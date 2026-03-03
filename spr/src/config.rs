@@ -88,6 +88,43 @@ impl Config {
         )
     }
 
+    /// Whether `branch_name` is in the namespace jj-spr generates branches in,
+    /// and is not the master branch.
+    ///
+    /// This is not the test for whether a branch may be deleted — see
+    /// [`Self::is_synthetic_base_branch`], which is narrower. A pull request
+    /// head branch answers `true` here and must never be taken away while the
+    /// pull request is open, all the more so under [`BaseStrategy::Linear`],
+    /// where it is also what the pull request above is based on.
+    pub fn is_spr_branch(&self, branch_name: &str) -> bool {
+        branch_name.starts_with(&self.branch_prefix) && branch_name != self.master_ref.branch_name()
+    }
+
+    /// Whether `branch_name` names a base branch jj-spr generated to carry a
+    /// stacked pull request's parent tree, as [`Self::get_base_branch_name`]
+    /// names one.
+    ///
+    /// Such a branch belongs to the one pull request based on it, which is why
+    /// only such a branch may be given a derived base commit or deleted when a
+    /// pull request stops pointing at it. Under [`BaseStrategy::Linear`] a
+    /// stacked pull request's base is instead the head branch of the pull
+    /// request below, which is not ours to write to or take away: doing either
+    /// would disturb that pull request, and deleting it would close it.
+    pub fn is_synthetic_base_branch(&self, branch_name: &str) -> bool {
+        // What tells the two apart is the `.` that
+        // [`Self::get_base_branch_name`] puts between the master branch name
+        // and the slug: `slugify` drops every `.`, so the slug a head branch is
+        // named after can never contain one. The master branch name itself is
+        // deliberately not matched on — a repository that has renamed its
+        // default branch still owns the base branches it made under the old
+        // name, and they still have to be cleaned up.
+        let Some(name) = branch_name.strip_prefix(&self.branch_prefix) else {
+            return false;
+        };
+
+        self.is_spr_branch(branch_name) && name.contains('.')
+    }
+
     fn find_unused_branch_name(&self, existing_ref_names: &HashSet<String>, slug: &str) -> String {
         let remote_name = &self.remote_name;
         let branch_prefix = &self.branch_prefix;
@@ -370,6 +407,62 @@ mod tests {
         assert_eq!(gh.parse_pull_request_field("   123 "), Some(123));
         assert_eq!(gh.parse_pull_request_field("#123"), Some(123));
         assert_eq!(gh.parse_pull_request_field(" # 123"), Some(123));
+    }
+
+    #[test]
+    fn test_is_spr_branch() {
+        let gh = config_factory();
+
+        assert!(gh.is_spr_branch("spr/foo/my-feature"));
+        assert!(gh.is_spr_branch("spr/foo/master.my-feature"));
+        assert!(!gh.is_spr_branch("master"));
+        assert!(!gh.is_spr_branch("spr/bar/my-feature"));
+        assert!(!gh.is_spr_branch("release-1.0"));
+    }
+
+    /// The name a base branch is generated under has to read back as one, or
+    /// the branches jj-spr owns and the branches it must leave alone cannot be
+    /// told apart.
+    #[test]
+    fn a_generated_base_branch_name_reads_as_one() {
+        let gh = config_factory();
+        let name = gh.get_base_branch_name(&HashSet::new(), "My Feature");
+
+        assert!(gh.is_synthetic_base_branch(&name), "{name}");
+    }
+
+    /// A pull request head branch must not: under the linear base strategy it
+    /// is what a stacked pull request is based on, and jj-spr deletes the base
+    /// branches it owns.
+    #[test]
+    fn a_head_branch_does_not_read_as_a_base_branch() {
+        let gh = config_factory();
+
+        for title in ["My Feature", "master.my-feature", "master then more"] {
+            let name = gh.get_new_branch_name(&HashSet::new(), title);
+            assert!(!gh.is_synthetic_base_branch(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_is_synthetic_base_branch() {
+        let gh = config_factory();
+
+        assert!(gh.is_synthetic_base_branch("spr/foo/master.my-feature"));
+        assert!(!gh.is_synthetic_base_branch("spr/foo/my-feature"));
+        assert!(!gh.is_synthetic_base_branch("master"));
+        // Someone else's prefix, so someone else's branch.
+        assert!(!gh.is_synthetic_base_branch("spr/bar/master.my-feature"));
+        assert!(!gh.is_synthetic_base_branch("master.my-feature"));
+    }
+
+    /// A repository that renames its default branch still has base branches
+    /// named after the old one, and they are still jj-spr's to clean up.
+    #[test]
+    fn a_base_branch_from_before_a_default_branch_rename_still_reads_as_one() {
+        let gh = config_factory();
+
+        assert!(gh.is_synthetic_base_branch("spr/foo/main.my-feature"));
     }
 
     #[test]

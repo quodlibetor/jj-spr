@@ -404,6 +404,103 @@ impl GitHub {
         Ok(())
     }
 
+    /// Set the base branch of pull request `number`, and report the base branch
+    /// GitHub has for it afterwards.
+    ///
+    /// GitHub answers the request with the updated pull request, so the caller
+    /// learns whether the change landed without asking again.
+    async fn set_pull_request_base(
+        &self,
+        number: u64,
+        base_branch: &GitHubBranch,
+    ) -> Result<GitHubBranch> {
+        let updated = octocrab::instance()
+            .patch::<octocrab::models::pulls::PullRequest, _, _>(
+                format!(
+                    "/repos/{}/{}/pulls/{}",
+                    self.config.owner, self.config.repo, number
+                ),
+                Some(&PullRequestUpdate {
+                    base: Some(base_branch.branch_name().to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        self.config
+            .new_github_branch_from_ref(&updated.base.ref_field)
+    }
+
+    /// Point pull request `number` at `new_base` and delete `old_base`, the
+    /// base branch it targeted until now.
+    ///
+    /// GitHub closes a pull request whose base branch is deleted, so the branch
+    /// only goes away once GitHub has confirmed the retargeting. Only a base
+    /// branch jj-spr generated for this purpose is deleted: any other is either
+    /// a branch someone wants to keep, or — under `spr.baseStrategy = linear` —
+    /// the head branch of the pull request below, and deleting that would close
+    /// *it*.
+    ///
+    /// Returns whether the old base branch was deleted from the remote.
+    pub async fn retarget_pull_request(
+        &self,
+        number: u64,
+        new_base: &GitHubBranch,
+        old_base: &GitHubBranch,
+    ) -> Result<bool> {
+        let updated_base = self.set_pull_request_base(number, new_base).await?;
+
+        if updated_base.branch_name() != new_base.branch_name() {
+            return Err(Error::new(format!(
+                "GitHub reports Pull Request #{number} targets '{}', not '{}'",
+                updated_base.branch_name(),
+                new_base.branch_name()
+            )));
+        }
+
+        // Retargeting a pull request at the branch it already points at is not
+        // a reason to delete that branch — which is to say, to close it.
+        if old_base.branch_name() == new_base.branch_name()
+            || !self.config.is_synthetic_base_branch(old_base.branch_name())
+        {
+            return Ok(false);
+        }
+
+        self.delete_remote_branch(old_base).await
+    }
+
+    /// [`Self::retarget_pull_request`] to the master branch.
+    pub async fn retarget_to_master_branch(
+        &self,
+        number: u64,
+        old_base: &GitHubBranch,
+    ) -> Result<bool> {
+        self.retarget_pull_request(number, &self.config.master_ref, old_base)
+            .await
+    }
+
+    /// Delete `branch` from the remote, reporting whether the remote had it.
+    ///
+    /// A failure here is not an error: the branch may have been deleted
+    /// already, either by someone else or by GitHub itself.
+    async fn delete_remote_branch(&self, branch: &GitHubBranch) -> Result<bool> {
+        let output = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.repo_path)
+            .arg("push")
+            .arg("--no-verify")
+            .arg("--delete")
+            .arg("--")
+            .arg(&self.config.remote_name)
+            .arg(branch.on_github())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await?;
+
+        Ok(output.status.success())
+    }
+
     pub async fn request_reviewers(
         &self,
         number: u64,
