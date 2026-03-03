@@ -258,6 +258,48 @@ pub async fn diff(
     result
 }
 
+/// Determine whether an existing PR's base branch should be kept, dropped, or
+/// is absent. Returns `(base_branch, old_synthetic_base)`.
+///
+/// - `base_branch`: `Some` if the PR should keep (or gain) a synthetic base,
+///   `None` if the PR should target master.
+/// - `old_synthetic_base`: `Some` if the PR currently has a synthetic base. When
+///   `base_branch` is `None` as well, that branch is obsolete: the PR needs
+///   retargeting to master and the branch can be deleted.
+///
+/// `cherry_pick` is whether this diff is a cherry-pick at all, which the
+/// `Cherry Pick:` marker on the commit message answers as much as `--cherry-pick`
+/// does — so pass the resolved answer, not the flag.
+fn determine_base_branch(
+    pull_request: Option<&PullRequest>,
+    directly_based_on_master: bool,
+    cherry_pick: bool,
+) -> (
+    Option<crate::github::GitHubBranch>,
+    Option<crate::github::GitHubBranch>,
+) {
+    let old_synthetic_base = pull_request.and_then(|pr| {
+        if !pr.base.is_master_branch() {
+            Some(pr.base.clone())
+        } else {
+            None
+        }
+    });
+
+    let base_branch = pull_request.and_then(|pr| {
+        if pr.base.is_master_branch() {
+            None
+        } else if directly_based_on_master || cherry_pick {
+            // Commit is now directly on master — drop the synthetic base
+            None
+        } else {
+            Some(pr.base.clone())
+        }
+    });
+
+    (base_branch, old_synthetic_base)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn diff_impl(
     opts: &DiffOptions,
@@ -491,17 +533,11 @@ async fn diff_impl(
         }
     }
 
-    // Check if there is a base branch on GitHub already. That's the case when
-    // there is an existing Pull Request, and its base is not the master branch.
-    let base_branch = if let Some(ref pr) = pull_request {
-        if pr.base.is_master_branch() {
-            None
-        } else {
-            Some(pr.base.clone())
-        }
-    } else {
-        None
-    };
+    let (base_branch, old_synthetic_base) = determine_base_branch(
+        pull_request.as_ref(),
+        directly_based_on_master,
+        effective_cherry_pick,
+    );
 
     // We are going to construct `pr_base_parent: Option<Oid>`.
     // The value will be the commit we have to merge into the new Pull Request
@@ -516,11 +552,12 @@ async fn diff_impl(
     //     not rebased. We don't need to merge anything into the Pull Request
     //     branch.
     // (2) the parent tree has changed, but the parent of the local commit is on
-    //     master (or we are cherry-picking) and we are not already using a base
-    //     branch: in this case we can merge the master commit we are based on
-    //     into the PR branch, without going via a base branch. Thus, we don't
-    //     introduce a base branch here and the PR continues to target the
-    //     master branch.
+    //     master (or we are cherry-picking) and we are not using a base branch:
+    //     in this case we can merge the master commit we are based on into the
+    //     PR branch, without going via a base branch. This also applies when
+    //     the PR previously had a synthetic base but the commit is now directly
+    //     on master (e.g. after the bottom of a stack was landed). In that case
+    //     the synthetic base is dropped and the PR is retargeted to master.
     // (3) the parent tree has changed, and we need to use a base branch (either
     //     because one was already created earlier, or we find that we are not
     //     directly based on master now): we need to construct a new commit for
@@ -742,11 +779,33 @@ async fn diff_impl(
                     pull_request_updates.base = Some(base_branch.branch_name().to_string());
                 }
             } else {
-                // The Pull Request is against the master branch. In that case we
-                // only need to push the update to the Pull Request branch.
+                // The Pull Request is against the master branch (or we are
+                // retargeting it to master). In that case we only need to push the
+                // update to the Pull Request branch.
                 run_command(&mut cmd)
                     .await
                     .reword("git push failed".to_string())?;
+
+                // If the PR previously had a synthetic base, retarget it to
+                // master and take the synthetic base branch out of the way.
+                if let Some(ref old_base) = old_synthetic_base {
+                    let deleted = gh
+                        .retarget_to_master_branch(pull_request.number, old_base)
+                        .await?;
+
+                    output(
+                        "🎯",
+                        &format!(
+                            "Retargeted Pull Request #{} to {}",
+                            pull_request.number,
+                            config.master_ref.branch_name()
+                        ),
+                    )?;
+
+                    if deleted {
+                        output("🗑️", &format!("Deleted {}", old_base.branch_name()))?;
+                    }
+                }
             }
 
             if !pull_request_updates.is_empty() {
@@ -1137,14 +1196,82 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    // Integration tests would require more complex setup with actual Git repositories
-    // and proper mocking of GitHub API calls. The tests above focus on:
-    // 1. Option parsing and validation
-    // 2. Data structure correctness
-    // 3. Basic logic flow verification
-    //
-    // For full integration testing, consider:
-    // - Mocking GitHub API responses
-    // - Creating test repositories with specific commit structures
-    // - Testing the interaction between revision specification and commit preparation
+    fn make_test_pr(base_branch_name: &str) -> PullRequest {
+        PullRequest {
+            number: 42,
+            state: PullRequestState::Open,
+            title: "test".to_string(),
+            body: None,
+            sections: Default::default(),
+            base: crate::github::GitHubBranch::new_from_branch_name(
+                base_branch_name,
+                "origin",
+                "main",
+            ),
+            head: crate::github::GitHubBranch::new_from_branch_name(
+                "spr/test/my-feature",
+                "origin",
+                "main",
+            ),
+            base_oid: git2::Oid::zero(),
+            head_oid: git2::Oid::zero(),
+            merge_commit: None,
+            reviewers: Default::default(),
+            review_status: None,
+        }
+    }
+
+    #[test]
+    fn test_determine_base_branch_no_pr_returns_none() {
+        let (base, old) = determine_base_branch(None, true, false);
+        assert!(base.is_none());
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_determine_base_branch_pr_on_master_returns_none() {
+        let pr = make_test_pr("main");
+        let (base, old) = determine_base_branch(Some(&pr), true, false);
+        assert!(base.is_none());
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_determine_base_branch_stacked_pr_not_on_master_keeps_synthetic() {
+        let pr = make_test_pr("spr/test/main.parent-feature");
+        let (base, old) = determine_base_branch(Some(&pr), false, false);
+        assert_eq!(base.unwrap().branch_name(), "spr/test/main.parent-feature");
+        assert_eq!(old.unwrap().branch_name(), "spr/test/main.parent-feature");
+    }
+
+    #[test]
+    fn test_determine_base_branch_drops_synthetic_when_directly_on_master() {
+        let pr = make_test_pr("spr/test/main.parent-feature");
+        let (base, old) = determine_base_branch(Some(&pr), true, false);
+        assert!(
+            base.is_none(),
+            "should drop synthetic base when directly on master"
+        );
+        assert_eq!(
+            old.unwrap().branch_name(),
+            "spr/test/main.parent-feature",
+            "should remember old synthetic for cleanup"
+        );
+    }
+
+    #[test]
+    fn test_determine_base_branch_drops_synthetic_when_cherry_pick() {
+        let pr = make_test_pr("spr/test/main.parent-feature");
+        let (base, old) = determine_base_branch(Some(&pr), false, true);
+        assert!(base.is_none(), "should drop synthetic base on cherry-pick");
+        assert!(old.is_some(), "should remember old synthetic for cleanup");
+    }
+
+    #[test]
+    fn test_determine_base_branch_pr_on_master_not_directly_on_master() {
+        let pr = make_test_pr("main");
+        let (base, old) = determine_base_branch(Some(&pr), false, false);
+        assert!(base.is_none(), "PR already on master stays on master");
+        assert!(old.is_none(), "no synthetic base to clean up");
+    }
 }

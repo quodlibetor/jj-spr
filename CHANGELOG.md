@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first commit in a pull reuqest now uses the local commit's description.
 - `jj spr diff` remembers when PRs were created as cherry picks so
   `--cherry-pick` doesn't need to be specified each time the PR is updated.
+- `jj spr diff` retargets a pull request at the default branch once its commit
+  sits directly on that branch, and deletes the synthetic base branch the pull
+  request used to point at. The branch is only deleted after GitHub confirms
+  the retarget, because GitHub closes a pull request whose base branch
+  disappears, and only branches under `spr.branchPrefix` are deleted.
 
 ## [0.1.0] - 2025-11-15
 
