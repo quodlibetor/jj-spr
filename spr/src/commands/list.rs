@@ -45,20 +45,104 @@ pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Confi
 struct Row {
     #[tabled(rename = "Reviews")]
     review_status: String,
+    #[tabled(rename = "Comments")]
+    comment_status: String,
     #[tabled(rename = "Description")]
     description: String,
 }
 
+/// Who the conversation on a PR is waiting on.
+enum CommentStatus {
+    /// A reviewer had the last word, so the PR is waiting on us.
+    AwaitingReply,
+    /// There is discussion, and we have replied to all of it.
+    Replied,
+    /// Nobody has commented.
+    Quiet,
+}
+
+impl CommentStatus {
+    fn icon(&self) -> &'static str {
+        match self {
+            CommentStatus::AwaitingReply => "📬",
+            CommentStatus::Replied => "💬",
+            CommentStatus::Quiet => "💤",
+        }
+    }
+}
+
+/// Determine who a PR's conversation is waiting on.
+///
+/// A reviewer is waiting on us if they had the last word in any unresolved
+/// review thread, or in the PR's top-level comments. GitHub returns comment
+/// connections oldest-first, so the last non-minimized node in each is the
+/// most recent one.
+fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> CommentStatus {
+    let top_level: Vec<_> = pr
+        .comments
+        .nodes
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|comment| !comment.is_minimized)
+        .collect();
+
+    let mut awaiting_reply = top_level.last().is_some_and(|last| !last.viewer_did_author);
+    let mut any_discussion = !top_level.is_empty();
+
+    for thread in pr.review_threads.nodes.iter().flatten().flatten() {
+        let last_comment = thread
+            .comments
+            .nodes
+            .iter()
+            .flatten()
+            .flatten()
+            .rfind(|comment| !comment.is_minimized);
+
+        let Some(last_comment) = last_comment else {
+            continue;
+        };
+        any_discussion = true;
+
+        // A resolved thread is not waiting on anyone, whoever spoke last.
+        if !thread.is_resolved && !last_comment.viewer_did_author {
+            awaiting_reply = true;
+        }
+    }
+
+    match (awaiting_reply, any_discussion) {
+        (true, _) => CommentStatus::AwaitingReply,
+        (false, true) => CommentStatus::Replied,
+        (false, false) => CommentStatus::Quiet,
+    }
+}
+
 fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Result<()> {
+    let rows = collect_rows(response_body);
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut table = Table::new(rows);
+    table.with(Style::sharp());
+
+    let term = console::Term::stdout();
+    term.write_line(&table.to_string())?;
+
+    Ok(())
+}
+
+fn collect_rows(response_body: Response<search_query::ResponseData>) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
 
     // A response without data, or without search nodes, means there is
     // simply nothing to list.
     let Some(data) = response_body.data else {
-        return Ok(());
+        return rows;
     };
     let Some(search_nodes) = data.search.nodes else {
-        return Ok(());
+        return rows;
     };
 
     for pr in search_nodes.into_iter().flatten() {
@@ -66,6 +150,8 @@ fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Result<
             crate::commands::list::search_query::SearchQuerySearchNodes::PullRequest(pr) => pr,
             _ => continue,
         };
+
+        let comment_status = comment_status(&pr).icon().to_string();
 
         let review_status = match pr.review_decision {
             Some(search_query::PullRequestReviewDecision::APPROVED) => {
@@ -88,19 +174,144 @@ fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Result<
 
         rows.push(Row {
             review_status,
+            comment_status,
             description,
         });
     }
 
-    if rows.is_empty() {
-        return Ok(());
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a search response around one pull request.
+    ///
+    /// `pr_fields` is spliced into the PullRequest node, so each test spells
+    /// out only the part of the payload it cares about, in the same shape the
+    /// GraphQL API returns.
+    fn response(pr_fields: &str) -> Response<search_query::ResponseData> {
+        let json = format!(
+            r#"{{"data":{{"search":{{"nodes":[{{
+                 "__typename":"PullRequest",
+                 "number":1,
+                 "title":"a title",
+                 "url":"https://github.com/o/r/pull/1",
+                 {pr_fields}
+               }}]}}}}}}"#
+        );
+        serde_json::from_str(&json).expect("test payload should match the query's response shape")
     }
 
-    let mut table = Table::new(rows);
-    table.with(Style::sharp());
+    /// Top-level comments, oldest first. `true` marks one we wrote.
+    fn comments(authored: &[bool]) -> String {
+        let nodes = authored
+            .iter()
+            .map(|mine| format!(r#"{{"isMinimized":false,"viewerDidAuthor":{mine}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#""comments":{{"nodes":[{nodes}]}}"#)
+    }
 
-    let term = console::Term::stdout();
-    term.write_line(&table.to_string())?;
+    /// One review thread, its comments oldest first.
+    fn thread(resolved: bool, authored: &[bool]) -> String {
+        let nodes = authored
+            .iter()
+            .map(|mine| format!(r#"{{"isMinimized":false,"viewerDidAuthor":{mine}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"isResolved":{resolved},"comments":{{"nodes":[{nodes}]}}}}"#)
+    }
 
-    Ok(())
+    fn threads(threads: &[String]) -> String {
+        format!(r#""reviewThreads":{{"nodes":[{}]}}"#, threads.join(","))
+    }
+
+    const NO_REVIEWS: &str = r#""reviewDecision":null"#;
+
+    fn comment_icon(pr_fields: &str) -> String {
+        let rows = collect_rows(response(pr_fields));
+        assert_eq!(rows.len(), 1, "expected exactly one row");
+        rows.into_iter().next().unwrap().comment_status
+    }
+
+    #[test]
+    fn no_comments_at_all_is_quiet() {
+        let fields = format!("{NO_REVIEWS},{},{}", comments(&[]), threads(&[]));
+        assert_eq!(comment_icon(&fields), CommentStatus::Quiet.icon());
+    }
+
+    #[test]
+    fn reviewer_with_the_last_top_level_word_awaits_reply() {
+        let fields = format!("{NO_REVIEWS},{},{}", comments(&[true, false]), threads(&[]));
+        assert_eq!(comment_icon(&fields), CommentStatus::AwaitingReply.icon());
+    }
+
+    #[test]
+    fn our_own_last_top_level_word_is_replied() {
+        let fields = format!("{NO_REVIEWS},{},{}", comments(&[false, true]), threads(&[]));
+        assert_eq!(comment_icon(&fields), CommentStatus::Replied.icon());
+    }
+
+    #[test]
+    fn reviewer_with_the_last_word_in_a_thread_awaits_reply() {
+        let fields = format!(
+            "{NO_REVIEWS},{},{}",
+            comments(&[]),
+            threads(&[thread(false, &[true, false])])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::AwaitingReply.icon());
+    }
+
+    /// A resolved thread is settled, so it should not ask for a reply even
+    /// though a reviewer spoke last in it.
+    #[test]
+    fn resolved_thread_does_not_await_reply() {
+        let fields = format!(
+            "{NO_REVIEWS},{},{}",
+            comments(&[]),
+            threads(&[thread(true, &[true, false])])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::Replied.icon());
+    }
+
+    /// Replying on one thread must not mask an open question on another.
+    #[test]
+    fn replying_to_one_thread_does_not_settle_another() {
+        let fields = format!(
+            "{NO_REVIEWS},{},{}",
+            comments(&[]),
+            threads(&[thread(false, &[false, true]), thread(false, &[true, false])])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::AwaitingReply.icon());
+    }
+
+    /// Minimized comments are hidden on GitHub, so the last visible comment
+    /// decides who spoke last.
+    #[test]
+    fn minimized_comments_are_ignored() {
+        let fields = format!(
+            r#"{NO_REVIEWS},"comments":{{"nodes":[
+                 {{"isMinimized":false,"viewerDidAuthor":true}},
+                 {{"isMinimized":true,"viewerDidAuthor":false}}
+               ]}},{}"#,
+            threads(&[])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::Replied.icon());
+    }
+
+    /// A thread of nothing but minimized comments is not discussion.
+    #[test]
+    fn wholly_minimized_thread_is_quiet() {
+        let fields = format!(
+            r#"{NO_REVIEWS},{},"reviewThreads":{{"nodes":[
+                 {{"isResolved":false,"comments":{{"nodes":[
+                   {{"isMinimized":true,"viewerDidAuthor":false}}
+                 ]}}}}
+               ]}}"#,
+            comments(&[])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::Quiet.icon());
+    }
 }

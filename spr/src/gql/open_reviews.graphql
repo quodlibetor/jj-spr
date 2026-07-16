@@ -7,6 +7,27 @@ query SearchQuery($query: String!) {
         title
         url
         reviewDecision
+        comments(last: 20) {
+          nodes {
+            isMinimized
+            viewerDidAuthor
+          }
+        }
+        # Code review conversations. Bounded to keep the query's node count
+        # well inside GitHub's per-query limit; a PR busy enough to exceed
+        # these still reports discussion, just possibly not who spoke last
+        # in the oldest threads.
+        reviewThreads(last: 50) {
+          nodes {
+            isResolved
+            comments(last: 5) {
+              nodes {
+                isMinimized
+                viewerDidAuthor
+              }
+            }
+          }
+        }
       }
     }
   }
