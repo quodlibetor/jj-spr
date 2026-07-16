@@ -41,7 +41,12 @@ pub struct PullRequest {
     pub node_id: String,
     pub state: PullRequestState,
     pub title: String,
+    /// The body exactly as GitHub has it.
     pub body: Option<String>,
+    /// The body parsed into sections. May include [`MessageSection::Stack`],
+    /// which `build_commit_message` and `build_github_body_for_merging` both
+    /// leave out, so it can reach neither a commit message nor a merge commit
+    /// message.
     pub sections: MessageSectionsMap,
     pub base: GitHubBranch,
     pub head: GitHubBranch,
@@ -118,10 +123,49 @@ impl PullRequestUpdate {
             self.title = title.cloned();
         }
 
-        let body = build_github_body(message);
-        if pull_request.body.as_ref() != Some(&body) {
+        // The Stack section is generated, so it is not in the local commit
+        // message. Carry over whatever the PR already has, or updating the
+        // message would drop it.
+        let mut message = message.clone();
+        if let Some(stack) = pull_request.sections.get(&MessageSection::Stack) {
+            message.insert(MessageSection::Stack, stack.clone());
+        }
+
+        self.set_body_if_changed(pull_request, &message);
+    }
+
+    /// Render `sections` into the body, and stage it if GitHub's differs.
+    ///
+    /// Compared trimmed: `build_github_body` trims, while the body GitHub hands
+    /// back does not — a body authored in the web UI typically carries a
+    /// trailing newline, and that alone must not make a PR look modified.
+    fn set_body_if_changed(&mut self, pull_request: &PullRequest, sections: &MessageSectionsMap) {
+        let body = build_github_body(sections);
+        if pull_request.body.as_deref().map(str::trim) != Some(body.as_str()) {
             self.body = Some(body);
         }
+    }
+
+    /// Rewrite the body with the Stack section replaced.
+    ///
+    /// Unlike the message, the stack is generated, so it is kept current
+    /// whether or not the user asked to update the message.
+    ///
+    /// The body is re-rendered from the PR's own parsed sections, so a summary
+    /// edited on GitHub survives — but only what the render emits does. Text
+    /// the parser bound to a section the PR body does not carry, such as a
+    /// `Reviewers:` line typed into it, is dropped.
+    ///
+    /// This and [`Self::update_message`] each render the body from scratch and
+    /// so do not compose: call at most one of them per update.
+    pub fn update_stack_section(&mut self, pull_request: &PullRequest, stack: Option<&str>) {
+        let mut sections = pull_request.sections.clone();
+        match stack {
+            Some(stack) => sections.insert(MessageSection::Stack, stack.to_owned()),
+            None => sections.remove(&MessageSection::Stack),
+        };
+
+        self.set_body_if_changed(pull_request, &sections);
     }
 }
 
@@ -1167,6 +1211,152 @@ impl GitHubBranch {
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
+    use crate::message::{build_commit_message, build_stack_section};
+
+    fn stack_text() -> String {
+        build_stack_section(&[121, 122], 122).unwrap()
+    }
+
+    /// A body as our own renderer would write it, so tests do not re-type how
+    /// the stack section is delimited.
+    fn body_with_stack(summary: &str, stack: &str) -> String {
+        let mut sections = message(summary);
+        sections.insert(MessageSection::Stack, stack.to_owned());
+        build_github_body(&sections)
+    }
+
+    /// A PR as GitHub would hand it back: the body parsed into sections at the
+    /// boundary, the way `get_pull_request` does. The Title and Pull Request
+    /// sections it also inserts are not needed here.
+    fn pull_request(body: &str) -> PullRequest {
+        PullRequest {
+            number: 122,
+            node_id: "PR_node".to_string(),
+            state: PullRequestState::Open,
+            title: "a title".to_string(),
+            body: Some(body.to_string()),
+            sections: parse_message(body, MessageSection::Summary),
+            base: GitHubBranch::new_from_branch_name("main", "origin", "main"),
+            head: GitHubBranch::new_from_branch_name("spr/a-title", "origin", "main"),
+            base_oid: git2::Oid::zero(),
+            head_oid: git2::Oid::zero(),
+            merge_commit: None,
+            reviewers: HashMap::new(),
+            review_status: None,
+        }
+    }
+
+    fn message(summary: &str) -> MessageSectionsMap {
+        [
+            (MessageSection::Title, "a title".to_string()),
+            (MessageSection::Summary, summary.to_string()),
+        ]
+        .into()
+    }
+
+    /// A body whose only difference from the commit message is the generated
+    /// Stack section has not been modified.
+    #[test]
+    fn test_stack_section_alone_is_not_a_message_change() {
+        let mut sections = message("the summary");
+        sections.insert(MessageSection::Stack, stack_text());
+        let body = build_github_body(&sections);
+        let mut update = PullRequestUpdate::default();
+
+        update.update_message(&pull_request(&body), &message("the summary"));
+
+        assert!(update.is_empty(), "unexpected update: {:?}", update);
+    }
+
+    /// Updating the message must not drop the Stack section.
+    #[test]
+    fn test_updating_the_message_keeps_the_stack_section() {
+        let body = body_with_stack("the old summary", &stack_text());
+        let mut update = PullRequestUpdate::default();
+
+        update.update_message(&pull_request(&body), &message("the new summary"));
+
+        let new_body = update.body.expect("body should be updated");
+        assert!(new_body.starts_with("the new summary"), "{new_body}");
+        assert!(new_body.contains("- #122 <- you are here"), "{new_body}");
+    }
+
+    #[test]
+    fn test_update_stack_section_adds_one_to_a_body_without_it() {
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request("the summary"), Some(&stack_text()));
+
+        let body = update.body.expect("body should be updated");
+        assert!(body.starts_with("the summary"), "{body}");
+        assert!(body.contains("- #122 <- you are here"), "{body}");
+    }
+
+    /// The list is re-rendered with the new stack, and the summary survives.
+    #[test]
+    fn test_update_stack_section_replaces_the_stack_list() {
+        let old = build_stack_section(&[121, 122], 122).unwrap();
+        let new = build_stack_section(&[121, 122, 123], 122).unwrap();
+        let body = body_with_stack("prose edited on GitHub", &old);
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request(&body), Some(&new));
+
+        let body = update.body.expect("body should be updated");
+        assert!(body.starts_with("prose edited on GitHub"), "{body}");
+        assert!(body.contains("- #123"), "{body}");
+    }
+
+    /// A PR that is no longer stacked loses its section.
+    #[test]
+    fn test_update_stack_section_removes_it_when_unstacked() {
+        let body = body_with_stack("the summary", &stack_text());
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request(&body), None);
+
+        assert_eq!(update.body.as_deref(), Some("the summary"));
+    }
+
+    /// An unchanged section must not provoke a pointless PATCH.
+    #[test]
+    fn test_update_stack_section_is_a_no_op_when_current() {
+        let body = body_with_stack("the summary", &stack_text());
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request(&body), Some(&stack_text()));
+
+        assert!(update.is_empty(), "unexpected update: {:?}", update);
+    }
+
+    /// A body GitHub hands back with a trailing newline is not a modified
+    /// body: the ⚠️ "message differs" warning and a PATCH would fire on every
+    /// run for a PR that is identical.
+    #[test]
+    fn test_a_trailing_newline_is_not_a_message_change() {
+        let mut update = PullRequestUpdate::default();
+
+        update.update_message(&pull_request("the summary\n"), &message("the summary"));
+
+        assert!(update.is_empty(), "unexpected update: {:?}", update);
+    }
+
+    /// The section parsed off a real PR body must not reach the commit message
+    /// that `jj spr amend` writes from `pull_request.sections`.
+    #[test]
+    fn test_stack_section_from_a_pr_body_stays_out_of_the_commit_message() {
+        let body = body_with_stack("the summary", &stack_text());
+
+        let sections = pull_request(&body).sections;
+
+        assert!(
+            sections.contains_key(&MessageSection::Stack),
+            "should parse"
+        );
+        let commit_message = build_commit_message(&sections);
+        assert!(!commit_message.contains("Stack"), "{commit_message}");
+        assert!(!commit_message.contains("#121"), "{commit_message}");
+    }
 
     fn test_config() -> crate::config::Config {
         crate::config::Config::new(

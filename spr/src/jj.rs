@@ -91,6 +91,35 @@ impl Jujutsu {
         Ok(merge_base)
     }
 
+    /// Get every commit in the stack that `top_change_id` belongs to, bottom-up.
+    ///
+    /// The stack is everything after `base_oid` up to that change, plus the
+    /// change's descendants — which is what a reader of any one of its PRs
+    /// wants to see, regardless of the revisions this run was asked to push.
+    /// `base_oid` is the commit the stack sits on and is itself excluded.
+    ///
+    /// Both arguments are resolved identities rather than anything the user
+    /// typed, which is what keeps this honest: a revision string would have to
+    /// be re-parsed here, and could then disagree with the range the caller
+    /// actually acted on. A change id is used for the top because it survives
+    /// the commit rewriting that `rewrite_commit_messages` does — a commit id
+    /// captured beforehand would be stale by the time this runs.
+    ///
+    /// Assumes the stack is linear. If the change has forked descendants they
+    /// are all returned, and the caller will render them as one stack — a known
+    /// limitation.
+    pub fn get_stack_commits(
+        &self,
+        config: &Config,
+        base_oid: Oid,
+        top_change_id: &str,
+    ) -> Result<Vec<PreparedCommit>> {
+        self.get_prepared_commits_for_revset(
+            config,
+            &format!("(({base_oid})..({top_change_id})) | (({top_change_id})::)"),
+        )
+    }
+
     pub fn get_prepared_commits_from_to(
         &self,
         config: &Config,
@@ -330,7 +359,7 @@ impl Jujutsu {
         })
     }
 
-    fn get_change_id_for_commit(&self, commit_oid: Oid) -> Result<String> {
+    pub fn get_change_id_for_commit(&self, commit_oid: Oid) -> Result<String> {
         // Get the change ID for a given commit OID
         let output = self.run_captured_with_args([
             "log",

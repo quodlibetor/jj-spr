@@ -97,6 +97,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jj spr init` offers it alongside the other two, and names it as the one to
   pick if you want GitHub to draw and merge your stacks.
 
+- `jj spr diff` writes a `Stack` section into each pull request's body listing
+  the stack it belongs to, marking the one being read — the `section` value of
+  `spr.stackDisplay`, and its default. The section is generated rather than
+  authored: `jj spr amend` does not write it back into your commit message and
+  it never reaches the merge commit. A pull request not in a stack of at least
+  two does not get one, and neither does one pushed with `--cherry-pick`, which
+  carries its change alone. The stack described is the repository's rather than
+  the run's — from where your chain leaves the master branch up through the top
+  change's descendants — so pushing one change brings its neighbours' sections
+  up to date, and a pull request reads the same however it was addressed.
+  Choosing `github` or `none` takes existing sections away rather than leaving
+  them to rot.
+
 - `spr.stackDisplay` chooses how a pull request says which stack it belongs to.
   There are two ways of saying it and they are alternatives, not layers — two
   descriptions of the same stack can disagree — so it is one setting with three

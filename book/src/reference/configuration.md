@@ -84,6 +84,29 @@ How a pull request says which stack it belongs to. There are two ways of saying 
 
 `jj spr init` asks for this right after the base strategy, starting on `section`. `github` is only on the list when you picked a linear base strategy — under `synthetic` there is no answer it could accept.
 
+#### The stack section
+
+Under `section`, `jj spr diff` writes a `Stack` section into the body of every pull request in the stack — a list of its pull requests, top-down the way `jj log` draws them, with a marker on the one you are reading:
+
+```
+## PR Stack
+
+- #12
+- #11 <- you are here
+- #10
+```
+
+It is generated, not authored: `jj spr amend` does not copy it back into your commit message, and it never appears in the merge commit.
+
+Two rules about which pull requests get one:
+
+- **A stack of one is not a stack.** A single pull request, or one whose place in the list cannot be worked out, gets no section — a list with no "you are here" is worse than none.
+- **The stack is the repository's, not the run's.** It runs from where your chain leaves the master branch up through the top change's descendants, whatever revisions you asked `jj spr diff` to push. So pushing one change still brings its neighbours' sections up to date, and a pull request reads the same however it was addressed. Changes with no pull request — an empty working copy change, one never diffed — are simply not in the list.
+
+`--cherry-pick` writes no section: such a pull request is based straight on the master branch and carries its change alone, so the run's pull requests may or may not be stacked on each other and there is no one shape to describe.
+
+Switching to `github` or `none` *removes* the section from every pull request in the stack rather than leaving it to rot, which is what makes the setting safe to change your mind about.
+
 #### What `github` needs
 
 It changes nothing about what jj-spr pushes. It does need a linear [`baseStrategy`](#basestrategy), because GitHub requires each pull request in a stack to be based on the branch of the one below it, and that is what the linear strategies build. If you leave `baseStrategy` unset, `github` selects `linear-rebase` for you — the strategy whose branches survive GitHub merging the stack itself. If you have set it to `linear`, jj-spr honours it and warns once per run about the merge button in GitHub's interface; if you have set it to `synthetic`, it reports the contradiction rather than overriding your choice.

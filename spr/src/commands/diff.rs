@@ -14,7 +14,7 @@ use crate::{
         GitHub, GitHubBranch, PullRequest, PullRequestRequestReviewers, PullRequestState,
         PullRequestUpdate,
     },
-    message::{MessageSection, validate_commit_message},
+    message::{MessageSection, build_stack_section, validate_commit_message},
     native_stacks::{
         ChainLink, DissolveReason, Reconciliation, StackSession, dissolve_any_stack_holding,
     },
@@ -128,19 +128,37 @@ pub async fn diff(
         vec![jj.get_prepared_commit_for_revision(config, &target_rev)?]
     };
 
-    // Determine the master base OID - this is the commit on master that the stack is based on
-    let master_base_oid = if let Some(first_commit) = prepared_commits.first() {
-        if use_range_mode {
-            // For range mode, the parent of the first commit is the master base
-            first_commit.parent_oid
-        } else {
-            // For single commit mode, find the actual merge base with master
-            jj.get_master_base_for_commit(config, first_commit.oid)?
-        }
-    } else {
+    let (Some(first_commit), Some(top_commit)) =
+        (prepared_commits.first(), prepared_commits.last())
+    else {
         output("👋", "No commits found - nothing to do. Good bye!")?;
         return result;
     };
+
+    // Determine the master base OID - this is the commit on master that the stack is based on
+    let master_base_oid = if use_range_mode {
+        // For range mode, the parent of the first commit is the master base
+        first_commit.parent_oid
+    } else {
+        // For single commit mode, find the actual merge base with master
+        jj.get_master_base_for_commit(config, first_commit.oid)?
+    };
+
+    // Where the stack for the PR bodies starts. It runs back to the master branch
+    // whatever revisions this run was asked to push, so that a PR is described
+    // the same way however it was addressed. This is deliberately not
+    // `master_base_oid`, which follows the range: a run bounded part-way up the
+    // stack would then leave the PRs below the bound out of the section, even
+    // though the pushed PRs are based on them and so genuinely are stacked on
+    // them. Being on master, this commit is never rewritten, so an id for it
+    // keeps.
+    let stack_base_oid = jj.get_master_base_for_commit(config, top_commit.oid)?;
+
+    // Identify the top of the stack now, while these commits still exist:
+    // rewriting the messages below replaces them, so a commit id captured here
+    // would be stale by the time the sections are worked out. A change id
+    // survives that.
+    let stack_top_change_id = jj.get_change_id_for_commit(top_commit.oid)?;
 
     // A change this run would open a pull request for has no number yet, and a
     // dry run opens nothing, so there is no number to give it.
@@ -284,6 +302,21 @@ pub async fn diff(
         for outcome in registrations.iter().filter(|o| o.is_notable()) {
             add_error(&mut result, report_stack(outcome));
         }
+    }
+
+    // Now that every commit this run touched has a PR, the stack's shape is
+    // known and each PR can be told about it. This has to be a second pass:
+    // during the loop above, the PRs for commits further up the stack may not
+    // exist yet.
+    //
+    // Under `--cherry-pick` a PR keeps an existing base branch but is otherwise
+    // based straight on master, so the run's PRs may or may not be stacked on
+    // each other. There is no one stack shape to describe, so describe none.
+    if !opts.dry_run && result.is_ok() && !opts.cherry_pick {
+        add_error(
+            &mut result,
+            update_stack_sections(jj, gh, config, stack_base_oid, &stack_top_change_id).await,
+        );
     }
 
     if opts.dry_run {
@@ -1415,6 +1448,56 @@ async fn diff_impl(
         based_on,
         retargeted,
     })
+}
+
+/// Tell every PR in the stack above `stack_base_oid` what the stack looks like,
+/// or take the section away where it is not what the repository wants.
+///
+/// The stack comes from the repository rather than from the revisions this run
+/// was asked to push, and is deliberately wider than them: it runs from where
+/// the stack leaves master up through the top change's descendants, so that
+/// pushing one change still brings its neighbours' sections up to date, and so
+/// that a PR is described the same way however it was addressed. Commits
+/// without a PR — an empty working copy change, or one never diffed — are
+/// simply not part of the list.
+///
+/// Under any [`StackDisplay`](crate::config::StackDisplay) but `section` this
+/// writes `None`, which *removes* a section rather than skipping it. That is
+/// what makes the setting switchable: a repository moving to `github`, or to
+/// `none`, would otherwise leave every PR carrying a list that nothing updates
+/// any more, and two descriptions of a stack that disagree are worse than one.
+/// The removal costs a lookup per PR and no write at all where there is no
+/// section to take away, since the update is then empty.
+async fn update_stack_sections(
+    jj: &crate::jj::Jujutsu,
+    gh: &impl crate::github::GitHubApi,
+    config: &crate::config::Config,
+    stack_base_oid: Oid,
+    stack_top_change_id: &str,
+) -> Result<()> {
+    let commits = jj.get_stack_commits(config, stack_base_oid, stack_top_change_id)?;
+    let numbers: Vec<u64> = commits
+        .iter()
+        .filter_map(|commit| commit.pull_request_number)
+        .collect();
+
+    for number in &numbers {
+        let section = config
+            .stack_display
+            .writes_a_section()
+            .then(|| build_stack_section(&numbers, *number))
+            .flatten();
+        let pull_request = gh.get_pull_request(*number).await?;
+
+        let mut update = crate::github::PullRequestUpdate::default();
+        update.update_stack_section(&pull_request, section.as_deref());
+
+        if !update.is_empty() {
+            gh.update_pull_request(*number, update).await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
