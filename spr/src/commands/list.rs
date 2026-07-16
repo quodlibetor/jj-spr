@@ -51,6 +51,45 @@ struct Row {
     description: String,
 }
 
+/// Describe where a PR stands with its reviewers.
+///
+/// `reviewDecision` is authoritative when it has reached a verdict — it
+/// already resolves disagreement between reviewers the way GitHub does, so
+/// one reviewer requesting changes correctly outweighs another's approval.
+/// The individual review states are consulted only when there is no verdict,
+/// to report feedback that `reviewDecision` has no way to express.
+fn review_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> String {
+    match pr.review_decision {
+        Some(search_query::PullRequestReviewDecision::APPROVED) => {
+            console::style("Accepted").green().to_string()
+        }
+        Some(search_query::PullRequestReviewDecision::CHANGES_REQUESTED) => {
+            console::style("Changes Requested").red().to_string()
+        }
+        None | Some(search_query::PullRequestReviewDecision::REVIEW_REQUIRED) => {
+            let commented = pr
+                .reviews
+                .iter()
+                .flat_map(|r| r.nodes.iter())
+                .flatten()
+                .flatten()
+                .any(|review| {
+                    matches!(
+                        review.state,
+                        search_query::PullRequestReviewState::COMMENTED
+                    )
+                });
+
+            if commented {
+                console::style("Commented").yellow().to_string()
+            } else {
+                "Pending".to_string()
+            }
+        }
+        Some(search_query::PullRequestReviewDecision::Other(ref d)) => d.clone(),
+    }
+}
+
 /// Who the conversation on a PR is waiting on.
 enum CommentStatus {
     /// A reviewer had the last word, so the PR is waiting on us.
@@ -152,19 +191,7 @@ fn collect_rows(response_body: Response<search_query::ResponseData>) -> Vec<Row>
         };
 
         let comment_status = comment_status(&pr).icon().to_string();
-
-        let review_status = match pr.review_decision {
-            Some(search_query::PullRequestReviewDecision::APPROVED) => {
-                console::style("Accepted").green().to_string()
-            }
-            Some(search_query::PullRequestReviewDecision::CHANGES_REQUESTED) => {
-                console::style("Changes Requested").red().to_string()
-            }
-            None | Some(search_query::PullRequestReviewDecision::REVIEW_REQUIRED) => {
-                "Pending".to_string()
-            }
-            Some(search_query::PullRequestReviewDecision::Other(d)) => d,
-        };
+        let review_status = review_status(&pr);
 
         let description = format!(
             "{}\n{}",
@@ -228,7 +255,7 @@ mod tests {
         format!(r#""reviewThreads":{{"nodes":[{}]}}"#, threads.join(","))
     }
 
-    const NO_REVIEWS: &str = r#""reviewDecision":null"#;
+    const NO_REVIEWS: &str = r#""reviewDecision":null,"reviews":{"nodes":[]}"#;
 
     fn comment_icon(pr_fields: &str) -> String {
         let rows = collect_rows(response(pr_fields));
@@ -313,5 +340,61 @@ mod tests {
             comments(&[])
         );
         assert_eq!(comment_icon(&fields), CommentStatus::Quiet.icon());
+    }
+
+    /// The Reviews cell, stripped of styling so tests assert on wording.
+    fn review_cell(decision: &str, review_states: &[&str]) -> String {
+        let states = review_states
+            .iter()
+            .map(|state| format!(r#"{{"state":"{state}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let fields = format!(
+            r#""reviewDecision":{decision},"reviews":{{"nodes":[{states}]}},{},{}"#,
+            comments(&[]),
+            threads(&[])
+        );
+        let rows = collect_rows(response(&fields));
+        assert_eq!(rows.len(), 1, "expected exactly one row");
+        let cell = rows.into_iter().next().unwrap().review_status;
+        console::strip_ansi_codes(&cell).into_owned()
+    }
+
+    #[test]
+    fn approved_pr_is_accepted() {
+        assert_eq!(review_cell(r#""APPROVED""#, &["APPROVED"]), "Accepted");
+    }
+
+    /// `reviewDecision` stays authoritative: GitHub reports CHANGES_REQUESTED
+    /// even though another reviewer approved, and so must we. Deriving the
+    /// column from the review states alone would report this as approved.
+    #[test]
+    fn changes_requested_outweighs_an_approval() {
+        assert_eq!(
+            review_cell(r#""CHANGES_REQUESTED""#, &["APPROVED", "CHANGES_REQUESTED"]),
+            "Changes Requested"
+        );
+    }
+
+    #[test]
+    fn a_commented_review_without_a_verdict_is_commented() {
+        assert_eq!(review_cell("null", &["COMMENTED"]), "Commented");
+        assert_eq!(
+            review_cell(r#""REVIEW_REQUIRED""#, &["COMMENTED"]),
+            "Commented"
+        );
+    }
+
+    #[test]
+    fn no_reviews_at_all_is_pending() {
+        assert_eq!(review_cell("null", &[]), "Pending");
+        assert_eq!(review_cell(r#""REVIEW_REQUIRED""#, &[]), "Pending");
+    }
+
+    /// An unsubmitted review is a draft only its author can see, so it is not
+    /// yet feedback.
+    #[test]
+    fn an_unsubmitted_review_is_still_pending() {
+        assert_eq!(review_cell("null", &["PENDING"]), "Pending");
     }
 }
