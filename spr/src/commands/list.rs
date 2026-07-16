@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::error::Error;
 use crate::error::Result;
+use crate::error::ResultExt;
 use graphql_client::{GraphQLQuery, Response};
 use reqwest;
 use tabled::Table;
@@ -38,7 +38,7 @@ pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Confi
         .await?;
     let response_body: Response<search_query::ResponseData> = res.json().await?;
 
-    print_pr_info(response_body).ok_or_else(|| Error::new("unexpected error"))
+    print_pr_info(response_body).context("Printing PR info".to_string())
 }
 
 #[derive(Tabled)]
@@ -49,14 +49,21 @@ struct Row {
     description: String,
 }
 
-fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Option<()> {
+fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Result<()> {
     let mut rows: Vec<Row> = Vec::new();
 
-    for pr in response_body.data?.search.nodes? {
+    // A response without data, or without search nodes, means there is
+    // simply nothing to list.
+    let Some(data) = response_body.data else {
+        return Ok(());
+    };
+    let Some(search_nodes) = data.search.nodes else {
+        return Ok(());
+    };
+
+    for pr in search_nodes.into_iter().flatten() {
         let pr = match pr {
-            Some(crate::commands::list::search_query::SearchQuerySearchNodes::PullRequest(pr)) => {
-                pr
-            }
+            crate::commands::list::search_query::SearchQuerySearchNodes::PullRequest(pr) => pr,
             _ => continue,
         };
 
@@ -86,14 +93,14 @@ fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Option<
     }
 
     if rows.is_empty() {
-        return Some(());
+        return Ok(());
     }
 
     let mut table = Table::new(rows);
     table.with(Style::sharp());
 
     let term = console::Term::stdout();
-    term.write_line(&table.to_string()).ok()?;
+    term.write_line(&table.to_string())?;
 
-    Some(())
+    Ok(())
 }
