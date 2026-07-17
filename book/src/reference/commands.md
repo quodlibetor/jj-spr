@@ -230,14 +230,67 @@ List open pull requests and their status.
 
 **Usage:**
 ```bash
-jj spr list
+jj spr list [OPTIONS]
 ```
 
+**Options:**
+- `--format <FORMAT>` - How to print the listing: `table` (the default),
+  `slack`, or `slack-links`. Taken from the `spr.listFormat` setting when the
+  flag is not given.
+- `--copy` - Also put the listing on the clipboard, as rich text where the
+  format has links to carry.
+
 **Output includes:**
-- PR number and title
-- Current state (open, draft, etc.)
+- Title and URL
 - Review status (approved, changes requested, etc.)
 - CI status
+- Whether the conversation is waiting on your reply. Reacting to a comment
+  counts as answering it, so a thumbs-up settles a thread you have nothing to
+  add to.
+
+Pull requests are listed in the order of the local changes that carry them,
+newest change first, so a stack reads the way `jj log` prints it. Separate
+stacks are listed one after another, and a `Stack` column marks where each one
+starts and ends when there is more than one. A pull request that no local
+change carries — landed elsewhere, or opened from another machine — is listed
+last.
+
+**Asking for reviews:** `--format slack` prints the listing as a Markdown
+bullet list to paste into a chat message — one bullet per pull request, its
+title under an emoji for where the review stands (⏳ pending, 💬 commented on,
+🔴 changes requested, ✅ accepted), and its URL on the line below:
+
+```
+- ⏳ Add the widget cache
+  https://github.com/acme/codez/pull/12
+- 💬 Rework the parser
+  https://github.com/acme/codez/pull/11
+```
+
+`--format slack-links` prints the same list with each title made a terminal
+hyperlink to its pull request instead of the URL being printed underneath, so
+every pull request is one short line. Terminals that do not understand the
+escape show the title alone, and so, at the time of writing, does a paste into
+Slack — which is what the plain `slack` format is for.
+
+Both formats separate stacks with a blank line, and leave out the merge and
+comment columns: what a reviewer needs from the message is which pull requests
+are waiting on them.
+
+**Getting the links into Slack:** no terminal turns a hyperlink back into a
+link when you copy it — every copy path writes plain text, so the URL behind a
+`slack-links` title is dropped on the way to the clipboard. `--copy` goes
+around that by putting the listing on the clipboard itself, as HTML with a
+real link per pull request alongside a plain-text version. Pasting that into
+Slack gives live links, the way pasting from a browser does. Both chat formats
+put the same HTML there — a linked title is what each was reaching for — and
+both fall back to the same spelled-out plain text, since the escapes that draw
+a hyperlink on screen paste as rubbish anywhere else.
+
+`--copy` works on the machine jj-spr runs on, so it does nothing useful over
+SSH. On X11 and Wayland the clipboard belongs to the process that set it, so
+what is copied outlives `jj spr list` only where a clipboard manager is
+running — most desktops run one.
 
 ---
 

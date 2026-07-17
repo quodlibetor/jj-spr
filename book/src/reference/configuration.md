@@ -40,6 +40,7 @@ jj-spr uses the following configuration values:
 | `baseStrategy`       |                                   | What a stacked pull request is based on, and how its branch is built: `synthetic`, `linear` or `linear-rebase`. See below | `synthetic`       | `synthetic`                                   |
 | `stackDisplay`       |                                   | How a pull request says which stack it belongs to: `section`, `github` or `none`. See below | `section`         | `section`; `github` only offered under a linear strategy |
 | `landStrategy`       |                                   | How `jj spr land` lands a pull request: `merge` squash-merges it there and then, `queue` puts it in the merge queue of `githubMasterBranch`, `auto` asks GitHub which of the two that branch allows, and `stack` hands the chain to GitHub's stacked pull requests. See below | `auto`            | `auto`                                        |
+| `listFormat`         | `--format`                        | How `jj spr list` prints its listing: `table`, `slack` or `slack-links`             | `table`           |                                               |
 
 Notes:
 - All config keys are in the `spr` section; for example, `spr.githubAuthToken`.

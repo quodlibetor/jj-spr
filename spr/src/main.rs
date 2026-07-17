@@ -21,7 +21,7 @@ use reqwest::{self, header};
 #[derive(Parser, Debug)]
 #[clap(
     name = "jj-spr",
-    version,
+    version = env!("JJ_SPR_VERSION"),
     about = "Jujutsu subcommand: Submit pull requests for individual, amendable, rebaseable commits to GitHub"
 )]
 pub struct Cli {
@@ -65,7 +65,7 @@ enum Commands {
     Amend(commands::amend::AmendOptions),
 
     /// List open Pull Requests on GitHub and their review decision
-    List,
+    List(commands::list::ListOptions),
 
     /// Create a new branch with the contents of an existing Pull Request
     Patch(commands::patch::PatchOptions),
@@ -210,7 +210,7 @@ pub async fn spr() -> Result<()> {
         Commands::Diff(opts) => commands::diff::diff(opts, &jj, &gh, &config).await?,
         Commands::Land(opts) => commands::land::land(opts, &jj, &gh, &config).await?,
         Commands::Amend(opts) => commands::amend::amend(opts, &jj, &gh, &config).await?,
-        Commands::List => commands::list::list(graphql_client, &config).await?,
+        Commands::List(opts) => commands::list::list(opts, graphql_client, &jj, &config).await?,
         Commands::Patch(opts) => commands::patch::patch(opts, &jj, &gh, &config).await?,
         Commands::Close(opts) => commands::close::close(opts, &jj, &gh, &config).await?,
         Commands::Cleanup(opts) => commands::cleanup::cleanup(opts, &jj, &gh, &config).await?,

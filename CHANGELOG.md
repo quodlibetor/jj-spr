@@ -13,45 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first commit in a pull reuqest now uses the local commit's description.
 - `jj spr diff` remembers when PRs were created as cherry picks so
   `--cherry-pick` doesn't need to be specified each time the PR is updated.
-- `jj spr land` lands the pull requests below the one it was asked for, bottom
-  first, instead of merging that one alone. A pull request branch carries the
-  local stack under it, so squash-merging one from the middle of a stack used to
-  put every change below it on the default branch as well — inside that one
-  squash, under that one's title — while the pull requests those changes belong
-  to stayed open with nothing left to show. Each now lands as its own commit and
-  is closed by the merge that carried it, which is also what GitHub's own
-  `gh stack merge` does with a stack. A change below the one being landed that
-  has no pull request refuses the land, because passing over it would land it
-  with nothing on GitHub to say so. A pull request pushed with `--cherry-pick`
-  carries its change on its own, so nothing below it is landed. Where the
-  default branch has a merge queue this needs `--wait`, since each pull request
-  has to be merged before the next can be queued.
-- `jj spr land` puts a pull request in the merge queue where the default branch
-  has one, instead of asking for a merge GitHub would refuse. The pull request
-  is retargeted at the default branch first, as it is before a squash-merge. A
-  queued land stops there: GitHub merges later, so the pull request branches are
-  left in place — the queue merges the pull request branch — and `jj spr
-  cleanup` removes them once it has. `--queue` and `--no-queue` choose for one
-  land.
-- `jj spr land --wait` stays until the merge queue has merged the pull request,
-  and then deletes the branches it used and fetches what landed, the way a
-  squash-merging land does. It gives up if GitHub takes the pull request out of
-  the queue without merging it, which is what a queue does to one whose checks
-  fail on the merged result.
-- `spr.landStrategy` chooses how `jj spr land` lands a pull request. `merge`
-  squash-merges it there and then, which is what jj-spr has always done, and
-  `queue` puts it in the merge queue GitHub keeps for the default branch. The
-  default, `auto`, asks GitHub which of the two that branch allows, so a
-  repository that requires a merge queue needs no configuration at all. `stack`
-  hands the whole chain to GitHub's stacked pull requests instead — see
-  `jj spr land --stack` above, which is the same thing for one land.
-  `jj spr init` asks for it, offering `stack` only where the base strategy and
-  `spr.stackDisplay` it has already asked about can carry it.
 - `jj spr diff` retargets a pull request at the default branch once its commit
   sits directly on that branch, and deletes the synthetic base branch the pull
   request used to point at. The branch is only deleted after GitHub confirms
   the retarget, because GitHub closes a pull request whose base branch
   disappears, and only branches under `spr.branchPrefix` are deleted.
+- `jj spr list` has a `Merge` column reporting what stands between each pull
+  request and landing: whether it is a draft, whether its branches conflict,
+  and how its checks are doing. A check that fails without blocking the merge
+  — one the base branch does not require — is called out separately from one
+  that does.
 - `jj spr land` retargets the pull requests stacked on the one it lands at the
   default branch, and deletes the base branches they pointed at, instead of
   leaving that until the next `jj spr diff`.
@@ -213,6 +184,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing stacked on it moves no base, so it takes nothing apart at all and the
   stack it is in keeps its number.
 
+- `jj spr land` lands the pull requests below the one it was asked for, bottom
+  first, instead of merging that one alone. A pull request branch carries the
+  local stack under it, so squash-merging one from the middle of a stack used to
+  put every change below it on the default branch as well — inside that one
+  squash, under that one's title — while the pull requests those changes belong
+  to stayed open with nothing left to show. Each now lands as its own commit and
+  is closed by the merge that carried it, which is also what GitHub's own
+  `gh stack merge` does with a stack. A change below the one being landed that
+  has no pull request refuses the land, because passing over it would land it
+  with nothing on GitHub to say so. A pull request pushed with `--cherry-pick`
+  carries its change on its own, so nothing below it is landed. Where the
+  default branch has a merge queue this needs `--wait`, since each pull request
+  has to be merged before the next can be queued.
+
+- `jj spr land` puts a pull request in the merge queue where the default branch
+  has one, instead of asking for a merge GitHub would refuse. The pull request
+  is retargeted at the default branch first, as it is before a squash-merge. A
+  queued land stops there: GitHub merges later, so the pull request branches are
+  left in place — the queue merges the pull request branch — and `jj spr
+  cleanup` removes them once it has. `--queue` and `--no-queue` choose for one
+  land.
+
+- `jj spr land --wait` stays until the merge queue has merged the pull request,
+  and then deletes the branches it used and fetches what landed, the way a
+  squash-merging land does. It gives up if GitHub takes the pull request out of
+  the queue without merging it, which is what a queue does to one whose checks
+  fail on the merged result.
+
+- `spr.landStrategy` chooses how `jj spr land` lands a pull request. `merge`
+  squash-merges it there and then, which is what jj-spr has always done, and
+  `queue` puts it in the merge queue GitHub keeps for the default branch. The
+  default, `auto`, asks GitHub which of the two that branch allows, so a
+  repository that requires a merge queue needs no configuration at all. `stack`
+  hands the whole chain to GitHub's stacked pull requests instead — see
+  `jj spr land --stack` above, which is the same thing for one land.
+  `jj spr init` asks for it, offering `stack` only where the base strategy and
+  `spr.stackDisplay` it has already asked about can carry it.
+
+- `jj-spr --version` names the commit the binary was built from, marking it
+  `dirty` when it was built over uncommitted changes. Builds without a git
+  checkout to ask, such as one from a released tarball, report the version
+  alone.
+- `jj spr list --format slack` prints the listing as a Markdown bullet list to
+  paste into a chat message asking for reviews: one bullet per pull request,
+  its title under an emoji for where its review stands, and its URL on the
+  line below. `--format slack-links` prints the same list with each title
+  made a terminal hyperlink instead, keeping every pull request to one line.
+  The default format can be set with `spr.listFormat`.
+- `jj spr list --copy` puts the listing on the clipboard as well as printing
+  it, as HTML with a real link per pull request where the format has links to
+  carry. No terminal turns a hyperlink back into a link when you copy it —
+  every copy path writes plain text — so this is what gets the links into a
+  chat message. The plain-text flavour that goes alongside spells the URLs
+  out, since the escapes that draw a hyperlink on screen paste as rubbish.
+
+### Changed
+
+- `jj spr list` now lists pull requests in the order of the local changes,
+  newest first, so a stack reads the way `jj log` prints it instead of in
+  whatever order GitHub returned. Pull requests with no local change are
+  listed last, and when there is more than one stack to tell apart a `Stack`
+  column marks where each one starts and ends.
+
 ### Fixed
 
 - Under a linear `spr.baseStrategy`, `jj spr diff` no longer treats the
@@ -252,6 +286,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request, and a base branch set by hand went the same way. A generated base
   branch is kept too while any open pull request still targets it, which the
   ones just retargeted onto it are the usual reason for.
+- `jj spr land` now asks GitHub which open pull requests are based on the
+  branches it is about to delete, instead of reading only the local change
+  stack. A pull request whose change jj does not have — abandoned locally, or in
+  a workspace this one has not fetched — was neither retargeted nor protected,
+  so under `spr.baseStrategy = linear` a land left it pointing at the head
+  branch it had just deleted, with only GitHub's own asynchronous cleanup to
+  rescue it.
 
 ## [0.1.0] - 2025-11-15
 

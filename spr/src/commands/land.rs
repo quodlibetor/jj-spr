@@ -22,8 +22,8 @@ use crate::{
     },
     output::{output, write_commit_title},
     stacked::{
-        may_delete_base_branch, retarget_stacked_pull_requests, spawn_branch_deletion,
-        spawn_head_branch_deletion,
+        base_branch_is_ours, may_delete_base_branch, retarget_stacked_pull_requests,
+        spawn_branch_deletion, spawn_head_branch_deletion,
     },
     utils::run_command,
 };
@@ -339,22 +339,41 @@ fn describe_wait(seconds: i64) -> String {
 /// Find the Pull Requests that will sit directly on the master branch once the
 /// commit `landing_oid` has landed.
 ///
-/// What a stacked Pull Request targets on GitHub depends on `spr.baseStrategy`:
-/// under `linear` it is the head branch of the Pull Request below, which does
-/// say which Pull Request is stacked on which; under `synthetic` it is a base
-/// branch holding the tree of its parent commit, which says nothing. Only the
-/// local stack answers the question for both, so we ask Jujutsu for the
-/// children of the commit being landed.
+/// Two sources answer it, because neither sees everything:
+///
+/// - **The local change stack.** What a stacked Pull Request targets on GitHub
+///   depends on `spr.baseStrategy`: under `linear` it is the head branch of the
+///   Pull Request below, which does say which Pull Request is stacked on which;
+///   under `synthetic` it is a base branch holding the tree of its parent
+///   commit, which says nothing. Only the local stack answers for both, so we
+///   ask Jujutsu for the children of the commit being landed.
+/// - **What GitHub reports as based on `head_branch`.** This sees the Pull
+///   Requests the local stack cannot: one whose change jj does not have because
+///   it was abandoned locally, or lives in a workspace this one has not
+///   fetched. Under `synthetic` it finds nothing the local stack missed, since
+///   no Pull Request targets a head branch there.
+///
+/// Asking GitHub as well is not tidiness. The head branch is deleted once these
+/// have been retargeted off it, so a Pull Request missing from this list is one
+/// this land leaves pointing at a branch it has just taken away. Landing below
+/// such a pull request without the GitHub half was tried against a real
+/// repository on 2026-08-06: it survived, still open, still based on the
+/// deleted head branch — GitHub retargets those itself, but on its own schedule
+/// and after `land` has returned. What is left in the meantime is a pull
+/// request whose diff means nothing, and a race between GitHub's cleanup and
+/// this land's branch deletion that jj-spr neither controls nor observes.
+/// Retargeting them here settles it before the branch goes.
 async fn find_stacked_pull_requests(
     jj: &crate::jj::Jujutsu,
     gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     landing_oid: git2::Oid,
+    head_branch: &crate::github::GitHubBranch,
 ) -> Result<Vec<StackedPullRequest>> {
     let children =
         jj.get_prepared_commits_for_revset(config, &format!("children({})", landing_oid))?;
 
-    let mut stacked = Vec::new();
+    let mut stacked: Vec<StackedPullRequest> = Vec::new();
     for number in children
         .iter()
         .filter_map(|child| child.pull_request_number)
@@ -368,6 +387,21 @@ async fn find_stacked_pull_requests(
                 number,
                 base: pull_request.base,
             });
+        }
+    }
+
+    // Both of those filters are already met by what GitHub sends back: it
+    // reports only open Pull Requests, and one based on the head branch is by
+    // definition not based on the master branch. Under `linear` the two sources
+    // overlap almost entirely, so the numbers already seen are skipped —
+    // retargeting one twice would be harmless, but reporting it twice would not
+    // read as harmless.
+    for pull_request in gh.get_pull_requests_with_base(head_branch).await? {
+        if !stacked
+            .iter()
+            .any(|seen| seen.number == pull_request.number)
+        {
+            stacked.push(pull_request);
         }
     }
 
@@ -510,6 +544,9 @@ async fn abandon_land(
 /// stack session, take away the branches it used, point the Pull Requests that
 /// were stacked on it at the master branch, and fetch what landed.
 ///
+/// `based_on_base_branch` is what GitHub reported as based on the Pull
+/// Request's base branch, asked for by the caller before anything on GitHub
+/// changed; `None` where the branch is not one jj-spr could take away anyway.
 /// `merge_sha` is the commit the merge produced, where GitHub said which it
 /// was.
 ///
@@ -519,6 +556,11 @@ async fn abandon_land(
 /// reaches it would withdraw the Pull Request instead of tidying up after it —
 /// which is why a queued land that is not waiting stops short of here, and one
 /// that is waiting arrives here only when the queue has finished.
+// The two lists are what is based on the two branches this tidies away, looked
+// up together by the caller before the merge and threaded through as they were
+// found. Bundling them would say they are one thing, and they are not: one
+// decides retargeting, the other only whether a branch may go.
+#[allow(clippy::too_many_arguments)]
 async fn clean_up_after_merging(
     jj: &crate::jj::Jujutsu,
     gh: &impl crate::github::GitHubApi,
@@ -526,6 +568,7 @@ async fn clean_up_after_merging(
     stacks: &mut Option<StackSession>,
     pull_request: &crate::github::PullRequest,
     stacked_pull_requests: &[StackedPullRequest],
+    based_on_base_branch: Option<&[StackedPullRequest]>,
     merge_sha: Option<&str>,
 ) -> Result<()> {
     output("🛬", "Landed!")?;
@@ -542,12 +585,8 @@ async fn clean_up_after_merging(
     // the Pull Requests above to the master branch, not here. That is why it
     // can go now, rather than waiting for that retargeting the way the head
     // branch does.
-    //
-    // Whether anything *else* is based on it is not asked — `close` does ask,
-    // and passing nothing here says only that `land` has not looked. See
-    // `may_delete_base_branch`.
     let remove_old_base_branch_child_process =
-        if may_delete_base_branch(config, &pull_request.base, Some(&[])) {
+        if may_delete_base_branch(config, &pull_request.base, based_on_base_branch) {
             Some(spawn_branch_deletion(jj, config, &pull_request.base)?)
         } else {
             None
@@ -576,10 +615,10 @@ async fn clean_up_after_merging(
     )
     .await?;
 
-    // "The Pull Requests above" are the ones the local stack knows about, which
-    // is where `find_stacked_pull_requests` looks. A Pull Request based on this
-    // branch whose change jj cannot see — abandoned locally, or in a workspace
-    // this one has not fetched — is neither retargeted nor protected below.
+    // "The Pull Requests above" are everything `find_stacked_pull_requests`
+    // found, which is the local stack together with what GitHub reports as
+    // based on this branch. One that could not be moved off it keeps the branch
+    // alive rather than being closed by its deletion.
     let remove_old_branch_child_process =
         spawn_head_branch_deletion(jj, config, &pull_request.head, &retargeted)?;
 
@@ -1305,7 +1344,26 @@ async fn land_pull_request(
     // Look up the Pull Requests stacked on this one before anything changes on
     // GitHub, so that a failure here stops a land that can still be retried.
     let stacked_pull_requests =
-        find_stacked_pull_requests(jj, gh, config, prepared_commit.oid).await?;
+        find_stacked_pull_requests(jj, gh, config, prepared_commit.oid, &pull_request.head).await?;
+
+    // And what is based on the base branch this land is about to leave, asked
+    // here for the same reason: by the time the branch is deleted the merge has
+    // happened, and an error then would be reported against a land that cannot
+    // be retried.
+    //
+    // Nothing this land aims at that branch — the retargeting below sends the
+    // Pull Requests above to the master branch — so the answer cannot go stale
+    // in a way that matters. One that appeared in the meantime was aimed there
+    // by somebody else, and the branch stays either way.
+    //
+    // Only asked where the answer could change anything: under
+    // `spr.baseStrategy = linear` the base is the head branch of the Pull
+    // Request below, which stays whatever is on it.
+    let based_on_base_branch = if base_branch_is_ours(config, &pull_request.base) {
+        Some(gh.get_pull_requests_with_base(&pull_request.base).await?)
+    } else {
+        None
+    };
 
     // Fetch current master from GitHub.
     run_command(
@@ -1589,6 +1647,7 @@ async fn land_pull_request(
             stacks,
             &pull_request,
             &stacked_pull_requests,
+            based_on_base_branch.as_deref(),
             Some(&format!("{}", merge_commit)),
         )
         .await;
@@ -1654,6 +1713,7 @@ async fn land_pull_request(
         stacks,
         &pull_request,
         &stacked_pull_requests,
+        based_on_base_branch.as_deref(),
         merge_commit.map(|oid| format!("{oid}")).as_deref(),
     )
     .await
