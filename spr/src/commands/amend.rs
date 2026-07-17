@@ -31,7 +31,7 @@ pub struct AmendOptions {
 pub async fn amend(
     opts: AmendOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
     // Determine revision and whether to use range mode

@@ -7,7 +7,14 @@ query PullRequestMergeabilityQuery(
     pullRequest(number: $number) {
       baseRefName
       headRefOid
+      # Whether the branches conflict, and nothing else. This is MERGEABLE for
+      # a pull request whose required checks have not started, so it cannot be
+      # the only thing landing consults.
       mergeable
+      # GitHub's own verdict, the only field that folds in what the base branch
+      # requires — its checks, its reviews, its rules. BLOCKED is the answer
+      # `mergeable` has no way to give.
+      mergeStateStatus
       mergeCommit {
         oid
       }

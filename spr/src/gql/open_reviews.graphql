@@ -6,7 +6,60 @@ query SearchQuery($query: String!) {
         number
         title
         url
+        isDraft
+        # Whether the branches conflict. GitHub computes this lazily, so a
+        # pull request it has not looked at yet answers UNKNOWN, and asking
+        # is what prompts it to work the answer out for next time.
+        mergeable
+        # GitHub's own verdict on whether the pull request can merge, which
+        # folds in the checks its branch protection requires. This is the
+        # only way to tell a required check from an optional one here:
+        # `isRequired` on the individual checks takes a pull request number
+        # as an argument, which a query over many pull requests has no way to
+        # vary per result.
+        mergeStateStatus
+        # Every check on the head commit, required or not, rolled into one
+        # state. Null when the pull request has no checks at all.
+        statusCheckRollup {
+          state
+        }
         reviewDecision
+        # Consulted only when reviewDecision has no verdict of its own; it
+        # reports states, such as COMMENTED, that reviewDecision cannot.
+        reviews(last: 20) {
+          nodes {
+            state
+          }
+        }
+        comments(last: 20) {
+          nodes {
+            isMinimized
+            viewerDidAuthor
+            # Reacting to a comment is how you acknowledge it without writing
+            # a reply, so our own reactions count as having dealt with it.
+            reactionGroups {
+              viewerHasReacted
+            }
+          }
+        }
+        # Code review conversations. Bounded to keep the query's node count
+        # well inside GitHub's per-query limit; a PR busy enough to exceed
+        # these still reports discussion, just possibly not who spoke last
+        # in the oldest threads.
+        reviewThreads(last: 50) {
+          nodes {
+            isResolved
+            comments(last: 5) {
+              nodes {
+                isMinimized
+                viewerDidAuthor
+                reactionGroups {
+                  viewerHasReacted
+                }
+              }
+            }
+          }
+        }
       }
     }
   }

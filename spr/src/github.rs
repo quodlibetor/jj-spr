@@ -17,6 +17,15 @@ use std::{
     path::PathBuf,
 };
 
+mod api;
+mod stacks;
+
+pub use api::{GitHubApi, GitHubRule};
+pub use stacks::{
+    AsyncMerge, Stack, StackApiError, StackBase, StackGitRef, StackPullRequest,
+    StackPullRequestState, StackResult, UnstackOutcome,
+};
+
 #[derive(Clone)]
 pub struct GitHub {
     config: crate::config::Config,
@@ -27,9 +36,17 @@ pub struct GitHub {
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub number: u64,
+    /// GitHub's own identifier for the pull request, which is what its GraphQL
+    /// API takes where the REST API takes [`PullRequest::number`].
+    pub node_id: String,
     pub state: PullRequestState,
     pub title: String,
+    /// The body exactly as GitHub has it.
     pub body: Option<String>,
+    /// The body parsed into sections. May include [`MessageSection::Stack`],
+    /// which `build_commit_message` and `build_github_body_for_merging` both
+    /// leave out, so it can reach neither a commit message nor a merge commit
+    /// message.
     pub sections: MessageSectionsMap,
     pub base: GitHubBranch,
     pub head: GitHubBranch,
@@ -38,6 +55,55 @@ pub struct PullRequest {
     pub merge_commit: Option<git2::Oid>,
     pub reviewers: HashMap<String, ReviewStatus>,
     pub review_status: Option<ReviewStatus>,
+}
+
+/// The branch a retarget leaves behind that is jj-spr's to delete, or `None`
+/// where nothing is to be deleted.
+///
+/// Two ways for the answer to be nothing: a pull request retargeted at the
+/// branch it already points at has left nothing, and a base branch jj-spr did
+/// not generate was never its to take away — deleting one of those would close
+/// whatever else is based on it, and under a linear `spr.baseStrategy` the base
+/// of a stacked pull request is the head branch of the pull request below.
+///
+/// A free function so that the rule has one statement rather than one per
+/// caller: [`GitHub::retarget_pull_request`] applies it against GitHub, and the
+/// fake GitHub the tests use applies it against a bare repository, so a test
+/// asserting that a branch went away is asserting this and not a copy of it.
+pub fn base_branch_to_take_away<'a>(
+    config: &crate::config::Config,
+    new_base: &GitHubBranch,
+    old_base: &'a GitHubBranch,
+) -> Option<&'a GitHubBranch> {
+    (old_base.branch_name() != new_base.branch_name()
+        && config.is_synthetic_base_branch(old_base.branch_name()))
+    .then_some(old_base)
+}
+
+/// An open pull request that sits on top of another one, as far as the base
+/// branch it targets goes.
+///
+/// Taking the pull request below out of the stack — landing it or closing it —
+/// makes that base branch obsolete, and under a linear `spr.baseStrategy` also
+/// doomed, since it is the head branch of the pull request below.
+/// A closed, unmerged pull request and the two branches it names.
+///
+/// Enough to ask whether it is closed because a branch went missing, and no
+/// more: `cleanup` walks every closed pull request in the repository, and
+/// fetching each one in full to find the few that are broken would be a request
+/// per pull request for a question two branch names answer.
+#[derive(Debug, Clone)]
+pub struct ClosedPullRequest {
+    pub number: u64,
+    pub head: GitHubBranch,
+    pub base: GitHubBranch,
+}
+
+#[derive(Debug, Clone)]
+pub struct StackedPullRequest {
+    pub number: u64,
+    /// The branch the pull request is based on right now.
+    pub base: GitHubBranch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,10 +136,49 @@ impl PullRequestUpdate {
             self.title = title.cloned();
         }
 
-        let body = build_github_body(message);
-        if pull_request.body.as_ref() != Some(&body) {
+        // The Stack section is generated, so it is not in the local commit
+        // message. Carry over whatever the PR already has, or updating the
+        // message would drop it.
+        let mut message = message.clone();
+        if let Some(stack) = pull_request.sections.get(&MessageSection::Stack) {
+            message.insert(MessageSection::Stack, stack.clone());
+        }
+
+        self.set_body_if_changed(pull_request, &message);
+    }
+
+    /// Render `sections` into the body, and stage it if GitHub's differs.
+    ///
+    /// Compared trimmed: `build_github_body` trims, while the body GitHub hands
+    /// back does not — a body authored in the web UI typically carries a
+    /// trailing newline, and that alone must not make a PR look modified.
+    fn set_body_if_changed(&mut self, pull_request: &PullRequest, sections: &MessageSectionsMap) {
+        let body = build_github_body(sections);
+        if pull_request.body.as_deref().map(str::trim) != Some(body.as_str()) {
             self.body = Some(body);
         }
+    }
+
+    /// Rewrite the body with the Stack section replaced.
+    ///
+    /// Unlike the message, the stack is generated, so it is kept current
+    /// whether or not the user asked to update the message.
+    ///
+    /// The body is re-rendered from the PR's own parsed sections, so a summary
+    /// edited on GitHub survives — but only what the render emits does. Text
+    /// the parser bound to a section the PR body does not carry, such as a
+    /// `Reviewers:` line typed into it, is dropped.
+    ///
+    /// This and [`Self::update_message`] each render the body from scratch and
+    /// so do not compose: call at most one of them per update.
+    pub fn update_stack_section(&mut self, pull_request: &PullRequest, stack: Option<&str>) {
+        let mut sections = pull_request.sections.clone();
+        match stack {
+            Some(stack) => sections.insert(MessageSection::Stack, stack.to_owned()),
+            None => sections.remove(&MessageSection::Stack),
+        };
+
+        self.set_body_if_changed(pull_request, &sections);
     }
 }
 
@@ -98,12 +203,130 @@ pub struct UserWithName {
     pub is_collaborator: bool,
 }
 
+/// GitHub's verdict on whether a pull request satisfies what its base branch
+/// requires: required checks, required reviews, and rules.
+///
+/// This is deliberately coarser than GitHub's `MergeStateStatus`, which
+/// distinguishes several ways of being ready that landing does not care to
+/// tell apart. What landing needs to know is only whether something stands in
+/// the way — GitHub does not report *which* requirement is unmet in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRequirements {
+    /// Something the base branch requires is unmet.
+    Unmet,
+    /// Nothing required stands in the way.
+    Met,
+    /// GitHub has not worked out an answer yet, or gave one this build does
+    /// not know. Landing waits for it rather than guessing either way.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequestMergeability {
     pub base: GitHubBranch,
     pub head_oid: git2::Oid,
     pub mergeable: Option<bool>,
+    pub merge_requirements: MergeRequirements,
     pub merge_commit: Option<git2::Oid>,
+}
+
+impl PullRequestMergeability {
+    /// Whether GitHub has settled on a verdict about the base branch's
+    /// requirements yet.
+    ///
+    /// It works this out lazily, and retargeting a pull request sends it back
+    /// to undecided, so a caller that means to act on the verdict has to wait
+    /// for one to arrive.
+    pub fn requirements_known(&self) -> bool {
+        self.merge_requirements != MergeRequirements::Unknown
+    }
+
+    /// Whether GitHub reports something the base branch requires as unmet.
+    ///
+    /// False while the verdict is still [`MergeRequirements::Unknown`], so
+    /// pair it with [`Self::requirements_known`] rather than reading a `false`
+    /// here as permission to merge.
+    pub fn requirements_unmet(&self) -> bool {
+        self.merge_requirements == MergeRequirements::Unmet
+    }
+}
+
+/// Read [`MergeRequirements`] off GitHub's `mergeStateStatus`.
+///
+/// The doubtful case is `BEHIND`, which GitHub gives when the head ref is out
+/// of date. That only bars merging when the base branch requires branches to
+/// be up to date, and nothing in the response says whether it does. `jj spr
+/// list` resolves that doubt towards reporting nothing, because a column that
+/// wrongly claims a pull request cannot land is worse than a quiet one. Here
+/// the doubt resolves the other way: a land refused in error costs a rebase or
+/// a `--force`, while a land allowed in error cannot be taken back.
+fn merge_requirements(
+    status: &pull_request_mergeability_query::MergeStateStatus,
+) -> MergeRequirements {
+    use pull_request_mergeability_query::MergeStateStatus as Status;
+
+    match status {
+        // Something required is unmet; GitHub does not say what.
+        Status::BLOCKED => MergeRequirements::Unmet,
+        // A draft is not offered for merging at all.
+        Status::DRAFT => MergeRequirements::Unmet,
+        // Conflicting. `mergeable` reports this too, and reports it better,
+        // but a land must not proceed on it either way.
+        Status::DIRTY => MergeRequirements::Unmet,
+        // Out of date — see above.
+        Status::BEHIND => MergeRequirements::Unmet,
+        // Ready. `HAS_HOOKS` is `CLEAN` with pre-receive hooks configured, and
+        // `UNSTABLE` is GitHub's word for a failing check that nothing
+        // requires — neither stands in the way of a merge.
+        Status::CLEAN | Status::HAS_HOOKS | Status::UNSTABLE => MergeRequirements::Met,
+        Status::UNKNOWN => MergeRequirements::Unknown,
+        // A status this build does not know is not evidence of readiness.
+        Status::Other(_) => MergeRequirements::Unknown,
+    }
+}
+
+/// The merge queue GitHub keeps for one branch.
+///
+/// Its existence is the whole of what a caller has to know to decide how to
+/// land: a branch that has one takes no other kind of merge. The two fields are
+/// for saying so to whoever asked — where the queue is, and how long joining
+/// the back of it looks like taking.
+#[derive(Debug, Clone)]
+pub struct MergeQueue {
+    pub url: String,
+    /// Seconds GitHub estimates a Pull Request queued now would wait, where it
+    /// will estimate at all. It gives no answer for an empty queue, or for one
+    /// it has not seen enough of to guess from.
+    pub next_entry_estimated_time_to_merge: Option<i64>,
+}
+
+/// One Pull Request's place in a merge queue.
+#[derive(Debug, Clone)]
+pub struct MergeQueueEntry {
+    /// Where GitHub says the entry sits in the queue, in GitHub's own
+    /// numbering. Passed through as given: the API documents the field as "the
+    /// position of this entry in the queue" and does not say what it counts
+    /// from, so renumbering it would be inventing a fact.
+    pub position: i64,
+    /// Seconds GitHub estimates this entry will wait, where it will estimate at
+    /// all.
+    pub estimated_time_to_merge: Option<i64>,
+}
+
+/// What has become of a Pull Request that was put in a merge queue.
+///
+/// The three fields together say which of the three things has happened, and no
+/// one of them says it alone. An entry and no merge commit is a Pull Request
+/// still waiting. A merge commit is one the queue merged. Neither an entry nor
+/// a merge commit means the queue let go of it without merging — its checks
+/// failed on the merged result, or somebody took it out — and `state` tells
+/// apart a Pull Request that is still open, and so could be queued again, from
+/// one that was closed.
+#[derive(Debug, Clone)]
+pub struct QueuedPullRequest {
+    pub state: PullRequestState,
+    pub merge_commit: Option<git2::Oid>,
+    pub entry: Option<MergeQueueEntry>,
 }
 
 #[derive(GraphQLQuery)]
@@ -114,6 +337,9 @@ pub struct PullRequestMergeability {
 )]
 pub struct PullRequestQuery;
 type GitObjectID = String;
+// Named for GitHub's `URI` scalar, which is how `graphql_client` looks it up.
+#[allow(clippy::upper_case_acronyms)]
+type URI = String;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -130,6 +356,46 @@ pub struct PullRequestMergeabilityQuery;
     response_derives = "Debug"
 )]
 pub struct OpenPullRequestBranchesQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/closed_pull_requests.graphql",
+    response_derives = "Debug"
+)]
+pub struct ClosedPullRequestsQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/pull_requests_with_base.graphql",
+    response_derives = "Debug"
+)]
+pub struct PullRequestsWithBaseQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/merge_queue_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct MergeQueueQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/enqueue_pull_request_mutation.graphql",
+    response_derives = "Debug"
+)]
+pub struct EnqueuePullRequestMutation;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/merge_queue_entry_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct MergeQueueEntryQuery;
 
 impl GitHub {
     pub fn new(
@@ -201,7 +467,16 @@ impl GitHub {
         let base = config.new_github_branch_from_ref(&pr.base_ref_name)?;
         let head = config.new_github_branch_from_ref(&pr.head_ref_name)?;
 
-        // Fetch refs from remote using git (since we're in a colocated repo)
+        // Fetch refs from remote using git (since we're in a colocated repo).
+        //
+        // Forced, because the head and base commits below are read back out of
+        // the local refs these write: a fetch that declined to move one because
+        // the remote branch no longer descends from it would leave this
+        // reporting a commit the branch has moved off. That happens whenever
+        // something rewrote the branch — jj-spr itself under
+        // `spr.baseStrategy = linear-rebase`, or GitHub when a stack is merged
+        // from its interface — and everything downstream would then be deciding
+        // what to push from history GitHub has already dropped.
         let _fetch_result = tokio::process::Command::new("git")
             .args([
                 "--git-dir",
@@ -209,8 +484,8 @@ impl GitHub {
                 "fetch",
                 "--no-write-fetch-head",
                 &config.remote_name,
-                &format!("{}:{}", head.on_github(), head.local()),
-                &format!("{}:{}", base.on_github(), base.local()),
+                &format!("+{}:{}", head.on_github(), head.local()),
+                &format!("+{}:{}", base.on_github(), base.local()),
             ])
             .output()
             .await;
@@ -223,12 +498,12 @@ impl GitHub {
         {
             if output.status.success() {
                 let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
+                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::ZERO_SHA1)
             } else {
-                git2::Oid::zero()
+                git2::Oid::ZERO_SHA1
             }
         } else {
-            git2::Oid::zero()
+            git2::Oid::ZERO_SHA1
         };
 
         let head_oid = if let Ok(output) = tokio::process::Command::new("git")
@@ -238,12 +513,12 @@ impl GitHub {
         {
             if output.status.success() {
                 let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
+                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::ZERO_SHA1)
             } else {
-                git2::Oid::zero()
+                git2::Oid::ZERO_SHA1
             }
         } else {
-            git2::Oid::zero()
+            git2::Oid::ZERO_SHA1
         };
 
         let mut sections = parse_message(&pr.body, MessageSection::Summary);
@@ -346,6 +621,7 @@ impl GitHub {
 
         Ok::<_, Error>(PullRequest {
             number: pr.number as u64,
+            node_id: pr.id,
             state: match pr.state {
                 pull_request_query::PullRequestState::OPEN => PullRequestState::Open,
                 _ => PullRequestState::Closed,
@@ -402,6 +678,222 @@ impl GitHub {
             .await?;
 
         Ok(())
+    }
+
+    /// Set the base branch of pull request `number`, and report the base branch
+    /// GitHub has for it afterwards.
+    ///
+    /// GitHub answers the request with the updated pull request, so the caller
+    /// learns whether the change landed without asking again.
+    async fn set_pull_request_base(
+        &self,
+        number: u64,
+        base_branch: &GitHubBranch,
+    ) -> Result<GitHubBranch> {
+        let updated = octocrab::instance()
+            .patch::<octocrab::models::pulls::PullRequest, _, _>(
+                format!(
+                    "/repos/{}/{}/pulls/{}",
+                    self.config.owner, self.config.repo, number
+                ),
+                Some(&PullRequestUpdate {
+                    base: Some(base_branch.branch_name().to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        self.config
+            .new_github_branch_from_ref(&updated.base.ref_field)
+    }
+
+    /// Point pull request `number` at `new_base` and delete `old_base`, the
+    /// base branch it targeted until now.
+    ///
+    /// GitHub closes a pull request whose base branch is deleted, so the branch
+    /// only goes away once GitHub has confirmed the retargeting. Only a base
+    /// branch jj-spr generated for this purpose is deleted: any other is either
+    /// a branch someone wants to keep, or — under a linear `spr.baseStrategy` —
+    /// the head branch of the pull request below, and deleting that would close
+    /// *it*.
+    ///
+    /// Returns whether the old base branch was deleted from the remote.
+    pub async fn retarget_pull_request(
+        &self,
+        number: u64,
+        new_base: &GitHubBranch,
+        old_base: &GitHubBranch,
+    ) -> Result<bool> {
+        let updated_base = self.set_pull_request_base(number, new_base).await?;
+
+        if updated_base.branch_name() != new_base.branch_name() {
+            return Err(Error::new(format!(
+                "GitHub reports Pull Request #{number} targets '{}', not '{}'",
+                updated_base.branch_name(),
+                new_base.branch_name()
+            )));
+        }
+
+        match base_branch_to_take_away(&self.config, new_base, old_base) {
+            Some(old_base) => self.delete_remote_branch(old_base).await,
+            None => Ok(false),
+        }
+    }
+
+    /// Squash-merge pull request `number`, and hand back the commit it landed as.
+    ///
+    /// `head_oid` is a lease: GitHub merges only if that is still the head, so a
+    /// pull request somebody pushed to since this land looked at it is refused
+    /// rather than merged unseen. That is the difference from
+    /// [`Self::merge_pull_request_async`], which accepts the field and ignores it.
+    ///
+    /// Squash, and only squash — the account of why the other two merge methods
+    /// are not offered is at the call site in `commands::land`, next to what they
+    /// did to a stacked pull request when they were tried.
+    ///
+    /// Here rather than at that call site because it was the one place in the
+    /// crate reaching for `octocrab` from outside this module, which is also what
+    /// made it the one call a test could not stand in for.
+    pub async fn merge_pull_request(
+        &self,
+        number: u64,
+        title: String,
+        message: String,
+        head_oid: git2::Oid,
+    ) -> Result<Option<git2::Oid>> {
+        let merge = octocrab::instance()
+            .pulls(&self.config.owner, &self.config.repo)
+            .merge(number)
+            .method(octocrab::params::pulls::MergeMethod::Squash)
+            .title(title)
+            .message(message)
+            .sha(format!("{head_oid}"))
+            .send()
+            .await
+            .convert()
+            .context(format!("squash-merging PR #{number} (head {head_oid})"))?;
+
+        if !merge.merged {
+            return Err(Error::new(format!(
+                "GitHub Pull Request merge failed: {}",
+                merge.message.unwrap_or_default()
+            )));
+        }
+
+        Ok(merge
+            .sha
+            .as_deref()
+            .and_then(|sha| git2::Oid::from_str(sha).ok()))
+    }
+
+    /// [`Self::retarget_pull_request`] to the master branch.
+    pub async fn retarget_to_master_branch(
+        &self,
+        number: u64,
+        old_base: &GitHubBranch,
+    ) -> Result<bool> {
+        self.retarget_pull_request(number, &self.config.master_ref, old_base)
+            .await
+    }
+
+    /// Reopen pull request `number`.
+    ///
+    /// Sends `state` and nothing else, which is not fussiness: an update
+    /// carrying a `base` is refused outright while a stack holds the pull
+    /// request (`GitHubRule::StackLocksBaseRefs`), and refused again while the
+    /// pull request is closed (`GitHubRule::AClosedPullRequestsBaseCannotMove`),
+    /// so a reopen that took the opportunity to fix the base as well would fail
+    /// for both reasons at once and reopen nothing.
+    ///
+    /// Both refs the pull request names have to be on the remote before this
+    /// will do anything — `GitHubRule::ReopeningNeedsTheRefsBack`. See
+    /// [`crate::reopen`], which is what puts them back.
+    pub async fn reopen_pull_request(&self, number: u64) -> Result<()> {
+        self.update_pull_request(
+            number,
+            PullRequestUpdate {
+                state: Some(PullRequestState::Open),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Whether the remote has `branch`.
+    ///
+    /// Asked of the remote rather than of a remote-tracking ref, because the
+    /// question is only ever asked about a branch something is suspected to have
+    /// deleted, and a remote-tracking ref is exactly what goes on claiming such
+    /// a branch is there.
+    pub async fn remote_branch_exists(&self, branch: &GitHubBranch) -> Result<bool> {
+        let output = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.repo_path)
+            .arg("ls-remote")
+            .arg("--exit-code")
+            .arg("--heads")
+            .arg("--")
+            .arg(&self.config.remote_name)
+            .arg(branch.on_github())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await?;
+
+        Ok(output.status.success())
+    }
+
+    /// Put `branch` on the remote at `oid`.
+    ///
+    /// Not a force push: this is for a branch that is not supposed to be there,
+    /// so one that turns out to be there is somebody else's and the push failing
+    /// is the right answer.
+    pub async fn create_remote_branch(&self, branch: &GitHubBranch, oid: git2::Oid) -> Result<()> {
+        let output = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.repo_path)
+            .arg("push")
+            .arg("--no-verify")
+            .arg("--")
+            .arg(&self.config.remote_name)
+            .arg(format!("{}:{}", oid, branch.on_github()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(Error::new(format!(
+                "Could not create {} on {}: {}",
+                branch.branch_name(),
+                self.config.remote_name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Delete `branch` from the remote, reporting whether the remote had it.
+    ///
+    /// A failure here is not an error: the branch may have been deleted
+    /// already, either by someone else or by GitHub itself.
+    pub async fn delete_remote_branch(&self, branch: &GitHubBranch) -> Result<bool> {
+        let output = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.repo_path)
+            .arg("push")
+            .arg("--no-verify")
+            .arg("--delete")
+            .arg("--")
+            .arg(&self.config.remote_name)
+            .arg(branch.on_github())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await?;
+
+        Ok(output.status.success())
     }
 
     pub async fn request_reviewers(
@@ -469,10 +961,297 @@ impl GitHub {
                 pull_request_mergeability_query::MergeableState::UNKNOWN => None,
                 _ => None,
             },
+            merge_requirements: merge_requirements(&pr.merge_state_status),
             merge_commit: pr
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
         })
+    }
+
+    /// The open pull requests GitHub has based on `base`.
+    ///
+    /// This sees pull requests the local repository cannot — see
+    /// [`crate::stacked`] for why that matters before a branch is deleted.
+    pub async fn get_pull_requests_with_base(
+        &self,
+        base: &GitHubBranch,
+    ) -> Result<Vec<StackedPullRequest>> {
+        let mut pull_requests = Vec::new();
+        let mut after: Option<String> = None;
+
+        loop {
+            let variables = pull_requests_with_base_query::Variables {
+                owner: self.config.owner.clone(),
+                name: self.config.repo.clone(),
+                base_ref_name: base.branch_name().to_string(),
+                first: 100,
+                after: after.clone(),
+            };
+            let request_body = PullRequestsWithBaseQuery::build_query(variables);
+            let res = self
+                .graphql_client
+                .post("https://api.github.com/graphql")
+                .json(&request_body)
+                .send()
+                .await?;
+            let response_body: Response<pull_requests_with_base_query::ResponseData> =
+                res.json().await?;
+
+            if let Some(errors) = response_body.errors {
+                let error = Err(Error::new(format!(
+                    "fetching the open Pull Requests based on '{}' failed",
+                    base.branch_name()
+                )));
+                return errors
+                    .into_iter()
+                    .fold(error, |err, e| err.context(e.to_string()));
+            }
+
+            let prs = response_body
+                .data
+                .ok_or_else(|| {
+                    Error::new(format!(
+                        "failed to fetch the open PRs based on '{}'",
+                        base.branch_name()
+                    ))
+                })?
+                .repository
+                .ok_or_else(|| Error::new("failed to find repository"))?
+                .pull_requests;
+
+            if let Some(nodes) = prs.nodes {
+                for node in nodes.into_iter().flatten() {
+                    pull_requests.push(StackedPullRequest {
+                        number: node.number as u64,
+                        base: self
+                            .config
+                            .new_github_branch_from_ref(&node.base_ref_name)?,
+                    });
+                }
+            }
+
+            if prs.page_info.has_next_page {
+                after = prs.page_info.end_cursor;
+            } else {
+                break;
+            }
+        }
+
+        Ok(pull_requests)
+    }
+
+    /// The merge queue GitHub keeps for `branch_name`, or `None` where it keeps
+    /// none.
+    ///
+    /// `None` is the ordinary answer and not a failure: most branches have no
+    /// merge queue, and GitHub says so by returning null for the queue rather
+    /// than by refusing the question. A repository jj-spr cannot see at all
+    /// still fails, because that is a different thing from a branch without a
+    /// queue and a caller reading `None` as "merge it directly" must not be
+    /// told it by a lookup that never reached GitHub.
+    pub async fn get_merge_queue(&self, branch_name: &str) -> Result<Option<MergeQueue>> {
+        let variables = merge_queue_query::Variables {
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
+            branch: branch_name.to_string(),
+        };
+        let request_body = MergeQueueQuery::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<merge_queue_query::ResponseData> = res.json().await?;
+
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(format!(
+                "querying the merge queue of branch '{branch_name}' failed"
+            )));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+
+        let merge_queue = response_body
+            .data
+            .ok_or_else(|| Error::new("failed to fetch the merge queue"))?
+            .repository
+            .ok_or_else(|| Error::new("failed to find repository"))?
+            .merge_queue;
+
+        Ok(merge_queue.map(|queue| MergeQueue {
+            url: queue.url,
+            next_entry_estimated_time_to_merge: queue.next_entry_estimated_time_to_merge,
+        }))
+    }
+
+    /// Put the Pull Request `node_id` names in the merge queue of its base
+    /// branch, and hand back the entry GitHub made for it.
+    ///
+    /// `head_oid` is the commit this enqueue is about. GitHub refuses the
+    /// enqueue where the Pull Request has moved on from it, which is what makes
+    /// this safe to ask for on the strength of a mergeability verdict taken a
+    /// moment earlier: the queue merges later, on its own schedule, so a push
+    /// that arrives in between would otherwise be queued by a land that never
+    /// looked at it.
+    pub async fn enqueue_pull_request(
+        &self,
+        node_id: &str,
+        head_oid: git2::Oid,
+    ) -> Result<MergeQueueEntry> {
+        let variables = enqueue_pull_request_mutation::Variables {
+            pull_request_id: node_id.to_string(),
+            expected_head_oid: format!("{}", head_oid),
+        };
+        let request_body = EnqueuePullRequestMutation::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<enqueue_pull_request_mutation::ResponseData> =
+            res.json().await?;
+
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(
+                "adding the Pull Request to the merge queue failed",
+            ));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+
+        // GitHub answers a successful mutation with the entry it made. An
+        // answer without one means the mutation reported no error and did
+        // nothing, which is not something to report as queued.
+        response_body
+            .data
+            .and_then(|data| data.enqueue_pull_request)
+            .and_then(|payload| payload.merge_queue_entry)
+            .map(|entry| MergeQueueEntry {
+                position: entry.position,
+                estimated_time_to_merge: entry.estimated_time_to_merge,
+            })
+            .ok_or_else(|| {
+                Error::new("GitHub did not say the Pull Request was added to the merge queue")
+            })
+    }
+
+    /// Where Pull Request `number` has got to in the merge queue it was put in.
+    ///
+    /// Asked repeatedly by a land that waits, so it fetches what tells the
+    /// three outcomes apart and nothing else.
+    pub async fn get_queued_pull_request(&self, number: u64) -> Result<QueuedPullRequest> {
+        let variables = merge_queue_entry_query::Variables {
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
+            number: number as i64,
+        };
+        let request_body = MergeQueueEntryQuery::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<merge_queue_entry_query::ResponseData> = res.json().await?;
+
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(format!(
+                "querying PR #{number} in the merge queue failed"
+            )));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+
+        let pr = response_body
+            .data
+            .ok_or_else(|| Error::new("failed to fetch PR"))?
+            .repository
+            .ok_or_else(|| Error::new("failed to find repository"))?
+            .pull_request
+            .ok_or_else(|| Error::new("failed to find PR"))?;
+
+        Ok(QueuedPullRequest {
+            state: match pr.state {
+                merge_queue_entry_query::PullRequestState::OPEN => PullRequestState::Open,
+                _ => PullRequestState::Closed,
+            },
+            merge_commit: pr
+                .merge_commit
+                .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
+            entry: pr.merge_queue_entry.map(|entry| MergeQueueEntry {
+                position: entry.position,
+                estimated_time_to_merge: entry.estimated_time_to_merge,
+            }),
+        })
+    }
+
+    /// Every closed, unmerged pull request in the repository, with the branches
+    /// it names.
+    ///
+    /// `CLOSED` is not `MERGED`: GraphQL keeps them apart, where the REST API
+    /// reports both as `closed` and leaves `merged_at` to tell them apart. So
+    /// nothing here has been merged, and every one of them is a pull request
+    /// somebody either closed or lost.
+    pub async fn get_closed_pull_requests(&self) -> Result<Vec<ClosedPullRequest>> {
+        let mut closed = Vec::new();
+        let mut after: Option<String> = None;
+
+        loop {
+            let variables = closed_pull_requests_query::Variables {
+                owner: self.config.owner.clone(),
+                name: self.config.repo.clone(),
+                first: 100,
+                after: after.clone(),
+            };
+            let request_body = ClosedPullRequestsQuery::build_query(variables);
+            let res = self
+                .graphql_client
+                .post("https://api.github.com/graphql")
+                .json(&request_body)
+                .send()
+                .await?;
+            let response_body: Response<closed_pull_requests_query::ResponseData> =
+                res.json().await?;
+
+            if let Some(errors) = response_body.errors {
+                let error = Err(Error::new(
+                    "fetching closed Pull Requests failed".to_string(),
+                ));
+                return errors
+                    .into_iter()
+                    .fold(error, |err, e| err.context(e.to_string()));
+            }
+
+            let prs = response_body
+                .data
+                .ok_or_else(|| Error::new("failed to fetch closed Pull Requests"))?
+                .repository
+                .ok_or_else(|| Error::new("failed to find repository"))?
+                .pull_requests;
+
+            if let Some(nodes) = prs.nodes {
+                for node in nodes.into_iter().flatten() {
+                    closed.push(ClosedPullRequest {
+                        number: node.number as u64,
+                        head: self.config.new_github_branch(&node.head_ref_name),
+                        base: self.config.new_github_branch(&node.base_ref_name),
+                    });
+                }
+            }
+
+            if prs.page_info.has_next_page {
+                after = prs.page_info.end_cursor;
+            } else {
+                break;
+            }
+        }
+
+        Ok(closed)
     }
 
     pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {
@@ -595,6 +1374,265 @@ impl GitHubBranch {
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
+    use crate::message::{build_commit_message, build_stack_section};
+
+    fn stack_text() -> String {
+        build_stack_section(&[121, 122], 122).unwrap()
+    }
+
+    /// A body as our own renderer would write it, so tests do not re-type how
+    /// the stack section is delimited.
+    fn body_with_stack(summary: &str, stack: &str) -> String {
+        let mut sections = message(summary);
+        sections.insert(MessageSection::Stack, stack.to_owned());
+        build_github_body(&sections)
+    }
+
+    /// A PR as GitHub would hand it back: the body parsed into sections at the
+    /// boundary, the way `get_pull_request` does. The Title and Pull Request
+    /// sections it also inserts are not needed here.
+    fn pull_request(body: &str) -> PullRequest {
+        PullRequest {
+            number: 122,
+            node_id: "PR_node".to_string(),
+            state: PullRequestState::Open,
+            title: "a title".to_string(),
+            body: Some(body.to_string()),
+            sections: parse_message(body, MessageSection::Summary),
+            base: GitHubBranch::new_from_branch_name("main", "origin", "main"),
+            head: GitHubBranch::new_from_branch_name("spr/a-title", "origin", "main"),
+            base_oid: git2::Oid::ZERO_SHA1,
+            head_oid: git2::Oid::ZERO_SHA1,
+            merge_commit: None,
+            reviewers: HashMap::new(),
+            review_status: None,
+        }
+    }
+
+    fn message(summary: &str) -> MessageSectionsMap {
+        [
+            (MessageSection::Title, "a title".to_string()),
+            (MessageSection::Summary, summary.to_string()),
+        ]
+        .into()
+    }
+
+    /// A body whose only difference from the commit message is the generated
+    /// Stack section has not been modified.
+    #[test]
+    fn test_stack_section_alone_is_not_a_message_change() {
+        let mut sections = message("the summary");
+        sections.insert(MessageSection::Stack, stack_text());
+        let body = build_github_body(&sections);
+        let mut update = PullRequestUpdate::default();
+
+        update.update_message(&pull_request(&body), &message("the summary"));
+
+        assert!(update.is_empty(), "unexpected update: {:?}", update);
+    }
+
+    /// Updating the message must not drop the Stack section.
+    #[test]
+    fn test_updating_the_message_keeps_the_stack_section() {
+        let body = body_with_stack("the old summary", &stack_text());
+        let mut update = PullRequestUpdate::default();
+
+        update.update_message(&pull_request(&body), &message("the new summary"));
+
+        let new_body = update.body.expect("body should be updated");
+        assert!(new_body.starts_with("the new summary"), "{new_body}");
+        assert!(new_body.contains("- #122 <- you are here"), "{new_body}");
+    }
+
+    #[test]
+    fn test_update_stack_section_adds_one_to_a_body_without_it() {
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request("the summary"), Some(&stack_text()));
+
+        let body = update.body.expect("body should be updated");
+        assert!(body.starts_with("the summary"), "{body}");
+        assert!(body.contains("- #122 <- you are here"), "{body}");
+    }
+
+    /// The list is re-rendered with the new stack, and the summary survives.
+    #[test]
+    fn test_update_stack_section_replaces_the_stack_list() {
+        let old = build_stack_section(&[121, 122], 122).unwrap();
+        let new = build_stack_section(&[121, 122, 123], 122).unwrap();
+        let body = body_with_stack("prose edited on GitHub", &old);
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request(&body), Some(&new));
+
+        let body = update.body.expect("body should be updated");
+        assert!(body.starts_with("prose edited on GitHub"), "{body}");
+        assert!(body.contains("- #123"), "{body}");
+    }
+
+    /// A PR that is no longer stacked loses its section.
+    #[test]
+    fn test_update_stack_section_removes_it_when_unstacked() {
+        let body = body_with_stack("the summary", &stack_text());
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request(&body), None);
+
+        assert_eq!(update.body.as_deref(), Some("the summary"));
+    }
+
+    /// An unchanged section must not provoke a pointless PATCH.
+    #[test]
+    fn test_update_stack_section_is_a_no_op_when_current() {
+        let body = body_with_stack("the summary", &stack_text());
+        let mut update = PullRequestUpdate::default();
+
+        update.update_stack_section(&pull_request(&body), Some(&stack_text()));
+
+        assert!(update.is_empty(), "unexpected update: {:?}", update);
+    }
+
+    /// A body GitHub hands back with a trailing newline is not a modified
+    /// body: the ⚠️ "message differs" warning and a PATCH would fire on every
+    /// run for a PR that is identical.
+    #[test]
+    fn test_a_trailing_newline_is_not_a_message_change() {
+        let mut update = PullRequestUpdate::default();
+
+        update.update_message(&pull_request("the summary\n"), &message("the summary"));
+
+        assert!(update.is_empty(), "unexpected update: {:?}", update);
+    }
+
+    /// The section parsed off a real PR body must not reach the commit message
+    /// that `jj spr amend` writes from `pull_request.sections`.
+    #[test]
+    fn test_stack_section_from_a_pr_body_stays_out_of_the_commit_message() {
+        let body = body_with_stack("the summary", &stack_text());
+
+        let sections = pull_request(&body).sections;
+
+        assert!(
+            sections.contains_key(&MessageSection::Stack),
+            "should parse"
+        );
+        let commit_message = build_commit_message(&sections);
+        assert!(!commit_message.contains("Stack"), "{commit_message}");
+        assert!(!commit_message.contains("#121"), "{commit_message}");
+    }
+
+    fn test_config() -> crate::config::Config {
+        crate::config::Config::new(
+            "acme".into(),
+            "codez".into(),
+            "origin".into(),
+            "master".into(),
+            "spr/foo/".into(),
+            false,
+        )
+    }
+
+    fn test_branch(name: &str) -> GitHubBranch {
+        GitHubBranch::new_from_branch_name(name, "origin", "master")
+    }
+
+    /// A retarget leaves behind the base branch jj-spr generated for the pull
+    /// request, and that one alone.
+    #[test]
+    fn a_generated_base_branch_a_pull_request_has_left_is_taken_away() {
+        let config = test_config();
+        let old = test_branch("spr/foo/master.a-feature");
+
+        assert_eq!(
+            base_branch_to_take_away(&config, &test_branch("master"), &old)
+                .map(GitHubBranch::branch_name),
+            Some("spr/foo/master.a-feature")
+        );
+    }
+
+    /// Two branches a retarget must never take away: the head branch of the pull
+    /// request below, which under a linear strategy is what a stacked pull request
+    /// is based on, and a branch somebody chose by hand. Deleting either would
+    /// close whatever is based on it.
+    #[test]
+    fn a_base_branch_that_is_not_ours_is_left_alone() {
+        let config = test_config();
+
+        for name in ["spr/foo/a-feature", "release-1.0", "master"] {
+            assert!(
+                base_branch_to_take_away(&config, &test_branch("master"), &test_branch(name))
+                    .is_none(),
+                "{name} is not this pull request's to delete"
+            );
+        }
+    }
+
+    /// Retargeting a pull request at the branch it already points at has left
+    /// nothing behind — and deleting that branch would be deleting its base.
+    #[test]
+    fn a_base_branch_that_was_not_left_is_not_taken_away() {
+        let config = test_config();
+        let base = test_branch("spr/foo/master.a-feature");
+
+        assert!(base_branch_to_take_away(&config, &base, &base).is_none());
+    }
+
+    /// The statuses that mean GitHub is holding the pull request back.
+    #[test]
+    fn unmet_requirements_are_read_off_merge_state_status() {
+        use pull_request_mergeability_query::MergeStateStatus as Status;
+
+        for status in [
+            Status::BLOCKED,
+            Status::DRAFT,
+            Status::DIRTY,
+            Status::BEHIND,
+        ] {
+            assert_eq!(
+                merge_requirements(&status),
+                MergeRequirements::Unmet,
+                "expected {status:?} to be treated as an unmet requirement"
+            );
+        }
+    }
+
+    /// `UNSTABLE` belongs here rather than above: it is GitHub's word for a
+    /// failing check that the base branch does not require, which it will
+    /// merge quite happily.
+    #[test]
+    fn met_requirements_are_read_off_merge_state_status() {
+        use pull_request_mergeability_query::MergeStateStatus as Status;
+
+        for status in [Status::CLEAN, Status::HAS_HOOKS, Status::UNSTABLE] {
+            assert_eq!(
+                merge_requirements(&status),
+                MergeRequirements::Met,
+                "expected {status:?} to be treated as met"
+            );
+        }
+    }
+
+    /// GitHub computes this lazily, so a pull request it has not looked at yet
+    /// — or has just had its base rewritten — answers `UNKNOWN`.
+    #[test]
+    fn uncomputed_requirements_are_unknown() {
+        assert_eq!(
+            merge_requirements(&pull_request_mergeability_query::MergeStateStatus::UNKNOWN),
+            MergeRequirements::Unknown
+        );
+    }
+
+    /// A status added to GitHub's schema after this build must not be read as
+    /// permission to merge.
+    #[test]
+    fn unrecognised_status_is_not_met() {
+        assert_eq!(
+            merge_requirements(&pull_request_mergeability_query::MergeStateStatus::Other(
+                "SOMETHING_NEW".to_string()
+            )),
+            MergeRequirements::Unknown
+        );
+    }
 
     #[test]
     fn test_new_from_ref_with_branch_name() {

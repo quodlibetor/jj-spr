@@ -6,6 +6,7 @@
  */
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -17,6 +18,17 @@ use crate::{
     message::{MessageSection, MessageSectionsMap, build_commit_message, parse_message},
 };
 use git2::Oid;
+
+/// The changes to read a stack order out of: the ones `jj log` shows by
+/// default, which for the usual configuration is every local change that has
+/// not landed yet.
+///
+/// The commits `jj spr diff` pushes to the pull request branches are in the
+/// repository too, and are mutable in the same sense, but they are built from
+/// scratch by [`Jujutsu::create_derived_commit`] and so carry none of the
+/// commit message's sections. Without a `Pull Request` field they cannot be
+/// mistaken for the local change they were made from.
+const LOCAL_CHANGES_REVSET: &str = "mutable()";
 
 #[derive(Debug, Clone)]
 pub enum DryRunAction {
@@ -35,6 +47,27 @@ pub enum DryRunAction {
     },
 }
 
+/// What a run would do to a pull request's generated stack section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackChange {
+    /// The pull request has no section and would gain one.
+    Added,
+    /// The pull request is no longer in a stack, so its section would go.
+    Removed,
+    /// The section is there but describes a different stack.
+    Rewritten,
+}
+
+impl StackChange {
+    pub fn describe(self) -> &'static str {
+        match self {
+            StackChange::Added => "would add the PR stack section",
+            StackChange::Removed => "would remove the PR stack section",
+            StackChange::Rewritten => "would rewrite the PR stack section",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedCommit {
     pub oid: Oid,
@@ -44,6 +77,13 @@ pub struct PreparedCommit {
     pub pull_request_number: Option<u64>,
     pub message_changed: bool,
     pub dry_run_action: Option<DryRunAction>,
+    /// Set during a dry run when this change's pull request would have its
+    /// stack section rewritten. Recorded alongside `dry_run_action` rather
+    /// than inside it because the two are independent: a change can need a
+    /// push, or a new section, or both, or a section and no push at all —
+    /// which is the case `dry_run_action` alone used to report as nothing to
+    /// do.
+    pub dry_run_stack_change: Option<StackChange>,
 }
 
 pub struct Jujutsu {
@@ -91,6 +131,35 @@ impl Jujutsu {
         Ok(merge_base)
     }
 
+    /// Get every commit in the stack that `top_change_id` belongs to, bottom-up.
+    ///
+    /// The stack is everything after `base_oid` up to that change, plus the
+    /// change's descendants — which is what a reader of any one of its PRs
+    /// wants to see, regardless of the revisions this run was asked to push.
+    /// `base_oid` is the commit the stack sits on and is itself excluded.
+    ///
+    /// Both arguments are resolved identities rather than anything the user
+    /// typed, which is what keeps this honest: a revision string would have to
+    /// be re-parsed here, and could then disagree with the range the caller
+    /// actually acted on. A change id is used for the top because it survives
+    /// the commit rewriting that `rewrite_commit_messages` does — a commit id
+    /// captured beforehand would be stale by the time this runs.
+    ///
+    /// Assumes the stack is linear. If the change has forked descendants they
+    /// are all returned, and the caller will render them as one stack — a known
+    /// limitation.
+    pub fn get_stack_commits(
+        &self,
+        config: &Config,
+        base_oid: Oid,
+        top_change_id: &str,
+    ) -> Result<Vec<PreparedCommit>> {
+        self.get_prepared_commits_for_revset(
+            config,
+            &format!("(({base_oid})..({top_change_id})) | (({top_change_id})::)"),
+        )
+    }
+
     pub fn get_prepared_commits_from_to(
         &self,
         config: &Config,
@@ -100,11 +169,23 @@ impl Jujutsu {
     ) -> Result<Vec<PreparedCommit>> {
         // Get commit range using jj
         let operator = if is_inclusive { "::" } else { ".." };
+        self.get_prepared_commits_for_revset(
+            config,
+            &format!("{}{}{}", from_revision, operator, to_revision),
+        )
+    }
+
+    /// Prepare every commit a revset selects, oldest first.
+    pub fn get_prepared_commits_for_revset(
+        &self,
+        config: &Config,
+        revset: &str,
+    ) -> Result<Vec<PreparedCommit>> {
         let output = self.run_captured_with_args([
             "log",
             "--no-graph",
             "-r",
-            &format!("{}{}{}", from_revision, operator, to_revision),
+            revset,
             "--template",
             "commit_id ++ \"\\n\"",
         ])?;
@@ -123,6 +204,44 @@ impl Jujutsu {
         commits.reverse();
 
         Ok(commits)
+    }
+
+    /// The pull requests of the local changes, grouped into stacks.
+    ///
+    /// Each group is one stack, and holds the pull request numbers of that
+    /// stack's changes in `jj log` order: newest change first, so a stack
+    /// reads top down the way `jj log` prints it. Groups themselves are in the
+    /// order their newest change appears in the log.
+    ///
+    /// A change that carries no pull request is left out, but it still joins
+    /// the changes on either side of it into one stack, because the dependency
+    /// between them is real whether or not the change between has been pushed.
+    pub fn get_local_pull_request_stacks(&self, config: &Config) -> Result<Vec<Vec<u64>>> {
+        // Back into the order `jj log` printed them in, which is the order the
+        // stacks are reported in.
+        let mut changes = self.get_prepared_commits_for_revset(config, LOCAL_CHANGES_REVSET)?;
+        changes.reverse();
+
+        let position: HashMap<Oid, usize> = changes
+            .iter()
+            .enumerate()
+            .map(|(index, change)| (change.oid, index))
+            .collect();
+
+        let mut pull_requests = Vec::with_capacity(changes.len());
+        let mut parents = Vec::with_capacity(changes.len());
+        for change in &changes {
+            pull_requests.push(change.pull_request_number);
+            parents.push(
+                self.git_repo
+                    .find_commit(change.oid)?
+                    .parent_ids()
+                    .filter_map(|parent| position.get(&parent).copied())
+                    .collect(),
+            );
+        }
+
+        Ok(group_into_stacks(&pull_requests, &parents))
     }
 
     pub fn check_no_uncommitted_changes(&self) -> Result<()> {
@@ -150,7 +269,7 @@ impl Jujutsu {
 
         for reference in refs {
             let reference = reference?;
-            if let Some(name) = reference.name() {
+            if let Ok(name) = reference.name() {
                 ref_names.insert(name.to_string());
             }
         }
@@ -296,6 +415,7 @@ impl Jujutsu {
             pull_request_number,
             message_changed: false,
             dry_run_action: None,
+            dry_run_stack_change: None,
         })
     }
 
@@ -318,7 +438,7 @@ impl Jujutsu {
         })
     }
 
-    fn get_change_id_for_commit(&self, commit_oid: Oid) -> Result<String> {
+    pub fn get_change_id_for_commit(&self, commit_oid: Oid) -> Result<String> {
         // Get the change ID for a given commit OID
         let output = self.run_captured_with_args([
             "log",
@@ -362,6 +482,70 @@ impl Jujutsu {
             )))
         }
     }
+}
+
+/// Gather the pull requests of a set of changes into one list per stack.
+///
+/// A stack is a connected run of the local ancestry graph: `parents[i]` holds
+/// the positions of change `i`'s parents that are themselves in the set, and
+/// changes joined by such a parent link belong to the same stack. Changes
+/// without a pull request are still linked through — the dependency they
+/// create is real whether or not they have been pushed — but contribute
+/// nothing to the result, so a stack that has no pull requests at all is
+/// dropped.
+///
+/// The order of `pull_requests` is kept, both between stacks and within them.
+fn group_into_stacks(pull_requests: &[Option<u64>], parents: &[Vec<usize>]) -> Vec<Vec<u64>> {
+    // Ancestry matters here only as a connection, not as a direction: parent
+    // and child are in the same stack whichever of them is reached first.
+    let mut neighbours = vec![Vec::new(); pull_requests.len()];
+    for (change, parents) in parents.iter().enumerate() {
+        for &parent in parents {
+            neighbours[change].push(parent);
+            neighbours[parent].push(change);
+        }
+    }
+
+    const UNGROUPED: usize = usize::MAX;
+    let mut stack_of = vec![UNGROUPED; pull_requests.len()];
+    let mut stack_count = 0;
+    for start in 0..pull_requests.len() {
+        if stack_of[start] != UNGROUPED {
+            continue;
+        }
+
+        let mut to_visit = vec![start];
+        stack_of[start] = stack_count;
+        while let Some(change) = to_visit.pop() {
+            for &neighbour in &neighbours[change] {
+                if stack_of[neighbour] == UNGROUPED {
+                    stack_of[neighbour] = stack_count;
+                    to_visit.push(neighbour);
+                }
+            }
+        }
+
+        stack_count += 1;
+    }
+
+    // Reading the pull requests out in the order they came in, rather than
+    // stack by stack, is what keeps that order inside each stack — and starts
+    // each stack at the position of the first pull request in it.
+    let mut stacks: Vec<Vec<u64>> = Vec::new();
+    let mut position_of_stack = vec![None; stack_count];
+    for (change, pull_request) in pull_requests.iter().enumerate() {
+        let Some(number) = *pull_request else {
+            continue;
+        };
+
+        let position = *position_of_stack[stack_of[change]].get_or_insert_with(|| {
+            stacks.push(Vec::new());
+            stacks.len() - 1
+        });
+        stacks[position].push(number);
+    }
+
+    stacks
 }
 
 fn get_jj_bin() -> PathBuf {
@@ -453,6 +637,130 @@ mod tests {
     use super::*;
     use std::{fs, path::Path};
     use tempfile::TempDir;
+
+    /// Changes in the two lists `group_into_stacks` takes them as: the pull
+    /// request each one carries, and the positions of its local parents.
+    type Changes = (Vec<Option<u64>>, Vec<Vec<usize>>);
+
+    /// A stack of changes, newest first: each carrying the pull request
+    /// `numbers` names for it, and each one the parent of the change before it.
+    ///
+    /// `first_position` is where the stack's changes sit in the whole set,
+    /// which is what its parent links are in terms of.
+    fn stack(first_position: usize, numbers: &[Option<u64>]) -> Changes {
+        let parents = (0..numbers.len())
+            .map(|position| {
+                let parent = first_position + position + 1;
+                if position + 1 < numbers.len() {
+                    vec![parent]
+                } else {
+                    // The oldest change's parent has landed, so it is not one
+                    // of the local changes.
+                    vec![]
+                }
+            })
+            .collect();
+
+        (numbers.to_vec(), parents)
+    }
+
+    /// Lay stacks out one after another, the way `jj log` prints them.
+    fn changes(stacks: &[Changes]) -> Changes {
+        let mut numbers = Vec::new();
+        let mut parents = Vec::new();
+        for (stack_numbers, stack_parents) in stacks {
+            numbers.extend(stack_numbers.iter().copied());
+            parents.extend(stack_parents.iter().cloned());
+        }
+        (numbers, parents)
+    }
+
+    /// A stack's changes come out in the order they went in, which is `jj
+    /// log`'s: newest change first.
+    #[test]
+    fn a_stack_keeps_its_order() {
+        let (numbers, parents) = stack(0, &[Some(3), Some(2), Some(1)]);
+        assert_eq!(group_into_stacks(&numbers, &parents), vec![vec![3, 2, 1]]);
+    }
+
+    /// Stacks that share no ancestry are independent, and each gets a group.
+    #[test]
+    fn unrelated_stacks_are_separate() {
+        let (numbers, parents) = changes(&[stack(0, &[Some(3), Some(2)]), stack(2, &[Some(1)])]);
+        assert_eq!(
+            group_into_stacks(&numbers, &parents),
+            vec![vec![3, 2], vec![1]]
+        );
+    }
+
+    /// A change that has not been pushed has no pull request to list, but the
+    /// changes above it still depend on the ones below, so it must not break
+    /// the stack in two.
+    #[test]
+    fn a_change_without_a_pull_request_still_joins_the_stack() {
+        let (numbers, parents) = stack(0, &[Some(2), None, Some(1)]);
+        assert_eq!(group_into_stacks(&numbers, &parents), vec![vec![2, 1]]);
+    }
+
+    /// A merge depends on every line it merges, so they are one stack.
+    #[test]
+    fn a_merge_joins_the_lines_it_merges() {
+        let numbers = vec![Some(4), Some(3), Some(2), Some(1)];
+        let parents = vec![vec![1, 2], vec![3], vec![3], vec![]];
+        assert_eq!(
+            group_into_stacks(&numbers, &parents),
+            vec![vec![4, 3, 2, 1]]
+        );
+    }
+
+    /// Two changes on the same parent are one stack for the same reason a
+    /// merge is: they have a change in common, and cannot be landed in any
+    /// order without regard for it.
+    #[test]
+    fn a_fork_is_one_stack() {
+        let numbers = vec![Some(3), Some(2), Some(1)];
+        let parents = vec![vec![2], vec![2], vec![]];
+        assert_eq!(group_into_stacks(&numbers, &parents), vec![vec![3, 2, 1]]);
+    }
+
+    /// Local changes that were never pushed have no place in a listing of
+    /// pull requests.
+    #[test]
+    fn a_stack_without_pull_requests_is_dropped() {
+        let (numbers, parents) = changes(&[stack(0, &[None, None]), stack(2, &[Some(1)])]);
+        assert_eq!(group_into_stacks(&numbers, &parents), vec![vec![1]]);
+    }
+
+    /// The stacks come out of the repository itself, so this checks the whole
+    /// path: the revset the changes are read with, the pull request each
+    /// change's message carries, and the ancestry that joins them.
+    #[test]
+    fn local_pull_request_stacks_are_read_from_the_repository() {
+        let (_temp_dir, repo_path) = create_jujutsu_test_repo();
+        let config = create_test_config();
+
+        for number in [1, 2] {
+            create_jujutsu_commit(
+                &repo_path,
+                &format!(
+                    "Change {number}\n\nPull Request: https://github.com/test_owner/test_repo/pull/{number}"
+                ),
+                &format!("content{number}"),
+            );
+        }
+        // A change that has not been pushed sits on top of the stack, and
+        // belongs to it without adding to it.
+        create_jujutsu_commit(&repo_path, "Not pushed yet", "content3");
+
+        let jj = Jujutsu::new(repo_path).expect("Failed to create Jujutsu instance");
+
+        assert_eq!(
+            jj.get_local_pull_request_stacks(&config)
+                .expect("Failed to read the local stacks"),
+            vec![vec![2, 1]],
+            "the stack should be one group, newest change first"
+        );
+    }
 
     fn create_test_config() -> Config {
         Config::new(
@@ -610,6 +918,36 @@ mod tests {
                 last_commit_title
             );
         }
+    }
+
+    #[test]
+    fn test_prepared_commits_for_children_revset() {
+        let (_temp_dir, repo_path) = create_jujutsu_test_repo();
+        let config = create_test_config();
+
+        create_jujutsu_commit(&repo_path, "First commit", "content1");
+        create_jujutsu_commit(&repo_path, "Second commit", "content2");
+
+        let jj = Jujutsu::new(repo_path.clone()).expect("Failed to create Jujutsu instance");
+
+        // The commit ID of the first commit, which `land` would be landing.
+        let first = jj
+            .resolve_revision_to_commit_id("@--")
+            .expect("Failed to resolve @--");
+
+        let children = jj
+            .get_prepared_commits_for_revset(&config, &format!("children({})", first))
+            .expect("Failed to get children");
+
+        assert_eq!(children.len(), 1, "the first commit has one child");
+        assert!(
+            children[0]
+                .message
+                .get(&MessageSection::Title)
+                .expect("child should have a title")
+                .contains("Second commit"),
+            "the child of the first commit is the second commit"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub struct PatchOptions {
 pub async fn patch(
     _opts: PatchOptions,
     _jj: &crate::jj::Jujutsu,
-    _gh: &mut crate::github::GitHub,
+    _gh: &crate::github::GitHub,
     _config: &crate::config::Config,
 ) -> Result<()> {
     // TODO: Implement Jujutsu-native patch functionality

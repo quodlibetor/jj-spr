@@ -69,6 +69,10 @@
                 lockFile = ./Cargo.lock;
               };
 
+              # The flake source has no .git for the build script to ask, so
+              # tell it what `jj-spr --version` should report.
+              env.JJ_SPR_BUILD_REV = self.shortRev or self.dirtyShortRev or "unknown";
+
               buildInputs = with pkgs; [
                 openssl
                 zlib

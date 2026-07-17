@@ -61,6 +61,23 @@ fn test_binary_exists_and_has_correct_identity() {
 }
 
 #[test]
+fn test_version_names_the_commit_it_was_built_from() {
+    let output = run_jj_spr(&["--version"], None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Anything running this test was built from a checkout, so the build
+    // script had a revision to report.
+    let prefix = format!("jj-spr {} (", env!("CARGO_PKG_VERSION"));
+    let rev = stdout
+        .trim()
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("--version should name a build revision, got {stdout:?}"));
+
+    assert!(!rev.is_empty(), "build revision should not be empty");
+}
+
+#[test]
 fn test_help_shows_jujutsu_subcommand_identity() {
     let output = run_jj_spr(&["--help"], None);
     assert!(output.status.success(), "Should show help");
@@ -320,6 +337,44 @@ fn test_list_command_behavior() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!all_output.is_empty(), "Should produce error message");
+}
+
+// ============================================================================
+// CHERRY-PICK FLAG TESTS
+// ============================================================================
+
+#[test]
+fn test_diff_rejects_conflicting_cherry_pick_flags() {
+    let (_temp_dir, repo_path) = create_jj_repo();
+    let output = run_jj_spr(
+        &["diff", "--cherry-pick", "--no-cherry-pick"],
+        Some(&repo_path),
+    );
+    assert!(
+        !output.status.success(),
+        "Conflicting flags should cause a non-zero exit"
+    );
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        all_output.contains("cannot be used with"),
+        "Error message should mention argument conflict, got: {}",
+        all_output
+    );
+}
+
+#[test]
+fn test_diff_help_mentions_no_cherry_pick() {
+    let output = run_jj_spr(&["diff", "--help"], None);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no-cherry-pick"),
+        "diff --help should document --no-cherry-pick"
+    );
 }
 
 // ============================================================================

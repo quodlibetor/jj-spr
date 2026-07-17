@@ -1,0 +1,13 @@
+mutation EnqueuePullRequestMutation(
+  $pullRequestId: ID!
+  $expectedHeadOid: GitObjectID!
+) {
+  enqueuePullRequest(
+    input: { pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid }
+  ) {
+    mergeQueueEntry {
+      position
+      estimatedTimeToMerge
+    }
+  }
+}

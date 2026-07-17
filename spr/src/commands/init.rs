@@ -9,7 +9,10 @@ use indoc::formatdoc;
 use lazy_regex::regex;
 
 use crate::{
-    config::{AuthTokenSource, get_auth_token_with_source, set_jj_config},
+    config::{
+        AuthTokenSource, BaseStrategy, LandStrategy, StackDisplay, get_auth_token_with_source,
+        get_config_value, set_jj_config,
+    },
     error::{Error, Result, ResultExt},
     output::output,
 };
@@ -131,7 +134,12 @@ pub async fn init() -> Result<()> {
         ),
     )?;
 
-    let url = repo.git_repo.find_remote(&remote)?.url().map(String::from);
+    let url = repo
+        .git_repo
+        .find_remote(&remote)?
+        .url()
+        .ok()
+        .map(String::from);
     let regex = lazy_regex::regex!(r#"github\.com[/:]([\w\-\.]+/[\w\-\.]+?)(.git)?$"#);
     let github_repo = config
         .get_string("spr.githubRepository")
@@ -198,7 +206,185 @@ pub async fn init() -> Result<()> {
 
     set_jj_config("spr.branchPrefix", &branch_prefix, &path)?;
 
+    // What a stacked pull request is based on
+
+    console::Term::stdout().write_line("")?;
+
+    output(
+        "❓",
+        &formatdoc!(
+            "What should a stacked pull request be based on? This only comes \
+             up once you stack: a change sitting directly on the main branch \
+             gets a pull request against the main branch either way.
+             'synthetic' gives every stacked pull request a base branch of its \
+             own, carrying the tree of the change below it. Each pull request \
+             then stands alone, so you can push one change without the ones \
+             below it being up to date on GitHub.
+             'linear' bases each pull request on the pull request branch of \
+             the change below it, so the stack on GitHub is a chain of \
+             branches. It wants the whole stack pushed in one run, since a \
+             stale branch below would leak its changes into the diff above.
+             'linear-rebase' does the same and additionally builds each pull \
+             request branch as a chain of ordinary commits, which is the only \
+             shape that survives GitHub rebasing it. Pick this one if you want \
+             GitHub to draw and merge your stacks. It is also the only \
+             strategy that force-pushes, and only when a base has moved."
+        ),
+    )?;
+
+    let base_strategy = select_one(
+        "Base strategy",
+        &BaseStrategy::ALL,
+        BaseStrategy::as_str,
+        get_config_value("spr.baseStrategy", &config)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    )?;
+
+    set_jj_config("spr.baseStrategy", base_strategy.as_str(), &path)?;
+
+    // How a pull request says which stack it belongs to
+
+    console::Term::stdout().write_line("")?;
+
+    output(
+        "❓",
+        &formatdoc!(
+            "How should a pull request say which stack it belongs to? Only one \
+             of these, because two descriptions of the same stack can disagree.
+             'section' writes a `Stack` list into each pull request's body, \
+             marking the one you are reading. It asks nothing of the \
+             repository, so it works everywhere.
+             'none' says nothing, and leaves the stack visible only in the \
+             branches."
+        ),
+    )?;
+
+    // GitHub's stacks are offered only where the base strategy can carry one:
+    // they require each pull request to be based on the branch of the one
+    // below, which the synthetic strategy never does, and the pair is the
+    // combination the configuration refuses. Leaving the value off the list is
+    // also how `init` heals a repository that already holds it.
+    let github_offered = base_strategy.bases_on_the_change_below();
+
+    if github_offered {
+        output(
+            "  ",
+            &formatdoc!(
+                "'github' registers the pull requests with GitHub's Stacked \
+                 Pull Requests API instead, so GitHub draws the stack itself — \
+                 on each pull request and in the repository's list of stacks. \
+                 Better where you can have it, but it is in public preview and \
+                 not every repository has it yet."
+            ),
+        )?;
+    } else {
+        output(
+            "ℹ️ ",
+            "GitHub-native stacks need a linear base strategy, so they are not offered here.",
+        )?;
+    }
+
+    let displays = StackDisplay::ALL
+        .into_iter()
+        .filter(|display| github_offered || !display.draws_the_stack())
+        .collect::<Vec<_>>();
+
+    let stack_display = select_one(
+        "Stack display",
+        &displays,
+        StackDisplay::as_str,
+        get_config_value("spr.stackDisplay", &config)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    )?;
+
+    set_jj_config("spr.stackDisplay", stack_display.as_str(), &path)?;
+
+    // How a pull request is landed
+
+    console::Term::stdout().write_line("")?;
+
+    output(
+        "❓",
+        &formatdoc!(
+            "How should `jj spr land` land a pull request?
+             'auto' asks GitHub which of the other two the default branch \
+             allows, and is right for nearly every repository: a branch with a \
+             merge queue takes no merge that does not go through it, and a \
+             branch without one has no queue to join.
+             'merge' squash-merges the pull request there and then.
+             'queue' puts it in the merge queue GitHub keeps for the default \
+             branch, and leaves the merging to GitHub."
+        ),
+    )?;
+
+    // `stack` is offered only where the answers above can carry it: it needs a
+    // stack to merge and the branches `linear-rebase` builds, and refuses the
+    // land without both. Offering it regardless would let `init` write a
+    // configuration under which no land succeeds — and leaving it out where it
+    // was configured before is how `init` heals one that already says so.
+    let stack_offered = stack_display.draws_the_stack() && base_strategy.rebases_branches();
+
+    if stack_offered {
+        output(
+            "  ",
+            &formatdoc!(
+                "'stack' hands the whole chain to GitHub's stacked pull \
+                 requests: one request merges this pull request and every \
+                 member of its stack below it, and GitHub retargets and \
+                 rebases the ones above. 'auto' never picks it, because GitHub \
+                 words each squash commit from the repository's settings \
+                 rather than from your commit message."
+            ),
+        )?;
+    }
+
+    let land_strategies = LandStrategy::ALL
+        .into_iter()
+        .filter(|strategy| stack_offered || *strategy != LandStrategy::Stack)
+        .collect::<Vec<_>>();
+
+    let land_strategy = select_one(
+        "Land strategy",
+        &land_strategies,
+        LandStrategy::as_str,
+        get_config_value("spr.landStrategy", &config)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    )?;
+
+    set_jj_config("spr.landStrategy", land_strategy.as_str(), &path)?;
+
     Ok(())
+}
+
+/// Ask which of `options` to use, starting on `current` and returning the one
+/// that was picked.
+///
+/// The strategy settings are all of this shape — a small closed set of names
+/// that round-trip through the configuration — and the part worth not
+/// repeating is starting the cursor on what is configured already, so that
+/// running `jj spr init` again over an existing repository and pressing Enter
+/// through it changes nothing.
+fn select_one<T: Copy + PartialEq>(
+    prompt: &str,
+    options: &[T],
+    name: impl Fn(T) -> &'static str,
+    current: T,
+) -> Result<T> {
+    let chosen = dialoguer::Select::new()
+        .with_prompt(prompt)
+        .items(options.iter().map(|&option| name(option)))
+        .default(
+            options
+                .iter()
+                .position(|&option| option == current)
+                .unwrap_or(0),
+        )
+        .interact()?;
+
+    Ok(options[chosen])
 }
 
 fn validate_branch_prefix(branch_prefix: &str) -> Result<()> {

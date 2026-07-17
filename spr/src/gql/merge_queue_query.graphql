@@ -1,0 +1,8 @@
+query MergeQueueQuery($name: String!, $owner: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue(branch: $branch) {
+      url
+      nextEntryEstimatedTimeToMerge
+    }
+  }
+}
