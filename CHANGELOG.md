@@ -110,6 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Choosing `github` or `none` takes existing sections away rather than leaving
   them to rot.
 
+- The `Stack` section is delimited by markers, so jj-spr can find and replace
+  exactly its own text and leave the rest of a pull request body alone. Anything
+  you write above or below it survives a rewrite, and a body edited on GitHub
+  keeps your edits.
+
 - `spr.stackDisplay` chooses how a pull request says which stack it belongs to.
   There are two ways of saying it and they are alternatives, not layers — two
   descriptions of the same stack can disagree — so it is one setting with three

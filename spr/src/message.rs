@@ -32,6 +32,9 @@ pub fn message_section_label(section: &MessageSection) -> &'static str {
     match section {
         Title => "Title",
         Summary => "Summary",
+        // Unreachable: `build_message` writes the stack section between markers
+        // instead of labelling it. Kept so the match stays exhaustive, and to
+        // name the label that older bodies still carry.
         Stack => "PR Stack",
         Reviewers => "Reviewers",
         ReviewedBy => "Reviewed By",
@@ -46,10 +49,14 @@ pub fn message_section_by_label(label: &str) -> Option<MessageSection> {
     match &label.to_ascii_lowercase()[..] {
         "title" => Some(Title),
         "summary" => Some(Summary),
-        // Only the label this renders. A bare "stack" is not accepted: nothing
-        // writes it, and `Stack: React + Postgres` is ordinary prose in a
-        // commit message — claiming it would delete the line, since
-        // `build_commit_message` omits this section.
+        // Read-only compatibility: bodies labelled before the markers are
+        // still on GitHub and must still parse. Nothing writes this label any
+        // more — see STACK_BEGIN.
+        //
+        // A bare "stack" is deliberately not accepted: nothing ever wrote it,
+        // and `Stack: React + Postgres` is ordinary prose in a commit message —
+        // claiming it would delete the line, since `build_commit_message` omits
+        // this section.
         "pr stack" => Some(Stack),
         "reviewer" => Some(Reviewers),
         "reviewers" => Some(Reviewers),
@@ -60,8 +67,86 @@ pub fn message_section_by_label(label: &str) -> Option<MessageSection> {
     }
 }
 
+/// Markers delimiting the generated [`MessageSection::Stack`] in a PR body.
+///
+/// They are HTML comments, so GitHub does not render them and nobody types one
+/// by accident. They also free the section's text from the label grammar, which
+/// admits only word characters and spaces, so the section can carry a rule and
+/// a sentence.
+///
+/// This is what new bodies use. The `PR Stack:` label is still accepted on read
+/// for bodies written before it — so a summary line shaped like that label is
+/// still claimed by the section, which the markers do not change.
+const STACK_BEGIN: &str = "<!-- spr-stack -->";
+const STACK_END: &str = "<!-- /spr-stack -->";
+
+/// Split the stack section out of a PR body, returning the rest of the body.
+///
+/// Takes the last *terminated* marker pair, searching back from the last
+/// `STACK_END` for the `STACK_BEGIN` that opens it, and requiring each to own
+/// its line. That is the one we wrote: [`build_github_body`] renders the
+/// section last, so an earlier pair is someone quoting the format.
+///
+/// A marker with nothing closing it is ordinary text. It must not swallow the
+/// rest of the body, which would take the `Pull Request:` line with it — and a
+/// change whose PR link has vanished gets a second PR opened for it.
+///
+/// Known limitation: a body whose *only* marker pair is a quotation — someone
+/// documenting this format, in a code fence say — has it taken as the section.
+/// Telling the two apart needs a Markdown parser; the fence this replaced had
+/// the same hazard.
+fn split_stack_section(msg: &str) -> (String, Option<String>) {
+    let Some(end) = rfind_line(msg, STACK_END) else {
+        return (msg.to_owned(), None);
+    };
+    let Some(begin) = rfind_line(&msg[..end], STACK_BEGIN) else {
+        return (msg.to_owned(), None);
+    };
+
+    let text = msg[begin + STACK_BEGIN.len()..end].trim().to_owned();
+    let before = msg[..begin].trim();
+    let rest = msg[end + STACK_END.len()..].trim();
+
+    // Rejoin as separate paragraphs: run together with a single newline they
+    // would render as one.
+    let remainder = match (before.is_empty(), rest.is_empty()) {
+        (true, _) => rest.to_owned(),
+        (_, true) => before.to_owned(),
+        _ => format!("{before}\n\n{rest}"),
+    };
+
+    (remainder, Some(text))
+}
+
+/// Byte offset of the last `marker` that is alone on its line.
+///
+/// A marker with text around it is prose mentioning the marker, not a
+/// delimiter.
+fn rfind_line(msg: &str, marker: &str) -> Option<usize> {
+    msg.match_indices(marker)
+        .filter(|(at, _)| {
+            let before_is_clear = msg[..*at].chars().next_back().is_none_or(|c| c == '\n');
+            let after_is_clear = msg[at + marker.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == '\n');
+            before_is_clear && after_is_clear
+        })
+        .map(|(at, _)| at)
+        .last()
+}
+
 pub fn parse_message(msg: &str, top_section: MessageSection) -> MessageSectionsMap {
     let regex = lazy_regex::regex!(r#"^\s*([\w\s]+?)\s*:\s*(.*)$"#);
+
+    // Only a PR body carries a stack section, so only a PR body is searched for
+    // one. A commit message that merely quotes the markers — this feature's own
+    // documentation, say — keeps its text.
+    let (msg, stack) = if top_section == MessageSection::Summary {
+        split_stack_section(msg)
+    } else {
+        (msg.to_owned(), None)
+    };
 
     let mut section = top_section;
     let mut lines_in_section = Vec::<&str>::new();
@@ -100,6 +185,10 @@ pub fn parse_message(msg: &str, top_section: MessageSection) -> MessageSectionsM
         append_to_message_section(sections.entry(section), lines_in_section.join("\n").trim());
     }
 
+    if let Some(text) = stack {
+        sections.insert(MessageSection::Stack, text);
+    }
+
     sections
 }
 
@@ -131,6 +220,14 @@ pub fn build_message(section_texts: &MessageSectionsMap, sections: &[MessageSect
         if let Some(text) = value {
             if !result.is_empty() {
                 result.push('\n');
+            }
+
+            // The stack section is delimited by markers rather than a label —
+            // see STACK_BEGIN. Its text is free-form, so it is written out
+            // between them verbatim.
+            if section == &MessageSection::Stack {
+                result.push_str(&format!("{STACK_BEGIN}\n{text}\n{STACK_END}\n"));
+                continue;
             }
 
             if section != &MessageSection::Title && section != &MessageSection::Summary {
@@ -176,6 +273,11 @@ pub fn build_commit_message(section_texts: &MessageSectionsMap) -> String {
     )
 }
 
+/// Build the body for the PR.
+///
+/// `Stack` must stay last: [`split_stack_section`] reads the section back by
+/// taking the final marker pair, so a section rendered after it would let prose
+/// below the stack claim to be it.
 pub fn build_github_body(section_texts: &MessageSectionsMap) -> String {
     build_message(
         section_texts,
@@ -187,8 +289,7 @@ pub fn build_github_body(section_texts: &MessageSectionsMap) -> String {
 ///
 /// `stack` lists the stack's PR numbers bottom-up, the order the stack is built
 /// in. It renders them top-down, the way a stack is drawn — `jj log` puts the
-/// tip at the top. The section's own label heads the list, so this renders only
-/// the list itself.
+/// tip at the top — which is why it asks for review from the bottom up.
 ///
 /// Returns `None` for a stack that does not need the section: one PR is not a
 /// stack, and a stack we cannot place `current` in would render a list with no
@@ -198,7 +299,7 @@ pub fn build_stack_section(stack: &[u64], current: u64) -> Option<String> {
         return None;
     }
 
-    let mut text = String::new();
+    let mut text = String::from("---\nPR stack, review from the bottom up:\n");
     for number in stack.iter().rev() {
         text.push_str(&format!("- #{number}"));
         if *number == current {
@@ -329,6 +430,8 @@ Reviewer:    a, b, c"#,
     }
 
     const STACK_TEXT: &str = "\
+---
+PR stack, review from the bottom up:
 - #123
 - #122 <- you are here
 - #121";
@@ -383,7 +486,12 @@ Reviewer:    a, b, c"#,
         let body = build_github_body(&stacked_sections());
 
         assert!(body.starts_with("the summary"), "body was: {body}");
-        assert!(body.contains("PR Stack:\n"), "body was: {body}");
+        assert!(body.contains("<!-- spr-stack -->\n"), "body was: {body}");
+        assert!(body.contains("<!-- /spr-stack -->"), "body was: {body}");
+        assert!(
+            body.contains("PR stack, review from the bottom up:"),
+            "body was: {body}"
+        );
         assert!(body.contains("- #122 <- you are here"), "body was: {body}");
     }
 
@@ -423,6 +531,138 @@ Reviewer:    a, b, c"#,
         assert!(
             build_commit_message(&sections).contains("Stack: React + Postgres"),
             "the line must survive a round trip through the commit message"
+        );
+    }
+    /// The markers, unlike a label, let the section carry a rule and a
+    /// sentence with punctuation the label grammar would reject.
+    #[test]
+    fn test_stack_section_may_contain_a_rule_and_prose() {
+        let body = build_github_body(&stacked_sections());
+        let parsed = parse_message(&body, MessageSection::Summary);
+
+        assert_eq!(
+            parsed.get(&MessageSection::Stack),
+            Some(&STACK_TEXT.to_string())
+        );
+        assert!(STACK_TEXT.contains("---"));
+        assert!(STACK_TEXT.contains("PR stack, review from the bottom up:"));
+    }
+
+    /// Bodies written before the markers labelled the section, and are still on
+    /// GitHub, so the label is still honoured on read — and with it the label's
+    /// hazard: a summary line shaped like it is still claimed by the section.
+    /// The markers are what new bodies use; they are not a fix for that.
+    #[test]
+    fn test_a_plain_stack_label_is_still_honoured() {
+        let sections = parse_message("PR Stack: this is my prose", MessageSection::Summary);
+
+        assert_eq!(
+            sections.get(&MessageSection::Stack),
+            Some(&"this is my prose".to_string())
+        );
+    }
+
+    /// A marker with prose around it is someone mentioning the marker, not a
+    /// delimiter.
+    #[test]
+    fn test_a_marker_not_alone_on_its_line_is_prose() {
+        let body =
+            "the summary\n\nthe <!-- spr-stack --> marker opens it\n- #1\n<!-- /spr-stack -->";
+        let parsed = parse_message(body, MessageSection::Summary);
+
+        assert_eq!(parsed.get(&MessageSection::Stack), None);
+        assert!(
+            parsed
+                .get(&MessageSection::Summary)
+                .unwrap()
+                .contains("the <!-- spr-stack --> marker opens it")
+        );
+    }
+
+    /// Everything between the markers belongs to the section, including lines
+    /// that would otherwise read as a label.
+    #[test]
+    fn test_markers_shield_their_contents_from_the_label_grammar() {
+        let body =
+            "the summary\n\n<!-- spr-stack -->\nSummary: not really\n- #1\n<!-- /spr-stack -->";
+        let parsed = parse_message(body, MessageSection::Summary);
+
+        assert_eq!(
+            parsed.get(&MessageSection::Summary),
+            Some(&"the summary".to_string())
+        );
+        assert_eq!(
+            parsed.get(&MessageSection::Stack),
+            Some(&"Summary: not really\n- #1".to_string())
+        );
+    }
+
+    /// An unterminated marker must not swallow the rest of the body — doing so
+    /// would take the `Pull Request:` line with it, and a change whose PR link
+    /// has vanished gets a second PR opened for it.
+    #[test]
+    fn test_an_unterminated_marker_is_ordinary_text() {
+        let body = "the summary\n\n<!-- spr-stack -->\n- #1\n\nPull Request: https://x/1";
+        let parsed = parse_message(body, MessageSection::Summary);
+
+        assert_eq!(parsed.get(&MessageSection::Stack), None);
+        assert_eq!(
+            parsed.get(&MessageSection::PullRequest),
+            Some(&"https://x/1".to_string()),
+            "the tail of the body must survive an unterminated marker"
+        );
+    }
+
+    /// A commit message is never searched for a stack section, so one that
+    /// quotes the markers — this feature's own documentation, say — keeps its
+    /// text.
+    #[test]
+    fn test_a_commit_message_quoting_the_markers_is_untouched() {
+        let msg = "feat: docs\n\nThe body looks like:\n\n```\n<!-- spr-stack -->\n- #1\n<!-- /spr-stack -->\n```\n\nPull Request: https://x/1";
+        let parsed = parse_message(msg, MessageSection::Title);
+
+        assert_eq!(parsed.get(&MessageSection::Stack), None);
+        let summary = parsed.get(&MessageSection::Summary).unwrap();
+        assert!(
+            summary.contains("<!-- spr-stack -->"),
+            "summary was: {summary}"
+        );
+        assert!(summary.contains("- #1"), "summary was: {summary}");
+        assert_eq!(
+            parsed.get(&MessageSection::PullRequest),
+            Some(&"https://x/1".to_string())
+        );
+    }
+
+    /// Only the section we wrote is taken. `build_message` renders it last, so
+    /// an earlier marker pair is someone quoting the format.
+    #[test]
+    fn test_the_last_marker_pair_is_the_stack_section() {
+        let body = "quoting the format:\n\n<!-- spr-stack -->\n- #999\n<!-- /spr-stack -->\n\n<!-- spr-stack -->\n- #1\n<!-- /spr-stack -->";
+        let parsed = parse_message(body, MessageSection::Summary);
+
+        assert_eq!(
+            parsed.get(&MessageSection::Stack),
+            Some(&"- #1".to_string())
+        );
+    }
+
+    /// Prose written below the section on GitHub must survive. It moves above
+    /// the section, which is rendered last, but it is not lost.
+    #[test]
+    fn test_prose_below_the_section_is_kept() {
+        let body = format!(
+            "the summary\n\n<!-- spr-stack -->\n{STACK_TEXT}\n<!-- /spr-stack -->\n\nPlease review carefully."
+        );
+        let parsed = parse_message(&body, MessageSection::Summary);
+
+        assert_eq!(
+            parsed.get(&MessageSection::Summary),
+            Some(&"the summary\n\nPlease review carefully.".to_string())
+        );
+        assert_eq!(
+            parsed.get(&MessageSection::Stack),
+            Some(&STACK_TEXT.to_string())
         );
     }
 
