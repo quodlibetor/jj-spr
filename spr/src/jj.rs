@@ -35,6 +35,27 @@ pub enum DryRunAction {
     },
 }
 
+/// What a run would do to a pull request's generated stack section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackChange {
+    /// The pull request has no section and would gain one.
+    Added,
+    /// The pull request is no longer in a stack, so its section would go.
+    Removed,
+    /// The section is there but describes a different stack.
+    Rewritten,
+}
+
+impl StackChange {
+    pub fn describe(self) -> &'static str {
+        match self {
+            StackChange::Added => "would add the PR stack section",
+            StackChange::Removed => "would remove the PR stack section",
+            StackChange::Rewritten => "would rewrite the PR stack section",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedCommit {
     pub oid: Oid,
@@ -44,6 +65,13 @@ pub struct PreparedCommit {
     pub pull_request_number: Option<u64>,
     pub message_changed: bool,
     pub dry_run_action: Option<DryRunAction>,
+    /// Set during a dry run when this change's pull request would have its
+    /// stack section rewritten. Recorded alongside `dry_run_action` rather
+    /// than inside it because the two are independent: a change can need a
+    /// push, or a new section, or both, or a section and no push at all —
+    /// which is the case `dry_run_action` alone used to report as nothing to
+    /// do.
+    pub dry_run_stack_change: Option<StackChange>,
 }
 
 pub struct Jujutsu {
@@ -337,6 +365,7 @@ impl Jujutsu {
             pull_request_number,
             message_changed: false,
             dry_run_action: None,
+            dry_run_stack_change: None,
         })
     }
 

@@ -110,6 +110,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Choosing `github` or `none` takes existing sections away rather than leaving
   them to rot.
 
+- `jj spr diff --dry-run` reports what it would do to each pull request's
+  `Stack` section — add one, rewrite it, or take it away — including for a
+  change whose branch is already pushed and whose only remaining work is its
+  body. It says so rather than report nothing to do. Sections are not reported
+  for a run that would open pull requests, since a change with no number yet
+  cannot be placed in the stack and a section worked out without it would be
+  wrong rather than merely incomplete.
+
 - The `Stack` section is delimited by markers, so jj-spr can find and replace
   exactly its own text and leave the rest of a pull request body alone. Anything
   you write above or below it survives a rewrite, and a body edited on GitHub

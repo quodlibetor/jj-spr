@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::HashMap;
 use std::iter::zip;
 
 use crate::{
@@ -14,6 +15,7 @@ use crate::{
         GitHub, GitHubBranch, PullRequest, PullRequestRequestReviewers, PullRequestState,
         PullRequestUpdate,
     },
+    jj::{DryRunAction, StackChange},
     message::{MessageSection, build_stack_section, validate_commit_message},
     native_stacks::{
         ChainLink, DissolveReason, Reconciliation, StackSession, dissolve_any_stack_holding,
@@ -161,10 +163,31 @@ pub async fn diff(
     let stack_top_change_id = jj.get_change_id_for_commit(top_commit.oid)?;
 
     // A change this run would open a pull request for has no number yet, and a
-    // dry run opens nothing, so there is no number to give it.
+    // dry run opens nothing, so there is no number to give it. The stack it
+    // ends up in is therefore one we cannot name, and a section worked out
+    // without it would be wrong rather than merely incomplete — a change whose
+    // neighbour is new would look like it was leaving the stack. So the
+    // sections are only reported for a run that opens nothing.
     let would_create_pull_requests = prepared_commits
         .iter()
         .any(|commit| commit.pull_request_number.is_none());
+
+    // Otherwise a dry run pushes nothing, so no pull request numbers appear
+    // while it runs and the stack's shape is already settled. Working the
+    // sections out before the loop rather than after it — the order a real run
+    // has to use — lets each change weigh its own section before reporting
+    // whether it is up to date. `--cherry-pick` writes no sections at all; see
+    // below.
+    let plan_sections = opts.dry_run && !opts.cherry_pick && !would_create_pull_requests;
+    let stack_changes: HashMap<u64, StackChange> = if plan_sections {
+        plan_stack_sections(jj, gh, config, stack_base_oid, &stack_top_change_id)
+            .await?
+            .into_iter()
+            .map(|(number, _, change)| (number, change))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     // Registering the run's pull requests as a stack GitHub draws itself is a
     // step around the loop rather than a way of running it: `None` is the whole
@@ -244,6 +267,7 @@ pub async fn diff(
             pull_request,
             change_below.as_ref(),
             stacks.as_mut(),
+            &stack_changes,
         )
         .await;
 
@@ -320,10 +344,12 @@ pub async fn diff(
     }
 
     if opts.dry_run {
+        // A change with only a stack section to rewrite still counts as work:
+        // a real run would edit its pull request body.
         let actions: Vec<_> = prepared_commits
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.dry_run_action.is_some())
+            .filter(|(_, c)| c.dry_run_action.is_some() || c.dry_run_stack_change.is_some())
             .collect();
 
         output(
@@ -342,8 +368,10 @@ pub async fn diff(
                 .unwrap_or("");
             let pos = idx + 1;
 
-            let (action_label, base, head, reviewers_list) = match &pc.dry_run_action {
-                Some(crate::jj::DryRunAction::Create {
+            // `branches` is None for a change whose only work is its stack
+            // section: nothing is pushed, so there is no head or base to name.
+            let (action_label, branches, reviewers_list) = match &pc.dry_run_action {
+                Some(DryRunAction::Create {
                     base,
                     head,
                     draft,
@@ -355,31 +383,46 @@ pub async fn diff(
                     } else {
                         "CREATE".to_string()
                     };
-                    (label, base.as_str(), head.as_str(), reviewers.clone())
+                    (
+                        label,
+                        Some((head.as_str(), base.as_str())),
+                        reviewers.clone(),
+                    )
                 }
-                Some(crate::jj::DryRunAction::Update {
+                Some(DryRunAction::Update {
                     pr_number,
                     base,
                     head,
                     ..
                 }) => {
                     let label = format!("UPDATE PR #{pr_number}");
-                    (label, base.as_str(), head.as_str(), vec![])
+                    (label, Some((head.as_str(), base.as_str())), vec![])
                 }
-                None => continue,
+                None => {
+                    let label = match pc.pull_request_number {
+                        Some(number) => format!("UPDATE PR #{number} (body only)"),
+                        None => "UPDATE (body only)".to_string(),
+                    };
+                    (label, None, vec![])
+                }
             };
 
             output(
                 &format!("  #{pos}"),
                 &format!("{action_label}  {}  \"{title}\"", pc.short_id),
             )?;
-            output("     ", &format!("head: {head}"))?;
-            output("     ", &format!("base: {base}"))?;
+            if let Some((head, base)) = branches {
+                output("     ", &format!("head: {head}"))?;
+                output("     ", &format!("base: {base}"))?;
+            }
             if !reviewers_list.is_empty() {
                 output(
                     "     ",
                     &format!("reviewers: {}", reviewers_list.join(", ")),
                 )?;
+            }
+            if let Some(change) = pc.dry_run_stack_change {
+                output("     ", &format!("stack: {}", change.describe()))?;
             }
             output("", "")?;
         }
@@ -400,6 +443,17 @@ pub async fn diff(
                 "ℹ️",
                 "The GitHub stack is not shown: this run would open pull \
                  requests, and a stack cannot be worked out until they have \
+                 numbers.",
+            )?;
+        }
+
+        // The same for the sections: their absence must not read as "the
+        // sections are all up to date".
+        if !plan_sections && !opts.cherry_pick && config.stack_display.writes_a_section() {
+            output(
+                "ℹ️",
+                "Stack sections are not shown: this run would open pull \
+                 requests, and the stack cannot be described until they have \
                  numbers.",
             )?;
         }
@@ -638,6 +692,7 @@ async fn diff_impl(
     pull_request: Option<PullRequest>,
     change_below: Option<&PushedChange>,
     stacks: Option<&mut StackSession>,
+    stack_changes: &HashMap<u64, StackChange>,
 ) -> Result<PushedChange> {
     // Parsed commit message of the local commit
     let message = &mut local_commit.message;
@@ -874,7 +929,19 @@ async fn diff_impl(
         {
             // ...and it does not need a rebase, and the trees of both Pull
             // Request branch and base are all the right ones.
-            output("✅", "No update necessary")?;
+            //
+            // The stack section is written to the body in a pass of its own, so
+            // "nothing to push" is not "nothing to do": the stack around this
+            // change may have moved even though the change itself has not. Only
+            // a dry run consults this, because only a dry run has to say up
+            // front what the later pass will do.
+            local_commit.dry_run_stack_change = stack_changes.get(&pull_request.number).copied();
+
+            if let Some(change) = local_commit.dry_run_stack_change {
+                output("📝", change.describe())?;
+            } else {
+                output("✅", "No update necessary")?;
+            }
 
             if opts.update_message {
                 // However, the user requested to update the commit message on
@@ -1198,6 +1265,9 @@ async fn diff_impl(
         let is_stacked = !base_ref.is_master_branch();
 
         local_commit.dry_run_action = if let Some(ref pr) = pull_request {
+            // A change can need both a push and a rewritten stack section.
+            local_commit.dry_run_stack_change = stack_changes.get(&pr.number).copied();
+
             Some(crate::jj::DryRunAction::Update {
                 pr_number: pr.number,
                 base: base_branch_name.to_string(),
@@ -1475,12 +1545,34 @@ async fn update_stack_sections(
     stack_base_oid: Oid,
     stack_top_change_id: &str,
 ) -> Result<()> {
+    for (number, update, _) in
+        plan_stack_sections(jj, gh, config, stack_base_oid, stack_top_change_id).await?
+    {
+        gh.update_pull_request(number, update).await?;
+    }
+
+    Ok(())
+}
+
+/// Work out which pull requests in the stack need their section rewritten.
+///
+/// Split out of [`update_stack_sections`] so that a dry run can report the
+/// same work without doing it. Only pull requests that would actually change
+/// are returned, so an empty result means every section is already right.
+async fn plan_stack_sections(
+    jj: &crate::jj::Jujutsu,
+    gh: &impl crate::github::GitHubApi,
+    config: &crate::config::Config,
+    stack_base_oid: Oid,
+    stack_top_change_id: &str,
+) -> Result<Vec<(u64, crate::github::PullRequestUpdate, StackChange)>> {
     let commits = jj.get_stack_commits(config, stack_base_oid, stack_top_change_id)?;
     let numbers: Vec<u64> = commits
         .iter()
         .filter_map(|commit| commit.pull_request_number)
         .collect();
 
+    let mut planned = Vec::new();
     for number in &numbers {
         let section = config
             .stack_display
@@ -1493,11 +1585,20 @@ async fn update_stack_sections(
         update.update_stack_section(&pull_request, section.as_deref());
 
         if !update.is_empty() {
-            gh.update_pull_request(*number, update).await?;
+            let had = pull_request.sections.get(&MessageSection::Stack);
+            // The body is what decides whether there is anything to send, so a
+            // section that reads the same either side is a re-render of one
+            // that is already there, which is a rewrite like any other.
+            let change = match (had, &section) {
+                (None, Some(_)) => StackChange::Added,
+                (Some(_), None) => StackChange::Removed,
+                _ => StackChange::Rewritten,
+            };
+            planned.push((*number, update, change));
         }
     }
 
-    Ok(())
+    Ok(planned)
 }
 
 #[cfg(test)]
