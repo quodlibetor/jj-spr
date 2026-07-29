@@ -113,7 +113,16 @@ jj spr list
 - PR number and title
 - Current state (open, draft, etc.)
 - Review status (approved, changes requested, etc.)
-- CI status
+- Whether the conversation is waiting on your reply. Reacting to a comment
+  counts as answering it, so a thumbs-up settles a thread you have nothing to
+  add to.
+
+Pull requests are listed in the order of the local changes that carry them,
+newest change first, so a stack reads the way `jj log` prints it. Separate
+stacks are listed one after another, and a `Stack` column marks where each one
+starts and ends when there is more than one. A pull request that no local
+change carries — landed elsewhere, or opened from another machine — is listed
+last.
 
 ---
 

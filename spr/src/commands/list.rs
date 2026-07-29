@@ -110,12 +110,32 @@ impl CommentStatus {
     }
 }
 
+/// Whether we have already dealt with a comment.
+///
+/// Writing it obviously counts, and so does reacting to it: a thumbs-up is
+/// how you acknowledge a comment you have nothing to add to, and a comment we
+/// have acknowledged is not one we still owe an answer.
+///
+/// This is a macro because the query gives top-level comments and review
+/// thread comments distinct generated types, despite the two spelling these
+/// fields identically.
+macro_rules! viewer_handled {
+    ($comment:expr) => {
+        $comment.viewer_did_author
+            || $comment
+                .reaction_groups
+                .iter()
+                .flatten()
+                .any(|group| group.viewer_has_reacted)
+    };
+}
+
 /// Determine who a PR's conversation is waiting on.
 ///
 /// A reviewer is waiting on us if they had the last word in any unresolved
-/// review thread, or in the PR's top-level comments. GitHub returns comment
-/// connections oldest-first, so the last non-minimized node in each is the
-/// most recent one.
+/// review thread, or in the PR's top-level comments, and we have not
+/// acknowledged it. GitHub returns comment connections oldest-first, so the
+/// last non-minimized node in each is the most recent one.
 fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> CommentStatus {
     let top_level: Vec<_> = pr
         .comments
@@ -126,7 +146,7 @@ fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> Com
         .filter(|comment| !comment.is_minimized)
         .collect();
 
-    let mut awaiting_reply = top_level.last().is_some_and(|last| !last.viewer_did_author);
+    let mut awaiting_reply = top_level.last().is_some_and(|last| !viewer_handled!(last));
     let mut any_discussion = !top_level.is_empty();
 
     for thread in pr.review_threads.nodes.iter().flatten().flatten() {
@@ -144,7 +164,7 @@ fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> Com
         any_discussion = true;
 
         // A resolved thread is not waiting on anyone, whoever spoke last.
-        if !thread.is_resolved && !last_comment.viewer_did_author {
+        if !thread.is_resolved && !viewer_handled!(last_comment) {
             awaiting_reply = true;
         }
     }
@@ -231,24 +251,37 @@ mod tests {
         serde_json::from_str(&json).expect("test payload should match the query's response shape")
     }
 
+    /// One visible comment node. `mine` marks one we wrote, `reacted` one we
+    /// left a reaction on. A comment nobody has reacted to has no reaction
+    /// groups at all.
+    fn comment_node(mine: bool, reacted: bool) -> String {
+        let groups = if reacted {
+            r#"[{"viewerHasReacted":true}]"#
+        } else {
+            "[]"
+        };
+        format!(r#"{{"isMinimized":false,"viewerDidAuthor":{mine},"reactionGroups":{groups}}}"#)
+    }
+
+    fn comment_nodes(authored: &[bool]) -> String {
+        authored
+            .iter()
+            .map(|mine| comment_node(*mine, false))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     /// Top-level comments, oldest first. `true` marks one we wrote.
     fn comments(authored: &[bool]) -> String {
-        let nodes = authored
-            .iter()
-            .map(|mine| format!(r#"{{"isMinimized":false,"viewerDidAuthor":{mine}}}"#))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(r#""comments":{{"nodes":[{nodes}]}}"#)
+        format!(r#""comments":{{"nodes":[{}]}}"#, comment_nodes(authored))
     }
 
     /// One review thread, its comments oldest first.
     fn thread(resolved: bool, authored: &[bool]) -> String {
-        let nodes = authored
-            .iter()
-            .map(|mine| format!(r#"{{"isMinimized":false,"viewerDidAuthor":{mine}}}"#))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(r#"{{"isResolved":{resolved},"comments":{{"nodes":[{nodes}]}}}}"#)
+        format!(
+            r#"{{"isResolved":{resolved},"comments":{{"nodes":[{}]}}}}"#,
+            comment_nodes(authored)
+        )
     }
 
     fn threads(threads: &[String]) -> String {
@@ -320,9 +353,10 @@ mod tests {
     fn minimized_comments_are_ignored() {
         let fields = format!(
             r#"{NO_REVIEWS},"comments":{{"nodes":[
-                 {{"isMinimized":false,"viewerDidAuthor":true}},
-                 {{"isMinimized":true,"viewerDidAuthor":false}}
+                 {},
+                 {{"isMinimized":true,"viewerDidAuthor":false,"reactionGroups":[]}}
                ]}},{}"#,
+            comment_node(true, false),
             threads(&[])
         );
         assert_eq!(comment_icon(&fields), CommentStatus::Replied.icon());
@@ -334,12 +368,62 @@ mod tests {
         let fields = format!(
             r#"{NO_REVIEWS},{},"reviewThreads":{{"nodes":[
                  {{"isResolved":false,"comments":{{"nodes":[
-                   {{"isMinimized":true,"viewerDidAuthor":false}}
+                   {{"isMinimized":true,"viewerDidAuthor":false,"reactionGroups":[]}}
                  ]}}}}
                ]}}"#,
             comments(&[])
         );
         assert_eq!(comment_icon(&fields), CommentStatus::Quiet.icon());
+    }
+
+    /// Reacting to a reviewer's comment acknowledges it, so the PR is no
+    /// longer waiting on us even though we never wrote a reply.
+    #[test]
+    fn our_reaction_to_the_last_top_level_word_is_a_reply() {
+        let fields = format!(
+            r#"{NO_REVIEWS},"comments":{{"nodes":[{}]}},{}"#,
+            comment_node(false, true),
+            threads(&[])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::Replied.icon());
+    }
+
+    #[test]
+    fn our_reaction_settles_an_unresolved_thread() {
+        let fields = format!(
+            r#"{NO_REVIEWS},{},"reviewThreads":{{"nodes":[
+                 {{"isResolved":false,"comments":{{"nodes":[{}]}}}}
+               ]}}"#,
+            comments(&[]),
+            comment_node(false, true)
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::Replied.icon());
+    }
+
+    /// Someone else's reaction says nothing about whether we have read the
+    /// comment, so it must not settle the conversation for us.
+    #[test]
+    fn a_reaction_that_is_not_ours_still_awaits_reply() {
+        let fields = format!(
+            r#"{NO_REVIEWS},"comments":{{"nodes":[
+                 {{"isMinimized":false,"viewerDidAuthor":false,
+                   "reactionGroups":[{{"viewerHasReacted":false}}]}}
+               ]}},{}"#,
+            threads(&[])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::AwaitingReply.icon());
+    }
+
+    /// Acknowledging one comment does not acknowledge the ones that follow it.
+    #[test]
+    fn a_reaction_does_not_settle_a_later_comment() {
+        let fields = format!(
+            r#"{NO_REVIEWS},"comments":{{"nodes":[{},{}]}},{}"#,
+            comment_node(false, true),
+            comment_node(false, false),
+            threads(&[])
+        );
+        assert_eq!(comment_icon(&fields), CommentStatus::AwaitingReply.icon());
     }
 
     /// The Reviews cell, stripped of styling so tests assert on wording.

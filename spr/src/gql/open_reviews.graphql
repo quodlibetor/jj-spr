@@ -18,6 +18,11 @@ query SearchQuery($query: String!) {
           nodes {
             isMinimized
             viewerDidAuthor
+            # Reacting to a comment is how you acknowledge it without writing
+            # a reply, so our own reactions count as having dealt with it.
+            reactionGroups {
+              viewerHasReacted
+            }
           }
         }
         # Code review conversations. Bounded to keep the query's node count
@@ -31,6 +36,9 @@ query SearchQuery($query: String!) {
               nodes {
                 isMinimized
                 viewerDidAuthor
+                reactionGroups {
+                  viewerHasReacted
+                }
               }
             }
           }
