@@ -65,6 +65,13 @@ pub struct LandOptions {
     #[clap(long)]
     cherry_pick: bool,
 
+    /// Land the Pull Request even if GitHub reports that the requirements its
+    /// base branch sets are not met: a required check failing or not yet
+    /// started, a missing review, an unsatisfied rule. Does the same thing for
+    /// one land as setting spr.landWithUnmetRequirements does for every land.
+    #[clap(long)]
+    force: bool,
+
     /// Jujutsu revision to operate on (if not specified, uses '@')
     #[clap(short = 'r', long)]
     revision: Option<String>,
@@ -206,6 +213,13 @@ pub async fn land(
         .await?;
     }
 
+    // Whether to hold GitHub's verdict on the base branch's requirements
+    // against this land. Settled before the loop because it decides not only
+    // whether an unmet requirement refuses the land, but whether the loop
+    // waits for a verdict at all: a land that means to proceed regardless has
+    // no reason to spend ten seconds waiting for an answer it will discard.
+    let enforce_requirements = config.enforce_merge_requirements(opts.force);
+
     // Check whether GitHub says this PR is mergeable. This happens in a
     // retry-loop because recent changes to the Pull Request can mean that
     // GitHub has not finished the mergeability check yet.
@@ -224,11 +238,34 @@ pub async fn land(
             )));
         }
 
-        if mergeability.base.is_master_branch() && mergeability.mergeable.is_some() {
+        // GitHub works both verdicts out lazily, and retargeting the Pull
+        // Request just above sends them back to `UNKNOWN`, so both have to
+        // arrive before there is anything to judge.
+        let requirements_known = !enforce_requirements || mergeability.requirements_known();
+
+        if mergeability.base.is_master_branch()
+            && mergeability.mergeable.is_some()
+            && requirements_known
+        {
             if mergeability.mergeable != Some(true) {
                 break Err(Error::new(formatdoc!(
                     "GitHub concluded the Pull Request is not mergeable at \
                     this point. Please rebase your changes and try again!"
+                )));
+            }
+
+            if enforce_requirements && mergeability.requirements_unmet() {
+                break Err(Error::new(formatdoc!(
+                    "GitHub reports that this Pull Request does not meet the \
+                     requirements its base branch sets. A required check may \
+                     be failing or not yet started, a review may be missing, \
+                     or a rule may be unsatisfied — GitHub does not say \
+                     which, but the Pull Request page does.
+
+                     Landing anyway needs permission to bypass those \
+                     requirements. If you have it and mean to use it, pass \
+                     --force, or set spr.landWithUnmetRequirements to true to \
+                     stop checking altogether."
                 )));
             }
 

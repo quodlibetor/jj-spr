@@ -154,5 +154,6 @@ Stored in git config under `spr.*` namespace:
 - `spr.githubRepository` - Owner/repo name
 - `spr.branchPrefix` - Prefix for generated branches (default: `spr/`)
 - `spr.requireApproval` - Require PR approval before landing
+- `spr.landWithUnmetRequirements` - Land even when GitHub reports the PR blocked by its base branch's requirements (default: `false`; `jj spr land --force` does the same for one land)
 - `spr.githubHost` - Custom GitHub Enterprise host
 - `spr.githubToken` - GitHub API token (typically stored via `jj spr init`)

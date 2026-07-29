@@ -17,6 +17,14 @@ pub struct Config {
     pub master_ref: GitHubBranch,
     pub branch_prefix: String,
     pub require_approval: bool,
+    /// Land a pull request even when GitHub reports the requirements its base
+    /// branch sets as unmet.
+    ///
+    /// Not a parameter of [`Config::new`]: it sits next to `require_approval`,
+    /// and a second bool in that position is one transposed argument away from
+    /// silently disabling the check it guards. Set it with struct update
+    /// syntax instead, which names the field at the call site.
+    pub land_with_unmet_requirements: bool,
 }
 
 impl Config {
@@ -37,7 +45,19 @@ impl Config {
             master_ref,
             branch_prefix,
             require_approval,
+            land_with_unmet_requirements: false,
         }
+    }
+
+    /// Whether GitHub's verdict on the base branch's requirements should stand
+    /// in the way of a land that was passed `force`.
+    ///
+    /// The flag and [`Config::land_with_unmet_requirements`] are alternatives
+    /// rather than an override pair: each says "land anyway", and neither has
+    /// occasion to countermand the other, since nothing asks to *enforce* the
+    /// requirements for a single land.
+    pub fn enforce_merge_requirements(&self, force: bool) -> bool {
+        !force && !self.land_with_unmet_requirements
     }
 
     pub fn pull_request_url(&self, number: u64) -> String {
@@ -267,6 +287,39 @@ mod tests {
             "spr/foo/".into(),
             false,
         )
+    }
+
+    /// The check is on unless something asks for it to be off. Nothing about
+    /// the default configuration should be able to turn it off by itself,
+    /// because a caller with permission to bypass the base branch's
+    /// requirements gets no other warning that they are doing so.
+    #[test]
+    fn merge_requirements_are_enforced_by_default() {
+        assert!(config_factory().enforce_merge_requirements(false));
+    }
+
+    #[test]
+    fn force_stops_enforcing_merge_requirements() {
+        assert!(!config_factory().enforce_merge_requirements(true));
+    }
+
+    #[test]
+    fn config_stops_enforcing_merge_requirements() {
+        let config = Config {
+            land_with_unmet_requirements: true,
+            ..config_factory()
+        };
+        assert!(!config.enforce_merge_requirements(false));
+    }
+
+    /// Asking for the same thing twice asks for it once.
+    #[test]
+    fn force_and_config_together_stop_enforcing_merge_requirements() {
+        let config = Config {
+            land_with_unmet_requirements: true,
+            ..config_factory()
+        };
+        assert!(!config.enforce_merge_requirements(true));
     }
 
     #[test]

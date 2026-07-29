@@ -111,12 +111,86 @@ pub struct UserWithName {
     pub is_collaborator: bool,
 }
 
+/// GitHub's verdict on whether a pull request satisfies what its base branch
+/// requires: required checks, required reviews, and rules.
+///
+/// This is deliberately coarser than GitHub's `MergeStateStatus`, which
+/// distinguishes several ways of being ready that landing does not care to
+/// tell apart. What landing needs to know is only whether something stands in
+/// the way — GitHub does not report *which* requirement is unmet in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRequirements {
+    /// Something the base branch requires is unmet.
+    Unmet,
+    /// Nothing required stands in the way.
+    Met,
+    /// GitHub has not worked out an answer yet, or gave one this build does
+    /// not know. Landing waits for it rather than guessing either way.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequestMergeability {
     pub base: GitHubBranch,
     pub head_oid: git2::Oid,
     pub mergeable: Option<bool>,
+    pub merge_requirements: MergeRequirements,
     pub merge_commit: Option<git2::Oid>,
+}
+
+impl PullRequestMergeability {
+    /// Whether GitHub has settled on a verdict about the base branch's
+    /// requirements yet.
+    ///
+    /// It works this out lazily, and retargeting a pull request sends it back
+    /// to undecided, so a caller that means to act on the verdict has to wait
+    /// for one to arrive.
+    pub fn requirements_known(&self) -> bool {
+        self.merge_requirements != MergeRequirements::Unknown
+    }
+
+    /// Whether GitHub reports something the base branch requires as unmet.
+    ///
+    /// False while the verdict is still [`MergeRequirements::Unknown`], so
+    /// pair it with [`Self::requirements_known`] rather than reading a `false`
+    /// here as permission to merge.
+    pub fn requirements_unmet(&self) -> bool {
+        self.merge_requirements == MergeRequirements::Unmet
+    }
+}
+
+/// Read [`MergeRequirements`] off GitHub's `mergeStateStatus`.
+///
+/// The doubtful case is `BEHIND`, which GitHub gives when the head ref is out
+/// of date. That only bars merging when the base branch requires branches to
+/// be up to date, and nothing in the response says whether it does. `jj spr
+/// list` resolves that doubt towards reporting nothing, because a column that
+/// wrongly claims a pull request cannot land is worse than a quiet one. Here
+/// the doubt resolves the other way: a land refused in error costs a rebase or
+/// a `--force`, while a land allowed in error cannot be taken back.
+fn merge_requirements(
+    status: &pull_request_mergeability_query::MergeStateStatus,
+) -> MergeRequirements {
+    use pull_request_mergeability_query::MergeStateStatus as Status;
+
+    match status {
+        // Something required is unmet; GitHub does not say what.
+        Status::BLOCKED => MergeRequirements::Unmet,
+        // A draft is not offered for merging at all.
+        Status::DRAFT => MergeRequirements::Unmet,
+        // Conflicting. `mergeable` reports this too, and reports it better,
+        // but a land must not proceed on it either way.
+        Status::DIRTY => MergeRequirements::Unmet,
+        // Out of date — see above.
+        Status::BEHIND => MergeRequirements::Unmet,
+        // Ready. `HAS_HOOKS` is `CLEAN` with pre-receive hooks configured, and
+        // `UNSTABLE` is GitHub's word for a failing check that nothing
+        // requires — neither stands in the way of a merge.
+        Status::CLEAN | Status::HAS_HOOKS | Status::UNSTABLE => MergeRequirements::Met,
+        Status::UNKNOWN => MergeRequirements::Unknown,
+        // A status this build does not know is not evidence of readiness.
+        Status::Other(_) => MergeRequirements::Unknown,
+    }
 }
 
 #[derive(GraphQLQuery)]
@@ -579,6 +653,7 @@ impl GitHub {
                 pull_request_mergeability_query::MergeableState::UNKNOWN => None,
                 _ => None,
             },
+            merge_requirements: merge_requirements(&pr.merge_state_status),
             merge_commit: pr
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
@@ -705,6 +780,63 @@ impl GitHubBranch {
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
+
+    /// The statuses that mean GitHub is holding the pull request back.
+    #[test]
+    fn unmet_requirements_are_read_off_merge_state_status() {
+        use pull_request_mergeability_query::MergeStateStatus as Status;
+
+        for status in [
+            Status::BLOCKED,
+            Status::DRAFT,
+            Status::DIRTY,
+            Status::BEHIND,
+        ] {
+            assert_eq!(
+                merge_requirements(&status),
+                MergeRequirements::Unmet,
+                "expected {status:?} to be treated as an unmet requirement"
+            );
+        }
+    }
+
+    /// `UNSTABLE` belongs here rather than above: it is GitHub's word for a
+    /// failing check that the base branch does not require, which it will
+    /// merge quite happily.
+    #[test]
+    fn met_requirements_are_read_off_merge_state_status() {
+        use pull_request_mergeability_query::MergeStateStatus as Status;
+
+        for status in [Status::CLEAN, Status::HAS_HOOKS, Status::UNSTABLE] {
+            assert_eq!(
+                merge_requirements(&status),
+                MergeRequirements::Met,
+                "expected {status:?} to be treated as met"
+            );
+        }
+    }
+
+    /// GitHub computes this lazily, so a pull request it has not looked at yet
+    /// — or has just had its base rewritten — answers `UNKNOWN`.
+    #[test]
+    fn uncomputed_requirements_are_unknown() {
+        assert_eq!(
+            merge_requirements(&pull_request_mergeability_query::MergeStateStatus::UNKNOWN),
+            MergeRequirements::Unknown
+        );
+    }
+
+    /// A status added to GitHub's schema after this build must not be read as
+    /// permission to merge.
+    #[test]
+    fn unrecognised_status_is_not_met() {
+        assert_eq!(
+            merge_requirements(&pull_request_mergeability_query::MergeStateStatus::Other(
+                "SOMETHING_NEW".to_string()
+            )),
+            MergeRequirements::Unknown
+        );
+    }
 
     #[test]
     fn test_new_from_ref_with_branch_name() {

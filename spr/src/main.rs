@@ -134,15 +134,20 @@ pub async fn spr() -> Result<()> {
     let branch_prefix = get_config_value("spr.branchPrefix", &git_config)
         .ok_or_else(|| Error::new("spr.branchPrefix must be configured".to_string()))?;
     let require_approval = get_config_bool("spr.requireApproval", &git_config).unwrap_or(false);
+    let land_with_unmet_requirements =
+        get_config_bool("spr.landWithUnmetRequirements", &git_config).unwrap_or(false);
 
-    let config = jj_spr::config::Config::new(
-        github_owner,
-        github_repo,
-        github_remote_name,
-        github_master_branch,
-        branch_prefix,
-        require_approval,
-    );
+    let config = jj_spr::config::Config {
+        land_with_unmet_requirements,
+        ..jj_spr::config::Config::new(
+            github_owner,
+            github_repo,
+            github_remote_name,
+            github_master_branch,
+            branch_prefix,
+            require_approval,
+        )
+    };
 
     if let Commands::Format(opts) = cli.command {
         return commands::format::format(opts, &jj, &config).await;

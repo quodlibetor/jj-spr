@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `jj spr land` retargets the pull requests stacked on the one it lands at the
   default branch, and deletes the base branches they pointed at, instead of
   leaving that until the next `jj spr diff`.
+- `jj spr land` refuses to land a pull request that GitHub reports as blocked
+  by its base branch: a required check failing or not yet started, a missing
+  review, an unsatisfied rule. It previously asked only whether the branches
+  conflicted, so a caller able to bypass a protected branch could land a pull
+  request whose CI had not started. `--force`, or the
+  `spr.landWithUnmetRequirements` setting, lands anyway.
 
 ## [0.1.0] - 2025-11-15
 
