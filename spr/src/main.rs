@@ -185,7 +185,7 @@ pub async fn spr() -> Result<()> {
         Commands::Diff(opts) => commands::diff::diff(opts, &jj, &mut gh, &config).await?,
         Commands::Land(opts) => commands::land::land(opts, &jj, &mut gh, &config).await?,
         Commands::Amend(opts) => commands::amend::amend(opts, &jj, &mut gh, &config).await?,
-        Commands::List => commands::list::list(graphql_client, &config).await?,
+        Commands::List => commands::list::list(graphql_client, &jj, &config).await?,
         Commands::Patch(opts) => commands::patch::patch(opts, &jj, &mut gh, &config).await?,
         Commands::Close(opts) => commands::close::close(opts, &jj, &mut gh, &config).await?,
         Commands::Cleanup(opts) => commands::cleanup::cleanup(opts, &jj, &gh, &config).await?,

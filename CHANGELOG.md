@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — one the base branch does not require — is called out separately from one
   that does.
 
+### Changed
+
+- `jj spr list` now lists pull requests in the order of the local changes,
+  newest first, so a stack reads the way `jj log` prints it instead of in
+  whatever order GitHub returned. Pull requests with no local change are
+  listed last, and when there is more than one stack to tell apart a `Stack`
+  column marks where each one starts and ends.
+
 ## [0.1.0] - 2025-11-15
 
 ### Added

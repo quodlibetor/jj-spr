@@ -23,7 +23,11 @@ type URI = String;
 )]
 pub struct SearchQuery;
 
-pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Config) -> Result<()> {
+pub async fn list(
+    graphql_client: reqwest::Client,
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+) -> Result<()> {
     let variables = search_query::Variables {
         query: format!(
             "repo:{}/{} is:open is:pr author:@me archived:false",
@@ -38,11 +42,20 @@ pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Confi
         .await?;
     let response_body: Response<search_query::ResponseData> = res.json().await?;
 
-    print_pr_info(response_body).context("Printing PR info".to_string())
+    // GitHub returns the pull requests in an order of its own, which says
+    // nothing about how they depend on one another. The local changes do know,
+    // so they decide the order the table is printed in.
+    let stacks = jj
+        .get_local_pull_request_stacks(config)
+        .context("Reading the local change stacks".to_string())?;
+
+    print_pr_info(response_body, &stacks).context("Printing PR info".to_string())
 }
 
 #[derive(Tabled)]
 struct Row {
+    #[tabled(rename = "Stack")]
+    stack: String,
     #[tabled(rename = "Merge")]
     merge_status: String,
     #[tabled(rename = "Reviews")]
@@ -277,32 +290,51 @@ fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> Com
     }
 }
 
-fn print_pr_info(response_body: Response<search_query::ResponseData>) -> Result<()> {
-    let rows = collect_rows(response_body);
+/// A pull request as the table will show it, before it is known where among
+/// the local changes it belongs.
+struct PullRequest {
+    number: u64,
+    merge_status: String,
+    review_status: String,
+    comment_status: String,
+    description: String,
+}
 
-    if rows.is_empty() {
+/// One block of the table.
+struct Group {
+    pull_requests: Vec<PullRequest>,
+    /// Whether this group is a local stack. The pull requests that no local
+    /// change accounts for are gathered into a group of their own, which is
+    /// not a stack and so has nothing to draw in the Stack column.
+    is_stack: bool,
+}
+
+fn print_pr_info(
+    response_body: Response<search_query::ResponseData>,
+    stacks: &[Vec<u64>],
+) -> Result<()> {
+    let groups = group_by_stack(collect_pull_requests(response_body), stacks);
+
+    if groups.is_empty() {
         return Ok(());
     }
 
-    let mut table = Table::new(rows);
-    table.with(Style::sharp());
-
     let term = console::Term::stdout();
-    term.write_line(&table.to_string())?;
+    term.write_line(&build_table(groups).to_string())?;
 
     Ok(())
 }
 
-fn collect_rows(response_body: Response<search_query::ResponseData>) -> Vec<Row> {
-    let mut rows: Vec<Row> = Vec::new();
+fn collect_pull_requests(response_body: Response<search_query::ResponseData>) -> Vec<PullRequest> {
+    let mut pull_requests: Vec<PullRequest> = Vec::new();
 
     // A response without data, or without search nodes, means there is
     // simply nothing to list.
     let Some(data) = response_body.data else {
-        return rows;
+        return pull_requests;
     };
     let Some(search_nodes) = data.search.nodes else {
-        return rows;
+        return pull_requests;
     };
 
     for pr in search_nodes.into_iter().flatten() {
@@ -321,7 +353,8 @@ fn collect_rows(response_body: Response<search_query::ResponseData>) -> Vec<Row>
             console::style(&pr.url).dim(),
         );
 
-        rows.push(Row {
+        pull_requests.push(PullRequest {
+            number: pr.number as u64,
             merge_status,
             review_status,
             comment_status,
@@ -329,7 +362,104 @@ fn collect_rows(response_body: Response<search_query::ResponseData>) -> Vec<Row>
         });
     }
 
-    rows
+    pull_requests
+}
+
+/// Sort the pull requests into the stacks the local changes describe.
+///
+/// The stacks are listed in the order they were given, each in its own group,
+/// and a pull request that no local change carries — one landed elsewhere, or
+/// opened from another machine — goes into a last group of its own rather than
+/// being dropped from a listing that is meant to show everything open.
+fn group_by_stack(pull_requests: Vec<PullRequest>, stacks: &[Vec<u64>]) -> Vec<Group> {
+    let position: std::collections::HashMap<u64, usize> = pull_requests
+        .iter()
+        .enumerate()
+        .map(|(position, pull_request)| (pull_request.number, position))
+        .collect();
+
+    // Taking each pull request out as its stack claims it leaves exactly the
+    // ones no stack mentions behind, still in the order GitHub gave them.
+    let mut unclaimed: Vec<Option<PullRequest>> = pull_requests.into_iter().map(Some).collect();
+    let mut groups: Vec<Group> = Vec::new();
+
+    for stack in stacks {
+        let pull_requests: Vec<PullRequest> = stack
+            .iter()
+            .filter_map(|number| position.get(number))
+            .filter_map(|&position| unclaimed[position].take())
+            .collect();
+
+        // A stack whose pull requests are all closed has nothing to show.
+        if !pull_requests.is_empty() {
+            groups.push(Group {
+                pull_requests,
+                is_stack: true,
+            });
+        }
+    }
+
+    let loose: Vec<PullRequest> = unclaimed.into_iter().flatten().collect();
+    if !loose.is_empty() {
+        groups.push(Group {
+            pull_requests: loose,
+            is_stack: false,
+        });
+    }
+
+    groups
+}
+
+fn build_table(groups: Vec<Group>) -> Table {
+    // The Stack column is only worth its width when there is more than one
+    // group to tell apart: a listing that is one stack from top to bottom
+    // already reads in order without it.
+    let stack_column_earns_its_place = groups.len() > 1;
+
+    let rows: Vec<Row> = groups
+        .into_iter()
+        .flat_map(|group| {
+            let last = group.pull_requests.len() - 1;
+            let is_stack = group.is_stack;
+            group
+                .pull_requests
+                .into_iter()
+                .enumerate()
+                .map(move |(position, pull_request)| Row {
+                    stack: stack_marker(is_stack, position, last),
+                    merge_status: pull_request.merge_status,
+                    review_status: pull_request.review_status,
+                    comment_status: pull_request.comment_status,
+                    description: pull_request.description,
+                })
+        })
+        .collect();
+
+    let mut builder = Table::builder(rows);
+    if !stack_column_earns_its_place {
+        builder.remove_column(0);
+    }
+
+    let mut table = builder.build();
+    table.with(Style::sharp());
+
+    table
+}
+
+/// Draw where a row sits in its stack, in the shape `jj log` gives a branch:
+/// the newest change opens the stack and the one nearest master closes it.
+fn stack_marker(is_stack: bool, position: usize, last: usize) -> String {
+    if !is_stack {
+        return String::new();
+    }
+
+    let marker = match position {
+        0 => "○",
+        position if position == last => "╯",
+        _ => "│",
+    };
+
+    console::style(marker).dim().to_string()
 }
 
 #[cfg(test)]
@@ -433,9 +563,10 @@ mod tests {
     const NO_REVIEWS: &str = r#""reviewDecision":null,"reviews":{"nodes":[]}"#;
 
     fn comment_icon(pr_fields: &str) -> String {
-        let rows = collect_rows(response(&format!("{},{pr_fields}", ready_to_merge())));
-        assert_eq!(rows.len(), 1, "expected exactly one row");
-        rows.into_iter().next().unwrap().comment_status
+        let pull_requests =
+            collect_pull_requests(response(&format!("{},{pr_fields}", ready_to_merge())));
+        assert_eq!(pull_requests.len(), 1, "expected exactly one pull request");
+        pull_requests.into_iter().next().unwrap().comment_status
     }
 
     #[test]
@@ -581,9 +712,9 @@ mod tests {
             comments(&[]),
             threads(&[])
         );
-        let rows = collect_rows(response(&fields));
-        assert_eq!(rows.len(), 1, "expected exactly one row");
-        let cell = rows.into_iter().next().unwrap().review_status;
+        let pull_requests = collect_pull_requests(response(&fields));
+        assert_eq!(pull_requests.len(), 1, "expected exactly one pull request");
+        let cell = pull_requests.into_iter().next().unwrap().review_status;
         console::strip_ansi_codes(&cell).into_owned()
     }
 
@@ -744,5 +875,109 @@ mod tests {
             merge_state("MERGEABLE", "BEHIND", Some("SUCCESS")),
             MergeStatus::Passing
         );
+    }
+
+    /// A pull request with nothing to say beyond its number.
+    fn pull_request(number: u64) -> PullRequest {
+        PullRequest {
+            number,
+            merge_status: MergeStatus::Passing.label().to_string(),
+            review_status: "Pending".to_string(),
+            comment_status: CommentStatus::Quiet.icon().to_string(),
+            description: format!("pull request {number}"),
+        }
+    }
+
+    /// The pull request numbers each group ended up with, in order.
+    fn grouped(open: &[u64], stacks: &[Vec<u64>]) -> Vec<Vec<u64>> {
+        let pull_requests = open.iter().copied().map(pull_request).collect();
+        group_by_stack(pull_requests, stacks)
+            .iter()
+            .map(|group| group.pull_requests.iter().map(|pr| pr.number).collect())
+            .collect()
+    }
+
+    /// The order GitHub returned is replaced by the order of the local
+    /// changes, which is the one that says how the pull requests depend on
+    /// each other.
+    #[test]
+    fn pull_requests_are_listed_in_local_stack_order() {
+        assert_eq!(grouped(&[1, 2, 3], &[vec![3, 2, 1]]), vec![vec![3, 2, 1]]);
+    }
+
+    /// Each local stack stays a block of its own, in the order the local
+    /// changes gave them.
+    #[test]
+    fn separate_stacks_stay_separate() {
+        assert_eq!(
+            grouped(&[1, 2, 3, 4], &[vec![3, 1], vec![4, 2]]),
+            vec![vec![3, 1], vec![4, 2]]
+        );
+    }
+
+    /// A pull request with no local change — landed elsewhere, or opened from
+    /// another machine — is still open, so it is still listed. It just has no
+    /// place among the stacks, and goes last.
+    #[test]
+    fn pull_requests_without_a_local_change_come_last() {
+        assert_eq!(
+            grouped(&[9, 1, 8, 2], &[vec![2, 1]]),
+            vec![vec![2, 1], vec![9, 8]],
+            "the pull requests with no local change keep GitHub's order"
+        );
+    }
+
+    /// The stacks describe the local changes, which may name pull requests
+    /// that are closed and so absent from the listing.
+    #[test]
+    fn stacks_may_name_pull_requests_that_are_not_listed() {
+        assert_eq!(
+            grouped(&[1], &[vec![7, 1], vec![8]]),
+            vec![vec![1]],
+            "a stack with nothing left to show is dropped rather than emptied"
+        );
+    }
+
+    /// Only the stack column can distinguish the groups, so it appears exactly
+    /// when there is more than one.
+    #[test]
+    fn the_stack_column_appears_only_when_it_separates_groups() {
+        let one_stack = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2, 1]]);
+        let table = build_table(one_stack).to_string();
+        assert!(
+            !table.contains("Stack"),
+            "one stack needs no Stack column, got:\n{table}"
+        );
+
+        let two_stacks =
+            group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2], vec![1]]);
+        let table = build_table(two_stacks).to_string();
+        assert!(
+            table.contains("Stack"),
+            "two stacks need a Stack column, got:\n{table}"
+        );
+    }
+
+    /// The markers have to say where each stack starts and ends, or the reader
+    /// cannot tell one block from the next.
+    #[test]
+    fn stack_markers_bracket_each_stack() {
+        let markers = |count: usize| {
+            (0..count)
+                .map(|position| stack_marker(true, position, count - 1))
+                .map(|marker| console::strip_ansi_codes(&marker).into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(markers(1), ["○"], "a stack of one is both ends at once");
+        assert_eq!(markers(2), ["○", "╯"]);
+        assert_eq!(markers(3), ["○", "│", "╯"]);
+    }
+
+    /// The pull requests no local change accounts for are not a stack, so
+    /// there is nothing to draw beside them.
+    #[test]
+    fn loose_pull_requests_have_no_marker() {
+        assert_eq!(stack_marker(false, 0, 1), "");
     }
 }

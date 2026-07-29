@@ -110,9 +110,9 @@ jj spr list
 ```
 
 **Output includes:**
-- PR number and title
-- Current state (open, draft, etc.)
+- Title and URL
 - Review status (approved, changes requested, etc.)
+- CI status
 - Whether the conversation is waiting on your reply. Reacting to a comment
   counts as answering it, so a thumbs-up settles a thread you have nothing to
   add to.
