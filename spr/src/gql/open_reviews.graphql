@@ -6,6 +6,23 @@ query SearchQuery($query: String!) {
         number
         title
         url
+        isDraft
+        # Whether the branches conflict. GitHub computes this lazily, so a
+        # pull request it has not looked at yet answers UNKNOWN, and asking
+        # is what prompts it to work the answer out for next time.
+        mergeable
+        # GitHub's own verdict on whether the pull request can merge, which
+        # folds in the checks its branch protection requires. This is the
+        # only way to tell a required check from an optional one here:
+        # `isRequired` on the individual checks takes a pull request number
+        # as an argument, which a query over many pull requests has no way to
+        # vary per result.
+        mergeStateStatus
+        # Every check on the head commit, required or not, rolled into one
+        # state. Null when the pull request has no checks at all.
+        statusCheckRollup {
+          state
+        }
         reviewDecision
         # Consulted only when reviewDecision has no verdict of its own; it
         # reports states, such as COMMENTED, that reviewDecision cannot.

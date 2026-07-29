@@ -43,12 +43,113 @@ pub async fn list(graphql_client: reqwest::Client, config: &crate::config::Confi
 
 #[derive(Tabled)]
 struct Row {
+    #[tabled(rename = "Merge")]
+    merge_status: String,
     #[tabled(rename = "Reviews")]
     review_status: String,
     #[tabled(rename = "Comments")]
     comment_status: String,
     #[tabled(rename = "Description")]
     description: String,
+}
+
+/// What stands between a PR and landing, apart from its review.
+///
+/// The variants are ordered by how much they have to say: the first one that
+/// applies is the one worth reporting, since a PR whose branches conflict is
+/// not waiting on its tests.
+#[derive(Debug, PartialEq, Eq)]
+enum MergeStatus {
+    /// Marked as a draft, so it is not offered for merging at all.
+    Draft,
+    /// GitHub has not worked out whether the PR can merge. It computes that
+    /// lazily, and asking is what sets it going, so a later run will say.
+    Unknown,
+    /// The branches conflict.
+    Conflicts,
+    /// A check that has to pass has not.
+    Failing,
+    /// A check has failed, but none that the base branch requires, so this
+    /// can still land.
+    OptionalFailing,
+    /// The checks have not finished.
+    Running,
+    /// Every check passed.
+    Passing,
+    /// There are no checks to pass.
+    NoChecks,
+}
+
+impl MergeStatus {
+    /// How the status reads in the table.
+    fn label(&self) -> console::StyledObject<&'static str> {
+        match self {
+            MergeStatus::Draft => console::style("Draft").dim(),
+            MergeStatus::Unknown => console::style("?").dim(),
+            MergeStatus::Conflicts => console::style("Conflicts").red(),
+            MergeStatus::Failing => console::style("Failing").red(),
+            MergeStatus::OptionalFailing => console::style("Optional failing").yellow(),
+            MergeStatus::Running => console::style("Running"),
+            MergeStatus::Passing => console::style("Passing").green(),
+            MergeStatus::NoChecks => console::style("—").dim(),
+        }
+    }
+}
+
+/// Decide whether a PR is ready to merge.
+///
+/// Two of GitHub's answers are combined here, because neither is enough on
+/// its own. `mergeStateStatus` is GitHub's own verdict, and the only thing
+/// that knows which checks the base branch requires — but it is a superset,
+/// reporting `BLOCKED` for a PR that is merely unapproved as readily as for
+/// one whose tests failed, which would make it useless as a report on checks.
+/// The rollup knows the checks but not which of them matter. So the rollup
+/// says whether anything is wrong, and `mergeStateStatus` says whether what
+/// is wrong actually stands in the way: `UNSTABLE` is GitHub's word for
+/// "mergeable, but some check that is not required is unhappy".
+fn merge_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> MergeStatus {
+    use search_query::{MergeStateStatus, MergeableState, StatusState};
+
+    if pr.is_draft {
+        return MergeStatus::Draft;
+    }
+
+    match (&pr.mergeable, &pr.merge_state_status) {
+        (MergeableState::UNKNOWN, _) | (_, MergeStateStatus::UNKNOWN) => {
+            return MergeStatus::Unknown;
+        }
+        (MergeableState::CONFLICTING, _) | (_, MergeStateStatus::DIRTY) => {
+            return MergeStatus::Conflicts;
+        }
+        // `BEHIND` is deliberately not reported. It only stands in the way of
+        // merging when the base branch requires branches to be up to date,
+        // and nothing here can tell whether that is so, which would leave the
+        // column claiming a PR cannot land when it can.
+        _ => {}
+    }
+
+    // Nothing rolled up means the PR has no checks, which is not a reason to
+    // hold it back.
+    let Some(rollup) = &pr.status_check_rollup else {
+        return MergeStatus::NoChecks;
+    };
+
+    let nothing_required_is_wrong = matches!(pr.merge_state_status, MergeStateStatus::UNSTABLE);
+
+    match rollup.state {
+        StatusState::SUCCESS => MergeStatus::Passing,
+        StatusState::FAILURE | StatusState::ERROR => {
+            if nothing_required_is_wrong {
+                MergeStatus::OptionalFailing
+            } else {
+                MergeStatus::Failing
+            }
+        }
+        StatusState::PENDING | StatusState::EXPECTED => MergeStatus::Running,
+        // A state this build does not know is better reported as unknown than
+        // as one of the verdicts it is not.
+        StatusState::Other(_) => MergeStatus::Unknown,
+    }
 }
 
 /// Describe where a PR stands with its reviewers.
@@ -210,6 +311,7 @@ fn collect_rows(response_body: Response<search_query::ResponseData>) -> Vec<Row>
             _ => continue,
         };
 
+        let merge_status = merge_status(&pr).label().to_string();
         let comment_status = comment_status(&pr).icon().to_string();
         let review_status = review_status(&pr);
 
@@ -220,6 +322,7 @@ fn collect_rows(response_body: Response<search_query::ResponseData>) -> Vec<Row>
         );
 
         rows.push(Row {
+            merge_status,
             review_status,
             comment_status,
             description,
@@ -249,6 +352,45 @@ mod tests {
                }}]}}}}}}"#
         );
         serde_json::from_str(&json).expect("test payload should match the query's response shape")
+    }
+
+    /// The single pull request a test payload describes.
+    fn pull_request_node(pr_fields: &str) -> search_query::SearchQuerySearchNodesOnPullRequest {
+        let nodes = response(pr_fields)
+            .data
+            .expect("the payload should have data")
+            .search
+            .nodes
+            .expect("the payload should have search nodes");
+        match nodes
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("expected exactly one pull request")
+        {
+            search_query::SearchQuerySearchNodes::PullRequest(pr) => pr,
+            _ => panic!("the payload should describe a pull request"),
+        }
+    }
+
+    /// The fields the Merge column reads, as the query returns them.
+    /// `mergeable` and `merge_state` are GitHub's two verdicts, and `rollup`
+    /// the rolled-up state of the checks — `None` for a PR that has none.
+    fn merge_fields(mergeable: &str, merge_state: &str, rollup: Option<&str>) -> String {
+        let rollup = rollup.map_or_else(
+            || "null".to_string(),
+            |state| format!(r#"{{"state":"{state}"}}"#),
+        );
+        format!(
+            r#""isDraft":false,"mergeable":"{mergeable}",
+               "mergeStateStatus":"{merge_state}","statusCheckRollup":{rollup}"#
+        )
+    }
+
+    /// A pull request with nothing standing between it and merging, for the
+    /// tests that are about something else.
+    fn ready_to_merge() -> String {
+        merge_fields("MERGEABLE", "CLEAN", Some("SUCCESS"))
     }
 
     /// One visible comment node. `mine` marks one we wrote, `reacted` one we
@@ -291,7 +433,7 @@ mod tests {
     const NO_REVIEWS: &str = r#""reviewDecision":null,"reviews":{"nodes":[]}"#;
 
     fn comment_icon(pr_fields: &str) -> String {
-        let rows = collect_rows(response(pr_fields));
+        let rows = collect_rows(response(&format!("{},{pr_fields}", ready_to_merge())));
         assert_eq!(rows.len(), 1, "expected exactly one row");
         rows.into_iter().next().unwrap().comment_status
     }
@@ -434,7 +576,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let fields = format!(
-            r#""reviewDecision":{decision},"reviews":{{"nodes":[{states}]}},{},{}"#,
+            r#"{},"reviewDecision":{decision},"reviews":{{"nodes":[{states}]}},{},{}"#,
+            ready_to_merge(),
             comments(&[]),
             threads(&[])
         );
@@ -480,5 +623,126 @@ mod tests {
     #[test]
     fn an_unsubmitted_review_is_still_pending() {
         assert_eq!(review_cell("null", &["PENDING"]), "Pending");
+    }
+
+    /// Where a PR stands with merging, given GitHub's two verdicts and the
+    /// rolled-up state of its checks.
+    fn merge_state(mergeable: &str, merge_state: &str, rollup: Option<&str>) -> MergeStatus {
+        let fields = format!(
+            "{},{NO_REVIEWS},{},{}",
+            merge_fields(mergeable, merge_state, rollup),
+            comments(&[]),
+            threads(&[])
+        );
+        merge_status(&pull_request_node(&fields))
+    }
+
+    #[test]
+    fn a_pr_with_every_check_passing_is_passing() {
+        assert_eq!(
+            merge_state("MERGEABLE", "CLEAN", Some("SUCCESS")),
+            MergeStatus::Passing
+        );
+    }
+
+    #[test]
+    fn conflicting_branches_report_the_conflict() {
+        assert_eq!(
+            merge_state("CONFLICTING", "DIRTY", Some("SUCCESS")),
+            MergeStatus::Conflicts,
+            "a PR that cannot merge at all is not waiting on its checks"
+        );
+    }
+
+    /// GitHub works mergeability out lazily, so a PR it has not looked at yet
+    /// has no answer to give. Guessing one would be worse than saying so.
+    #[test]
+    fn uncomputed_mergeability_is_unknown() {
+        assert_eq!(
+            merge_state("UNKNOWN", "UNKNOWN", Some("SUCCESS")),
+            MergeStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn a_draft_is_a_draft_however_green_it_is() {
+        let fields = format!(
+            r#""isDraft":true,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+               "statusCheckRollup":{{"state":"SUCCESS"}},{NO_REVIEWS},{},{}"#,
+            comments(&[]),
+            threads(&[])
+        );
+        assert_eq!(
+            merge_status(&pull_request_node(&fields)),
+            MergeStatus::Draft
+        );
+    }
+
+    #[test]
+    fn a_failing_check_that_blocks_the_merge_is_failing() {
+        assert_eq!(
+            merge_state("MERGEABLE", "BLOCKED", Some("FAILURE")),
+            MergeStatus::Failing
+        );
+        assert_eq!(
+            merge_state("MERGEABLE", "BLOCKED", Some("ERROR")),
+            MergeStatus::Failing
+        );
+    }
+
+    /// `UNSTABLE` is GitHub's word for a PR that can merge even though a
+    /// check is unhappy, which is to say the failing check is not one the
+    /// base branch requires.
+    #[test]
+    fn a_failing_check_the_branch_does_not_require_still_merges() {
+        assert_eq!(
+            merge_state("MERGEABLE", "UNSTABLE", Some("FAILURE")),
+            MergeStatus::OptionalFailing
+        );
+    }
+
+    /// `BLOCKED` covers a missing approval just as readily as a failing
+    /// check, so it must not be read as a verdict on the checks: this PR's
+    /// checks have all passed and only its review is outstanding, which the
+    /// Reviews column is the one to report.
+    #[test]
+    fn a_pr_blocked_only_on_review_still_reports_passing_checks() {
+        assert_eq!(
+            merge_state("MERGEABLE", "BLOCKED", Some("SUCCESS")),
+            MergeStatus::Passing
+        );
+    }
+
+    #[test]
+    fn unfinished_checks_are_running() {
+        assert_eq!(
+            merge_state("MERGEABLE", "BLOCKED", Some("PENDING")),
+            MergeStatus::Running
+        );
+        assert_eq!(
+            merge_state("MERGEABLE", "BLOCKED", Some("EXPECTED")),
+            MergeStatus::Running
+        );
+    }
+
+    /// A repository with no CI has nothing to report, which is not the same
+    /// as having something to report and it being bad.
+    #[test]
+    fn a_pr_with_no_checks_has_none_to_wait_for() {
+        assert_eq!(
+            merge_state("MERGEABLE", "CLEAN", None),
+            MergeStatus::NoChecks
+        );
+    }
+
+    /// Being behind the base branch only blocks the merge when the base
+    /// branch requires it, which the query cannot see, so it is not reported
+    /// as a blocker.
+    #[test]
+    fn being_behind_the_base_branch_reports_the_checks() {
+        assert_eq!(
+            merge_state("MERGEABLE", "BEHIND", Some("SUCCESS")),
+            MergeStatus::Passing
+        );
     }
 }

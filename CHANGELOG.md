@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first commit in a pull reuqest now uses the local commit's description.
 - `jj spr diff` remembers when PRs were created as cherry picks so
   `--cherry-pick` doesn't need to be specified each time the PR is updated.
+- `jj spr list` has a `Merge` column reporting what stands between each pull
+  request and landing: whether it is a draft, whether its branches conflict,
+  and how its checks are doing. A check that fails without blocking the merge
+  — one the base branch does not require — is called out separately from one
+  that does.
 
 ## [0.1.0] - 2025-11-15
 
