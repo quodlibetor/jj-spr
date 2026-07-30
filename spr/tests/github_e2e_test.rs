@@ -243,6 +243,39 @@ impl Scratch {
     fn pr_state(&self, number: u64) -> String {
         self.pr_field(number, ".state")
     }
+
+    /// The branch the pull request is asking to be merged into.
+    fn pr_base_branch(&self, number: u64) -> String {
+        self.pr_field(number, ".base.ref")
+    }
+
+    /// The repository's default branch, which is the branch jj-spr retargets a
+    /// pull request at once its commit sits directly on it.
+    fn default_branch(&self) -> String {
+        run(
+            "gh",
+            &[
+                "api",
+                &format!("repos/{}/{}", self.target.owner, self.target.repo),
+                "--jq",
+                ".default_branch",
+            ],
+            self.path(),
+        )
+    }
+
+    fn remote_has_branch(&self, branch: &str) -> bool {
+        !run(
+            "git",
+            &["ls-remote", "--heads", "origin", branch],
+            self.path(),
+        )
+        .is_empty()
+    }
+
+    fn repo_arg(&self) -> String {
+        format!("{}/{}", self.target.owner, self.target.repo)
+    }
 }
 
 impl Drop for Scratch {
@@ -317,6 +350,22 @@ fn slug(title: &str) -> String {
     title.replace(' ', "-")
 }
 
+/// A tag that tells this run's changes apart from every earlier run's.
+///
+/// The two tests that merge a pull request need it. What they merge stays on the
+/// default branch, so a later run pushing the same file with the same content
+/// would produce a change that does nothing — and a stack whose bottom is empty
+/// is no stack at all: the change above it is already on the default branch, so
+/// it never gets the base branch these tests are about.
+fn run_tag() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock should be past the epoch")
+        .as_secs();
+
+    format!("{}-{seconds}", std::process::id())
+}
+
 fn describe(title: &str) -> String {
     format!("{title}\n\nSummary:\nthe summary of {title}.")
 }
@@ -348,4 +397,126 @@ fn the_harness_opens_a_stack_and_cleans_up_after_itself() {
             "PR #{number} should be open"
         );
     }
+}
+
+/// Landing the bottom of a stack retargets the pull request above it at the
+/// default branch and takes away the base branch it used to point at.
+///
+/// The order matters and only GitHub can show it: a base branch deleted while
+/// the pull request still targets it makes GitHub close that pull request,
+/// review and all. So the state is asserted as well as the base — were the
+/// deletion to run first again, the base and the branch would look right while
+/// the pull request sat closed.
+#[test]
+fn landing_below_a_pull_request_retargets_it_and_leaves_it_open() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "landretarget");
+
+    let tag = run_tag();
+    let (bottom_title, top_title) = (
+        format!("e2e land bottom {tag}"),
+        format!("e2e land top {tag}"),
+    );
+    let prs = scratch.push_stack(&[&bottom_title, &top_title]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    let old_base = scratch.pr_base_branch(top);
+    assert!(
+        old_base.starts_with(&scratch.prefix),
+        "the top PR should be stacked on a base branch jj-spr made, got {old_base:?}"
+    );
+
+    jj_spr(&["land", "-r", "@-"], scratch.path());
+
+    assert_eq!(
+        scratch.pr_field(bottom, ".merged"),
+        "true",
+        "PR #{bottom} should have been merged"
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "landing below PR #{top} closed it"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.default_branch(),
+        "PR #{top} should now target the default branch"
+    );
+    assert!(
+        !scratch.remote_has_branch(&old_base),
+        "the base branch PR #{top} left behind is still on the remote: {old_base}"
+    );
+}
+
+/// The same has to hold when the pull request below was merged on GitHub rather
+/// than by `jj spr land`: there was no land to retarget anything, so the next
+/// `jj spr diff` is what finds the pull request pointing at a base branch whose
+/// content has landed, and it must not close it either.
+#[test]
+fn diff_retargets_a_pull_request_whose_parent_was_merged_on_github() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "diffretarget");
+
+    let tag = run_tag();
+    let (bottom_title, top_title) = (
+        format!("e2e uimerge bottom {tag}"),
+        format!("e2e uimerge top {tag}"),
+    );
+    let prs = scratch.push_stack(&[&bottom_title, &top_title]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    let old_base = scratch.pr_base_branch(top);
+    assert!(
+        old_base.starts_with(&scratch.prefix),
+        "the top PR should be stacked on a base branch jj-spr made, got {old_base:?}"
+    );
+
+    // Merge the bottom the way a reviewer clicking the button would, which
+    // leaves the pull request above it stacked on a base branch nobody needs.
+    run(
+        "gh",
+        &[
+            "pr",
+            "merge",
+            &bottom.to_string(),
+            "--repo",
+            &scratch.repo_arg(),
+            "--squash",
+            "--delete-branch",
+        ],
+        scratch.path(),
+    );
+
+    // Catch up locally: the change above is now directly on the trunk, which is
+    // what tells diff the base branch is obsolete.
+    run("jj", &["git", "fetch"], scratch.path());
+    run(
+        "jj",
+        &["rebase", "-r", "@", "-d", "trunk()"],
+        scratch.path(),
+    );
+
+    jj_spr(&["diff", "-r", "@", "-m", "rebase"], scratch.path());
+
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "retargeting PR #{top} closed it"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.default_branch(),
+        "PR #{top} should now target the default branch"
+    );
+    assert!(
+        !scratch.remote_has_branch(&old_base),
+        "the base branch PR #{top} left behind is still on the remote: {old_base}"
+    );
 }

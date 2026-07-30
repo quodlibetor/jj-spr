@@ -40,6 +40,19 @@ pub struct PullRequest {
     pub review_status: Option<ReviewStatus>,
 }
 
+/// An open pull request that sits on top of another one, as far as the base
+/// branch it targets goes.
+///
+/// Taking the pull request below out of the stack — landing it or closing it —
+/// makes that base branch obsolete, and under `spr.baseStrategy = linear` also
+/// doomed, since it is the head branch of the pull request below.
+#[derive(Debug, Clone)]
+pub struct StackedPullRequest {
+    pub number: u64,
+    /// The branch the pull request is based on right now.
+    pub base: GitHubBranch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewStatus {
     Requested,

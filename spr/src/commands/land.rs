@@ -10,11 +10,53 @@ use std::{io::Write, process::Stdio, time::Duration};
 
 use crate::{
     error::{Error, Result, ResultExt},
-    github::{PullRequestState, PullRequestUpdate, ReviewStatus},
+    github::{PullRequestState, PullRequestUpdate, ReviewStatus, StackedPullRequest},
     message::{MessageSection, build_github_body_for_merging},
     output::{output, write_commit_title},
+    stacked::{
+        may_delete_base_branch, retarget_stacked_pull_requests, spawn_branch_deletion,
+        spawn_head_branch_deletion,
+    },
     utils::run_command,
 };
+
+/// Find the Pull Requests that will sit directly on the master branch once the
+/// commit `landing_oid` has landed.
+///
+/// What a stacked Pull Request targets on GitHub depends on `spr.baseStrategy`:
+/// under `linear` it is the head branch of the Pull Request below, which does
+/// say which Pull Request is stacked on which; under `synthetic` it is a base
+/// branch holding the tree of its parent commit, which says nothing. Only the
+/// local stack answers the question for both, so we ask Jujutsu for the
+/// children of the commit being landed.
+async fn find_stacked_pull_requests(
+    jj: &crate::jj::Jujutsu,
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+    landing_oid: git2::Oid,
+) -> Result<Vec<StackedPullRequest>> {
+    let children =
+        jj.get_prepared_commits_for_revset(config, &format!("children({})", landing_oid))?;
+
+    let mut stacked = Vec::new();
+    for number in children
+        .iter()
+        .filter_map(|child| child.pull_request_number)
+    {
+        let pull_request = gh.clone().get_pull_request(number).await?;
+
+        // A Pull Request that already targets the master branch needs no
+        // retargeting, and a closed one is left alone.
+        if pull_request.state == PullRequestState::Open && !pull_request.base.is_master_branch() {
+            stacked.push(StackedPullRequest {
+                number,
+                base: pull_request.base,
+            });
+        }
+    }
+
+    Ok(stacked)
+}
 
 #[derive(Debug, clap::Parser)]
 pub struct LandOptions {
@@ -78,6 +120,11 @@ pub async fn land(
     }
 
     output("🛫", "Getting started...")?;
+
+    // Look up the Pull Requests stacked on this one before anything changes on
+    // GitHub, so that a failure here stops a land that can still be retried.
+    let stacked_pull_requests =
+        find_stacked_pull_requests(jj, gh, config, prepared_commit.oid).await?;
 
     // Fetch current master from GitHub.
     run_command(
@@ -266,34 +313,34 @@ pub async fn land(
 
     output("🛬", "Landed!")?;
 
-    let mut remove_old_branch_child_process = jj
-        .git_command()
-        .arg("push")
-        .arg("--no-verify")
-        .arg("--delete")
-        .arg("--")
-        .arg(&config.remote_name)
-        .arg(pull_request.head.on_github())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    let remove_old_base_branch_child_process = if base_is_master {
-        None
+    // Nothing this land aims at this base branch: the retargeting below sends
+    // the Pull Requests above to the master branch, not here. That is why it
+    // can go now, rather than waiting for that retargeting the way the head
+    // branch does.
+    let remove_old_base_branch_child_process = if may_delete_base_branch(config, &pull_request.base)
+    {
+        Some(spawn_branch_deletion(jj, config, &pull_request.base)?)
     } else {
-        Some(
-            jj.git_command()
-                .arg("push")
-                .arg("--no-verify")
-                .arg("--delete")
-                .arg("--")
-                .arg(&config.remote_name)
-                .arg(pull_request.base.on_github())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        )
+        None
     };
+
+    // The Pull Requests that were stacked on this one are now based on the
+    // master branch, so point them at it and take the base branches they leave
+    // out of the way, where those are ours.
+    let retargeted = retarget_stacked_pull_requests(
+        gh,
+        &stacked_pull_requests,
+        &config.master_ref,
+        &pull_request.head,
+    )
+    .await?;
+
+    // "The Pull Requests above" are the ones the local stack knows about, which
+    // is where `find_stacked_pull_requests` looks. A Pull Request based on this
+    // branch whose change jj cannot see — abandoned locally, or in a workspace
+    // this one has not fetched — is neither retargeted nor protected below.
+    let remove_old_branch_child_process =
+        spawn_head_branch_deletion(jj, config, &pull_request.head, &retargeted)?;
 
     // Rebase us on top of the now-landed commit
     if let Some(sha) = merge.sha {
@@ -331,7 +378,9 @@ pub async fn land(
     // Wait for the "git push" to delete the old Pull Request branch to finish,
     // but ignore the result. GitHub may be configured to delete the branch
     // automatically, in which case it's gone already and this command fails.
-    remove_old_branch_child_process.wait().await?;
+    if let Some(mut proc) = remove_old_branch_child_process {
+        proc.wait().await?;
+    }
     if let Some(mut proc) = remove_old_base_branch_child_process {
         proc.wait().await?;
     }

@@ -100,11 +100,23 @@ impl Jujutsu {
     ) -> Result<Vec<PreparedCommit>> {
         // Get commit range using jj
         let operator = if is_inclusive { "::" } else { ".." };
+        self.get_prepared_commits_for_revset(
+            config,
+            &format!("{}{}{}", from_revision, operator, to_revision),
+        )
+    }
+
+    /// Prepare every commit a revset selects, oldest first.
+    pub fn get_prepared_commits_for_revset(
+        &self,
+        config: &Config,
+        revset: &str,
+    ) -> Result<Vec<PreparedCommit>> {
         let output = self.run_captured_with_args([
             "log",
             "--no-graph",
             "-r",
-            &format!("{}{}{}", from_revision, operator, to_revision),
+            revset,
             "--template",
             "commit_id ++ \"\\n\"",
         ])?;
@@ -610,6 +622,36 @@ mod tests {
                 last_commit_title
             );
         }
+    }
+
+    #[test]
+    fn test_prepared_commits_for_children_revset() {
+        let (_temp_dir, repo_path) = create_jujutsu_test_repo();
+        let config = create_test_config();
+
+        create_jujutsu_commit(&repo_path, "First commit", "content1");
+        create_jujutsu_commit(&repo_path, "Second commit", "content2");
+
+        let jj = Jujutsu::new(repo_path.clone()).expect("Failed to create Jujutsu instance");
+
+        // The commit ID of the first commit, which `land` would be landing.
+        let first = jj
+            .resolve_revision_to_commit_id("@--")
+            .expect("Failed to resolve @--");
+
+        let children = jj
+            .get_prepared_commits_for_revset(&config, &format!("children({})", first))
+            .expect("Failed to get children");
+
+        assert_eq!(children.len(), 1, "the first commit has one child");
+        assert!(
+            children[0]
+                .message
+                .get(&MessageSection::Title)
+                .expect("child should have a title")
+                .contains("Second commit"),
+            "the child of the first commit is the second commit"
+        );
     }
 
     #[test]

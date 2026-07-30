@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request used to point at. The branch is only deleted after GitHub confirms
   the retarget, because GitHub closes a pull request whose base branch
   disappears, and only branches under `spr.branchPrefix` are deleted.
+- `jj spr land` retargets the pull requests stacked on the one it lands at the
+  default branch, and deletes the base branches they pointed at, instead of
+  leaving that until the next `jj spr diff`.
 
 ## [0.1.0] - 2025-11-15
 
