@@ -155,5 +155,6 @@ Stored in git config under `spr.*` namespace:
 - `spr.branchPrefix` - Prefix for generated branches (default: `spr/`)
 - `spr.requireApproval` - Require PR approval before landing
 - `spr.landWithUnmetRequirements` - Land even when GitHub reports the PR blocked by its base branch's requirements (default: `false`; `jj spr land --force` does the same for one land)
+- `spr.baseStrategy` - What a stacked PR is based on: `synthetic` (default) gives each PR its own generated base branch carrying the parent change's tree; `linear` bases each PR on the PR branch of the change below it, so the stack on GitHub is a chain of branches. `linear` wants the whole stack pushed in one run: a change whose parent is not in the run keeps the base it has, and falls back to a synthetic base branch only when a base commit has to be built for it
 - `spr.githubHost` - Custom GitHub Enterprise host
 - `spr.githubToken` - GitHub API token (typically stored via `jj spr init`)

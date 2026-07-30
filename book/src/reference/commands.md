@@ -93,10 +93,13 @@ jj spr land --cherry-pick -r <change-id>
 ```
 
 **Stacks:** Landing a pull request retargets the pull requests stacked on top of
-it at the default branch and deletes the base branches they pointed at, so the
-rest of the stack is ready to land without another `jj spr diff`. Until you
-rebase and run `jj spr diff` again, though, a retargeted pull request's diff on
-GitHub still includes the changes that just landed.
+it at the default branch, so the rest of the stack is ready to land without
+another `jj spr diff`. The base branches they pointed at are deleted, except
+under [`spr.baseStrategy = linear`](configuration.md#basestrategy), where what
+they pointed at is the landed pull request's own branch and taking it away
+would close them. Until you rebase and run `jj spr diff` again, though, a
+retargeted pull request's diff on GitHub still includes the changes that just
+landed.
 
 **Important:** After landing, you must manually rebase your working copy:
 ```bash

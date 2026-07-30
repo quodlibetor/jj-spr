@@ -165,6 +165,11 @@ impl Scratch {
         self.dir.path()
     }
 
+    /// Set one jj-spr setting, for the tests that are about a setting.
+    fn set_config(&self, key: &str, value: &str) {
+        run("git", &["config", key, value], self.path());
+    }
+
     /// Stack `titles` on the trunk, one change each, and push them all.
     ///
     /// Returns each change's PR number, bottom-up — read back from the commit
@@ -247,6 +252,48 @@ impl Scratch {
     /// The branch the pull request is asking to be merged into.
     fn pr_base_branch(&self, number: u64) -> String {
         self.pr_field(number, ".base.ref")
+    }
+
+    /// The branch the pull request is asking to have merged.
+    fn pr_head_branch(&self, number: u64) -> String {
+        self.pr_field(number, ".head.ref")
+    }
+
+    fn pr_head_sha(&self, number: u64) -> String {
+        self.pr_field(number, ".head.sha")
+    }
+
+    /// How `head` stands to `base` on GitHub: `"ahead"` when `head` descends
+    /// from `base`, `"identical"` when they are the same commit, and
+    /// `"behind"` or `"diverged"` when a branch has been rewritten.
+    fn compare(&self, base: &str, head: &str) -> String {
+        let path = format!(
+            "repos/{}/{}/compare/{base}...{head}",
+            self.target.owner, self.target.repo
+        );
+
+        run("gh", &["api", &path, "--jq", ".status"], self.path())
+    }
+
+    /// Every branch this run has put on the remote, by name, sorted.
+    fn remote_branches(&self) -> Vec<String> {
+        let listing = run(
+            "git",
+            &[
+                "ls-remote",
+                "--heads",
+                "origin",
+                &format!("{}*", self.prefix),
+            ],
+            self.path(),
+        );
+
+        let mut branches: Vec<String> = ls_remote_refs(&listing)
+            .map(|r| r.trim_start_matches("refs/heads/").to_owned())
+            .collect();
+
+        branches.sort();
+        branches
     }
 
     /// The repository's default branch, which is the branch jj-spr retargets a
@@ -332,10 +379,8 @@ impl Drop for Scratch {
             .output();
 
         if let Ok(out) = refs {
-            let branches: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| Some(line.split_whitespace().nth(1)?.to_owned()))
-                .collect();
+            let listing = String::from_utf8_lossy(&out.stdout);
+            let branches: Vec<String> = ls_remote_refs(&listing).map(str::to_owned).collect();
             for branch in branches {
                 let _ = Command::new("git")
                     .args(["push", "origin", "--delete", &branch])
@@ -348,6 +393,13 @@ impl Drop for Scratch {
 
 fn slug(title: &str) -> String {
     title.replace(' ', "-")
+}
+
+/// The refs named by `git ls-remote` output, one per line as `<sha>\t<ref>`.
+fn ls_remote_refs(listing: &str) -> impl Iterator<Item = &str> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
 }
 
 /// A tag that tells this run's changes apart from every earlier run's.
@@ -518,5 +570,96 @@ fn diff_retargets_a_pull_request_whose_parent_was_merged_on_github() {
     assert!(
         !scratch.remote_has_branch(&old_base),
         "the base branch PR #{top} left behind is still on the remote: {old_base}"
+    );
+}
+
+/// Under `spr.baseStrategy = linear` a stacked pull request asks to be merged
+/// into the pull request below it, and no base branch is generated at all.
+///
+/// Only GitHub can show this: what a pull request is based on is a fact about
+/// the pull request, and the branches that do or do not exist are a fact about
+/// the remote.
+#[test]
+fn a_linear_stack_bases_each_pull_request_on_the_one_below() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "linear");
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let prs = scratch.push_stack(&["e2e linear bottom", "e2e linear top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    assert_eq!(
+        scratch.pr_base_branch(bottom),
+        scratch.default_branch(),
+        "the bottom of a stack is on the default branch under any strategy"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.pr_head_branch(bottom),
+        "PR #{top} should be based on the branch of PR #{bottom}"
+    );
+
+    let mut expected = vec![scratch.pr_head_branch(bottom), scratch.pr_head_branch(top)];
+    expected.sort();
+    assert_eq!(
+        scratch.remote_branches(),
+        expected,
+        "the linear strategy should have pushed the two head branches and nothing else"
+    );
+}
+
+/// Amending the bottom of a linear stack moves both branches forward and never
+/// rewrites either: jj-spr does not force-push, and GitHub drops the review
+/// comments on commits that go missing.
+///
+/// The pull request above is the one at risk, because it is what has to gain
+/// the new commit from below.
+#[test]
+fn amending_below_a_linear_pull_request_only_moves_branches_forward() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "linearff");
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let prs = scratch.push_stack(&["e2e linearff bottom", "e2e linearff top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+    let before: Vec<String> = prs.iter().map(|n| scratch.pr_head_sha(*n)).collect();
+
+    // Amend the change at the bottom, which is what the one above is based on.
+    run("jj", &["edit", "@-"], scratch.path());
+    std::fs::write(
+        scratch.path().join(slug("e2e linearff bottom")),
+        "amended content",
+    )
+    .unwrap();
+    run("jj", &["edit", "@+"], scratch.path());
+    jj_spr(
+        &["diff", "--all", "-r", "trunk()..@", "-m", "amend"],
+        scratch.path(),
+    );
+
+    for (number, before) in prs.iter().zip(&before) {
+        let after = scratch.pr_head_sha(*number);
+        assert_eq!(
+            scratch.compare(before, &after),
+            "ahead",
+            "PR #{number}'s branch was rewritten rather than moved forward"
+        );
+    }
+
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.pr_head_branch(bottom),
+        "PR #{top} should still be based on the branch of PR #{bottom}"
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "pushing below PR #{top} closed it"
     );
 }

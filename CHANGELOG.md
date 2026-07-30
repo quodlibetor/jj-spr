@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conflicted, so a caller able to bypass a protected branch could land a pull
   request whose CI had not started. `--force`, or the
   `spr.landWithUnmetRequirements` setting, lands anyway.
+- `spr.baseStrategy` chooses what a stacked pull request is based on. The
+  default, `synthetic`, keeps giving each one a generated base branch carrying
+  the parent change's tree. `linear` bases it on the pull request branch of the
+  change below instead, so the stack on GitHub is a chain of branches and no
+  base branches are generated. Both push the whole stack forward only: jj-spr
+  still never force-pushes. A change whose parent is not in the same run keeps
+  the base its pull request has, and falls back to a synthetic base branch only
+  where that run has to build a base commit for it — as a change pushed as a
+  cherry-pick, or stacked on one, always does.
 
 ## [0.1.0] - 2025-11-15
 
