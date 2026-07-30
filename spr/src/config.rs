@@ -7,7 +7,68 @@
 
 use std::collections::HashSet;
 
-use crate::{error::Result, github::GitHubBranch, utils::slugify};
+use crate::{
+    error::{Error, Result},
+    github::GitHubBranch,
+    utils::slugify,
+};
+
+/// Which branch a stacked pull request asks to be merged into.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BaseStrategy {
+    /// Give every stacked pull request a base branch of its own, carrying the
+    /// tree of the local parent change.
+    ///
+    /// Each pull request is then self-contained: the base branch is built from
+    /// the local parent, so a change can be pushed without its parent being up
+    /// to date on GitHub.
+    #[default]
+    Synthetic,
+    /// Base a stacked pull request on the pull request branch of the change
+    /// below it, so that the stack on GitHub is a chain of branches.
+    ///
+    /// The pull requests below have to be pushed first — which `diff` does
+    /// anyway when it is given the whole stack — because a stale parent branch
+    /// would leak the parent's changes into this pull request's diff.
+    Linear,
+}
+
+impl std::str::FromStr for BaseStrategy {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "synthetic" => Ok(Self::Synthetic),
+            "linear" => Ok(Self::Linear),
+            other => Err(Error::new(format!(
+                "spr.baseStrategy must be 'synthetic' or 'linear', but is '{other}'"
+            ))),
+        }
+    }
+}
+
+impl BaseStrategy {
+    /// Every strategy, in the order `jj spr init` offers them: the default
+    /// first, then in increasing order of what a stack asks of GitHub.
+    ///
+    /// Kept next to the enum rather than in `init`, so that a strategy added
+    /// here is offered rather than quietly left out of the one place that asks
+    /// about it.
+    pub const ALL: [Self; 2] = [Self::Synthetic, Self::Linear];
+
+    /// The value `spr.baseStrategy` takes for this strategy.
+    ///
+    /// The inverse of the [`FromStr`](std::str::FromStr) above, and here rather
+    /// than spelled out wherever a strategy is written: `jj spr init` offers
+    /// these names and then stores the one that was picked, so the two
+    /// directions have to agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+            Self::Linear => "linear",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -25,6 +86,13 @@ pub struct Config {
     /// silently disabling the check it guards. Set it with struct update
     /// syntax instead, which names the field at the call site.
     pub land_with_unmet_requirements: bool,
+    /// What a stacked pull request is based on.
+    ///
+    /// Not a parameter of [`Config::new`] either: it has a default worth
+    /// having, and every caller that does not care about it would otherwise
+    /// have to name it in a positional list that is already long enough to be
+    /// hard to read. Set it with struct update syntax.
+    pub base_strategy: BaseStrategy,
 }
 
 impl Config {
@@ -46,6 +114,7 @@ impl Config {
             branch_prefix,
             require_approval,
             land_with_unmet_requirements: false,
+            base_strategy: BaseStrategy::default(),
         }
     }
 
@@ -516,6 +585,60 @@ mod tests {
         let gh = config_factory();
 
         assert!(gh.is_synthetic_base_branch("spr/foo/main.my-feature"));
+    }
+
+    #[test]
+    fn base_strategy_is_synthetic_by_default() {
+        assert_eq!(config_factory().base_strategy, BaseStrategy::Synthetic);
+        assert_eq!(BaseStrategy::default(), BaseStrategy::Synthetic);
+    }
+
+    #[test]
+    fn base_strategy_parses_its_two_values() {
+        assert_eq!(
+            "synthetic".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::Synthetic
+        );
+        assert_eq!(
+            "linear".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::Linear
+        );
+        // git config hands values over as they were written.
+        assert_eq!(
+            " Linear\n".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::Linear
+        );
+    }
+
+    /// What `jj spr init` offers is what it writes into the configuration, so
+    /// every name it can store has to be one the setting reads back — and the
+    /// list it offers has to hold every strategy, or a strategy exists that
+    /// nothing asks about.
+    #[test]
+    fn every_base_strategy_is_offered_under_a_name_that_parses_back() {
+        for strategy in BaseStrategy::ALL {
+            assert_eq!(strategy.as_str().parse::<BaseStrategy>().unwrap(), strategy);
+        }
+
+        for strategy in [BaseStrategy::Synthetic, BaseStrategy::Linear] {
+            assert!(
+                BaseStrategy::ALL.contains(&strategy),
+                "{strategy:?} is not offered by `jj spr init`"
+            );
+        }
+    }
+
+    /// A misspelt strategy must not quietly mean the default: the two
+    /// strategies build different branches, and a typo would look like the
+    /// setting had no effect.
+    #[test]
+    fn base_strategy_rejects_anything_else() {
+        let error = "lienar".parse::<BaseStrategy>().unwrap_err();
+
+        assert!(
+            error.messages().iter().any(|m| m.contains("lienar")),
+            "the error should name the value it rejected: {error:?}"
+        );
     }
 
     #[test]

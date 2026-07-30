@@ -9,7 +9,9 @@ use indoc::formatdoc;
 use lazy_regex::regex;
 
 use crate::{
-    config::{AuthTokenSource, get_auth_token_with_source, set_jj_config},
+    config::{
+        AuthTokenSource, BaseStrategy, get_auth_token_with_source, get_config_value, set_jj_config,
+    },
     error::{Error, Result, ResultExt},
     output::output,
 };
@@ -198,7 +200,67 @@ pub async fn init() -> Result<()> {
 
     set_jj_config("spr.branchPrefix", &branch_prefix, &path)?;
 
+    // What a stacked pull request is based on
+
+    console::Term::stdout().write_line("")?;
+
+    output(
+        "❓",
+        &formatdoc!(
+            "What should a stacked pull request be based on? This only comes \
+             up once you stack: a change sitting directly on the main branch \
+             gets a pull request against the main branch either way.
+             'synthetic' gives every stacked pull request a base branch of its \
+             own, carrying the tree of the change below it. Each pull request \
+             then stands alone, so you can push one change without the ones \
+             below it being up to date on GitHub.
+             'linear' bases each pull request on the pull request branch of \
+             the change below it, so the stack on GitHub is a chain of \
+             branches. It wants the whole stack pushed in one run, since a \
+             stale branch below would leak its changes into the diff above."
+        ),
+    )?;
+
+    let base_strategy = select_one(
+        "Base strategy",
+        &BaseStrategy::ALL,
+        BaseStrategy::as_str,
+        get_config_value("spr.baseStrategy", &config)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    )?;
+
+    set_jj_config("spr.baseStrategy", base_strategy.as_str(), &path)?;
+
     Ok(())
+}
+
+/// Ask which of `options` to use, starting on `current` and returning the one
+/// that was picked.
+///
+/// The strategy settings are all of this shape — a small closed set of names
+/// that round-trip through the configuration — and the part worth not
+/// repeating is starting the cursor on what is configured already, so that
+/// running `jj spr init` again over an existing repository and pressing Enter
+/// through it changes nothing.
+fn select_one<T: Copy + PartialEq>(
+    prompt: &str,
+    options: &[T],
+    name: impl Fn(T) -> &'static str,
+    current: T,
+) -> Result<T> {
+    let chosen = dialoguer::Select::new()
+        .with_prompt(prompt)
+        .items(options.iter().map(|&option| name(option)))
+        .default(
+            options
+                .iter()
+                .position(|&option| option == current)
+                .unwrap_or(0),
+        )
+        .interact()?;
+
+    Ok(options[chosen])
 }
 
 fn validate_branch_prefix(branch_prefix: &str) -> Result<()> {
