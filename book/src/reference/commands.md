@@ -147,6 +147,25 @@ jj spr close
 jj spr close -r <change-id>
 ```
 
+**Stacks:** Closing a pull request retargets the pull requests based on it at
+*its* base, not at the default branch — closing puts nothing on the default
+branch, so sending them there would pull in the changes of every pull request
+below, which are still under review. Each retargeted pull request's diff does
+grow to include the closed pull request's changes, which is reported when it
+happens: those changes are no longer under review anywhere else.
+
+The closed pull request's branch is only deleted once every pull request based
+on it has been moved, because GitHub closes a pull request whose base branch
+disappears. If one of them cannot be moved, the branch is kept and said so.
+Its base branch is deleted only where jj-spr generated that branch for this
+pull request alone, and only while nothing has been pointed at it. So a base
+branch you set yourself is never deleted, and neither is the one a stacked pull
+request has under [`spr.baseStrategy =
+linear`](configuration.md#basestrategy), which is the branch of the pull
+request below. Where `linear` fell back to generating a base branch after all,
+that branch *is* deleted — unless some open pull request still targets it,
+which the pull requests just retargeted onto it are the usual reason for.
+
 ---
 
 ### `jj spr amend`

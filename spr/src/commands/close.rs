@@ -5,8 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::process::Stdio;
-
 use indoc::formatdoc;
 
 use crate::{
@@ -15,6 +13,10 @@ use crate::{
     jj::PreparedCommit,
     message::MessageSection,
     output::{output, write_commit_title},
+    stacked::{
+        base_branch_is_ours, may_delete_base_branch, retarget_stacked_pull_requests,
+        spawn_branch_deletion, spawn_head_branch_deletion,
+    },
 };
 
 #[derive(Debug, clap::Parser)]
@@ -108,7 +110,11 @@ async fn close_impl(
 
     output("📖", "Getting started...")?;
 
-    let base_is_master = pull_request.base.is_master_branch();
+    // Look up the Pull Requests based on this one's head branch before anything
+    // changes on GitHub, so that a failure here stops a close that can still be
+    // retried. See [`crate::stacked`] for why GitHub is asked rather than the
+    // local stack.
+    let stacked_pull_requests = gh.get_pull_requests_with_base(&pull_request.head).await?;
 
     let result = gh
         .update_pull_request(
@@ -136,40 +142,87 @@ async fn close_impl(
     prepared_commit.message.remove(&MessageSection::ReviewedBy);
     prepared_commit.message_changed = true;
 
-    let mut remove_old_branch_child_process = jj
-        .git_command()
-        .arg("push")
-        .arg("--no-verify")
-        .arg("--delete")
-        .arg("--")
-        .arg(&config.remote_name)
-        .arg(pull_request.head.on_github())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    // Closing puts nothing on the master branch, so the Pull Requests that were
+    // based on this one belong on *its* base rather than on master: that way
+    // their diffs absorb the changes of this Pull Request alone, and not those
+    // of every Pull Request below it, which are still under review. When this
+    // one was at the bottom of the stack its base is the master branch anyway.
+    let retargeted = retarget_stacked_pull_requests(
+        gh,
+        &stacked_pull_requests,
+        &pull_request.base,
+        &pull_request.head,
+    )
+    .await?;
 
-    let remove_old_base_branch_child_process = if base_is_master {
+    // Those Pull Requests now show this closed one's changes as part of theirs.
+    // That is the point — the changes are no longer under review anywhere else
+    // — but it is not something to let happen quietly.
+    for number in &retargeted.moved {
+        output(
+            "📄",
+            &format!(
+                "Pull Request #{number} is based on {} now, so its diff also \
+                 contains the changes of the closed Pull Request \
+                 #{pull_request_number}",
+                pull_request.base.branch_name()
+            ),
+        )?;
+    }
+
+    // What is based on the base branch now that the retargeting is done —
+    // which, where it went well, is the Pull Requests just moved onto it.
+    // GitHub is asked rather than that list assumed, because nothing says this
+    // Pull Request is the only one that was ever based on the branch, and a
+    // second one is what deleting it would close. Only asked where the answer
+    // could change anything: under `spr.baseStrategy = linear` the base is the
+    // head branch of the Pull Request below and stays either way.
+    //
+    // Asking can fail, and that must not fail the close: by this point the Pull
+    // Request is closed and the local message has lost its number, so an error
+    // here would leave nothing to retry with and, in `--all` mode, stop the
+    // Pull Requests above from being closed at all. A lookup that did not come
+    // back is reported and keeps the branch, which is what not knowing what a
+    // deletion would close should cost.
+    let based_on_base_branch = if !base_branch_is_ours(config, &pull_request.base) {
         None
     } else {
-        Some(
-            jj.git_command()
-                .arg("push")
-                .arg("--no-verify")
-                .arg("--delete")
-                .arg("--")
-                .arg(&config.remote_name)
-                .arg(pull_request.base.on_github())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        )
+        match gh.get_pull_requests_with_base(&pull_request.base).await {
+            Ok(pull_requests) => Some(pull_requests),
+            Err(error) => {
+                output(
+                    "⚠️",
+                    &format!(
+                        "Could not find out what is based on {}, so keeping it",
+                        pull_request.base.branch_name()
+                    ),
+                )?;
+                for message in error.messages() {
+                    output("  ", message)?;
+                }
+
+                None
+            }
+        }
     };
+
+    let remove_old_branch_child_process =
+        spawn_head_branch_deletion(jj, config, &pull_request.head, &retargeted)?;
+
+    let remove_old_base_branch_child_process =
+        if may_delete_base_branch(config, &pull_request.base, based_on_base_branch.as_deref()) {
+            Some(spawn_branch_deletion(jj, config, &pull_request.base)?)
+        } else {
+            None
+        };
 
     // Wait for the "git push" to delete the old Pull Request branch to finish,
     // but ignore the result.
     // GitHub may be configured to delete the branch automatically,
     // in which case it's gone already and this command fails.
-    remove_old_branch_child_process.wait().await?;
+    if let Some(mut proc) = remove_old_branch_child_process {
+        proc.wait().await?;
+    }
     if let Some(mut proc) = remove_old_base_branch_child_process {
         proc.wait().await?;
     }

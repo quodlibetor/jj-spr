@@ -8,18 +8,22 @@
 //! Moving the pull requests stacked on one that is leaving the stack, and
 //! deciding which of the branches it leaves behind may go.
 //!
-//! `land` takes a pull request out of a stack and then wants its head branch
-//! gone. Under `spr.baseStrategy = linear` that branch is what the pull
-//! requests above are based on, and GitHub closes a pull request whose base
-//! branch is deleted, so they have to be pointed somewhere else first — and the
-//! branch has to stay if any of them could not be.
+//! `land` and `close` both take a pull request out of a stack and then want its
+//! head branch gone. Under `spr.baseStrategy = linear` that branch is what the
+//! pull requests above are based on, and GitHub closes a pull request whose
+//! base branch is deleted, so they have to be pointed somewhere else first —
+//! and the branch has to stay if any of them could not be.
 //!
-//! The caller says where "somewhere else" is, and finds the pull requests to
-//! move itself: `land` puts the changes on the master branch, so the pull
-//! requests above belong there, and reads the local stack to find them — which
-//! means it cannot see one whose change jj does not have. What it finds goes to
-//! [`retarget_stacked_pull_requests`], so the head branch this module agrees to
-//! delete is only as safe as the list it was given.
+//! Where "somewhere else" is differs: `land` puts the changes on the master
+//! branch, so the pull requests above belong there, while `close` puts them
+//! nowhere, so they belong on the closed pull request's own base.
+//!
+//! How the callers find those pull requests differs too, and that difference
+//! matters more: `close` asks GitHub which pull requests target the branch,
+//! while `land` reads the local stack and so cannot see one whose change jj
+//! does not have. Both hand what they found to
+//! [`retarget_stacked_pull_requests`], which is why the head branch this module
+//! agrees to delete is only as safe as the list it was given.
 
 use std::process::Stdio;
 
@@ -184,7 +188,41 @@ pub async fn retarget_stacked_pull_requests(
 ///   deleting it would close *that* pull request;
 /// - a base branch set by hand — a release branch, a colleague's branch — was
 ///   never jj-spr's to take away.
-pub fn may_delete_base_branch(config: &Config, base: &GitHubBranch) -> bool {
+///
+/// Even a generated base branch stays while a pull request is based on it.
+/// Ownership says there should be none — [`Config::get_base_branch_name`] picks
+/// a name no other branch has — but `close` retargets the pull requests above
+/// onto this very branch, so it is the one thing that can put a second pull
+/// request there, and deleting the branch would close it.
+///
+/// `based_on_base` is what the caller found to be based on `base`, and the
+/// caller decides how hard it looked: `close` asks GitHub after retargeting,
+/// which is the only answer that covers a pull request it did not move itself.
+/// `land` passes an empty list — it retargets onto the master branch, so it
+/// aims nothing here, and it does not ask whether anything else did.
+///
+/// `None` means the caller tried to find out and could not. The branch stays:
+/// not knowing what a deletion would close is exactly the situation to leave a
+/// branch behind in. A caller may pass `None` unasked when
+/// [`base_branch_is_ours`] is false, since the answer is then `false` either
+/// way and the lookup would be wasted.
+pub fn may_delete_base_branch(
+    config: &Config,
+    base: &GitHubBranch,
+    based_on_base: Option<&[StackedPullRequest]>,
+) -> bool {
+    based_on_base.is_some_and(<[_]>::is_empty) && base_branch_is_ours(config, base)
+}
+
+/// Whether `base` is a base branch jj-spr generated, and so one the pull
+/// request that points at it could take away.
+///
+/// The ownership half of [`may_delete_base_branch`], named so that a caller
+/// working out whether it is worth asking GitHub what is based on the branch
+/// asks the same question the answer will be judged against. Were the two to
+/// drift apart, a caller could skip that lookup for a branch that is then
+/// deleted out from under whatever the lookup would have found.
+pub fn base_branch_is_ours(config: &Config, base: &GitHubBranch) -> bool {
     config.is_synthetic_base_branch(base.branch_name())
 }
 
@@ -272,7 +310,8 @@ mod tests {
     fn a_generated_base_branch_is_deleted() {
         assert!(may_delete_base_branch(
             &config(),
-            &branch("spr/foo/master.my-feature")
+            &branch("spr/foo/master.my-feature"),
+            Some(&[])
         ));
     }
 
@@ -282,15 +321,49 @@ mod tests {
     fn the_head_branch_below_is_not_deleted() {
         assert!(!may_delete_base_branch(
             &config(),
-            &branch("spr/foo/my-feature")
+            &branch("spr/foo/my-feature"),
+            Some(&[])
         ));
     }
 
-    /// A base branch nobody generated is nobody's to delete.
+    /// Even a generated base branch stays once pull requests have been aimed at
+    /// it, which is what `close` does with the ones stacked on the pull request
+    /// it closes.
+    #[test]
+    fn a_base_branch_holding_up_a_retargeted_pull_request_is_kept() {
+        let stacked = vec![StackedPullRequest {
+            number: 7,
+            base: branch("spr/foo/my-feature"),
+        }];
+
+        assert!(!may_delete_base_branch(
+            &config(),
+            &branch("spr/foo/master.my-feature"),
+            Some(&stacked),
+        ));
+    }
+
+    /// A lookup that could not be made keeps the branch: not knowing what
+    /// deleting it would close is the situation to leave it behind in.
+    #[test]
+    fn a_base_branch_nobody_could_ask_about_is_kept() {
+        assert!(!may_delete_base_branch(
+            &config(),
+            &branch("spr/foo/master.my-feature"),
+            None
+        ));
+    }
+
+    /// A base branch nobody generated is nobody's to delete. `close` used to
+    /// spare only the master branch, so a release branch someone set by hand
+    /// went the same way as a generated one.
     #[test]
     fn a_hand_set_base_branch_is_not_deleted() {
         for name in ["master", "release-1.0", "a-colleagues-branch"] {
-            assert!(!may_delete_base_branch(&config(), &branch(name)), "{name}");
+            assert!(
+                !may_delete_base_branch(&config(), &branch(name), Some(&[])),
+                "{name}"
+            );
         }
     }
 

@@ -354,12 +354,16 @@ pub async fn land(
     // the Pull Requests above to the master branch, not here. That is why it
     // can go now, rather than waiting for that retargeting the way the head
     // branch does.
-    let remove_old_base_branch_child_process = if may_delete_base_branch(config, &pull_request.base)
-    {
-        Some(spawn_branch_deletion(jj, config, &pull_request.base)?)
-    } else {
-        None
-    };
+    //
+    // Whether anything *else* is based on it is not asked — `close` does ask,
+    // and passing nothing here says only that `land` has not looked. See
+    // `may_delete_base_branch`.
+    let remove_old_base_branch_child_process =
+        if may_delete_base_branch(config, &pull_request.base, Some(&[])) {
+            Some(spawn_branch_deletion(jj, config, &pull_request.base)?)
+        } else {
+            None
+        };
 
     // The Pull Requests that were stacked on this one are now based on the
     // master branch, so point them at it and take the base branches they leave

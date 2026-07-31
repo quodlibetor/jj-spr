@@ -218,6 +218,14 @@ pub struct PullRequestMergeabilityQuery;
 )]
 pub struct OpenPullRequestBranchesQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/pull_requests_with_base.graphql",
+    response_derives = "Debug"
+)]
+pub struct PullRequestsWithBaseQuery;
+
 impl GitHub {
     pub fn new(
         config: crate::config::Config,
@@ -658,6 +666,78 @@ impl GitHub {
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
         })
+    }
+
+    /// The open pull requests GitHub has based on `base`.
+    ///
+    /// This sees pull requests the local repository cannot — see
+    /// [`crate::stacked`] for why that matters before a branch is deleted.
+    pub async fn get_pull_requests_with_base(
+        &self,
+        base: &GitHubBranch,
+    ) -> Result<Vec<StackedPullRequest>> {
+        let mut pull_requests = Vec::new();
+        let mut after: Option<String> = None;
+
+        loop {
+            let variables = pull_requests_with_base_query::Variables {
+                owner: self.config.owner.clone(),
+                name: self.config.repo.clone(),
+                base_ref_name: base.branch_name().to_string(),
+                first: 100,
+                after: after.clone(),
+            };
+            let request_body = PullRequestsWithBaseQuery::build_query(variables);
+            let res = self
+                .graphql_client
+                .post("https://api.github.com/graphql")
+                .json(&request_body)
+                .send()
+                .await?;
+            let response_body: Response<pull_requests_with_base_query::ResponseData> =
+                res.json().await?;
+
+            if let Some(errors) = response_body.errors {
+                let error = Err(Error::new(format!(
+                    "fetching the open Pull Requests based on '{}' failed",
+                    base.branch_name()
+                )));
+                return errors
+                    .into_iter()
+                    .fold(error, |err, e| err.context(e.to_string()));
+            }
+
+            let prs = response_body
+                .data
+                .ok_or_else(|| {
+                    Error::new(format!(
+                        "failed to fetch the open PRs based on '{}'",
+                        base.branch_name()
+                    ))
+                })?
+                .repository
+                .ok_or_else(|| Error::new("failed to find repository"))?
+                .pull_requests;
+
+            if let Some(nodes) = prs.nodes {
+                for node in nodes.into_iter().flatten() {
+                    pull_requests.push(StackedPullRequest {
+                        number: node.number as u64,
+                        base: self
+                            .config
+                            .new_github_branch_from_ref(&node.base_ref_name)?,
+                    });
+                }
+            }
+
+            if prs.page_info.has_next_page {
+                after = prs.page_info.end_cursor;
+            } else {
+                break;
+            }
+        }
+
+        Ok(pull_requests)
     }
 
     pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {

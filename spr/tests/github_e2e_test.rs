@@ -663,3 +663,125 @@ fn amending_below_a_linear_pull_request_only_moves_branches_forward() {
         "pushing below PR #{top} closed it"
     );
 }
+
+/// Closing the middle of a linear stack retargets the pull request above it at
+/// the closed pull request's own base, and leaves it open.
+///
+/// Only GitHub can show this. Under `spr.baseStrategy = linear` what the pull
+/// request above is based on *is* the closed pull request's head branch, so the
+/// branch may only be deleted once that pull request has been moved off it —
+/// GitHub closes a pull request whose base branch disappears. Asserting the
+/// state as well as the base is the point: were the deletion to run first, the
+/// base and the branch would look right while the pull request sat closed.
+///
+/// The new base is the closed pull request's base rather than the default
+/// branch, because closing puts nothing on the default branch: sending the pull
+/// request above there would swallow the changes of everything below it, which
+/// is still under review.
+#[test]
+fn closing_below_a_linear_pull_request_retargets_it_and_leaves_it_open() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "closeretarget");
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let tag = run_tag();
+    let titles = [
+        format!("e2e close bottom {tag}"),
+        format!("e2e close middle {tag}"),
+        format!("e2e close top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let (bottom, middle, top) = (prs[0], prs[1], prs[2]);
+
+    let bottom_branch = scratch.pr_head_branch(bottom);
+    let middle_branch = scratch.pr_head_branch(middle);
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        middle_branch,
+        "PR #{top} should be based on the branch of PR #{middle} under the linear strategy"
+    );
+
+    // `push_stack` leaves the working copy on the top of the stack, so the
+    // middle change is its parent.
+    jj_spr(&["close", "-r", "@-"], scratch.path());
+
+    assert_eq!(
+        scratch.pr_state(middle),
+        "closed",
+        "PR #{middle} should have been closed"
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "closing below PR #{top} closed it"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        bottom_branch,
+        "PR #{top} should have been retargeted at the closed PR's own base"
+    );
+    assert!(
+        !scratch.remote_has_branch(&middle_branch),
+        "the closed PR's branch is still on the remote: {middle_branch}"
+    );
+    assert!(
+        scratch.remote_has_branch(&bottom_branch),
+        "closing PR #{middle} took away the branch of PR #{bottom} below it: {bottom_branch}"
+    );
+}
+
+/// Under `spr.baseStrategy = synthetic` the closed pull request's base branch
+/// is one jj-spr generated for it alone, so closing does take that one away.
+///
+/// The counterpart to the linear case above: the rule is ownership, not the
+/// strategy, and a repository holds pull requests made under both at once.
+#[test]
+fn closing_a_synthetic_pull_request_takes_away_its_generated_base_branch() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "closesynth");
+    // Set even though it is the default: this is the test whose whole point is
+    // the contrast with the linear case above, so it should fail about the
+    // strategy rather than about a branch if the default ever changes.
+    scratch.set_config("spr.baseStrategy", "synthetic");
+
+    let tag = run_tag();
+    let titles = [
+        format!("e2e closesynth bottom {tag}"),
+        format!("e2e closesynth top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let (bottom, top) = (prs[0], prs[1]);
+
+    let base = scratch.pr_base_branch(top);
+    let head = scratch.pr_head_branch(top);
+    assert!(
+        base.starts_with(&scratch.prefix),
+        "the top PR should be stacked on a base branch jj-spr made, got {base:?}"
+    );
+
+    // `push_stack` leaves the working copy on the top of the stack.
+    jj_spr(&["close", "-r", "@"], scratch.path());
+
+    assert_eq!(
+        scratch.pr_state(top),
+        "closed",
+        "PR #{top} should have been closed"
+    );
+    assert_eq!(
+        scratch.pr_state(bottom),
+        "open",
+        "closing PR #{top} closed PR #{bottom} below it"
+    );
+    for branch in [&base, &head] {
+        assert!(
+            !scratch.remote_has_branch(branch),
+            "a branch the closed PR owned is still on the remote: {branch}"
+        );
+    }
+}

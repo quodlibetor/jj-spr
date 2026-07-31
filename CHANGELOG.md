@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where that run has to build a base commit for it — as a change pushed as a
   cherry-pick, or stacked on one, always does.
 
+### Fixed
+
+- `jj spr close` no longer closes the pull requests around the one it is asked
+  to close. It asks GitHub which open pull requests are based on the closed
+  one's head branch, points them at the closed pull request's own base — so
+  each picks up the closed changes, but not those of the pull requests below it
+  that are still under review — and only then deletes the head branch, keeping
+  it when one of them could not be moved. It also no longer deletes a base
+  branch jj-spr did not generate: under `spr.baseStrategy = linear` that branch
+  is the head branch of the pull request below, so deleting it closed that pull
+  request, and a base branch set by hand went the same way. A generated base
+  branch is kept too while any open pull request still targets it, which the
+  ones just retargeted onto it are the usual reason for.
+
 ## [0.1.0] - 2025-11-15
 
 ### Added
