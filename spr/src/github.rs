@@ -17,6 +17,13 @@ use std::{
     path::PathBuf,
 };
 
+mod stacks;
+
+pub use stacks::{
+    Stack, StackApiError, StackBase, StackGitRef, StackPullRequest, StackPullRequestState,
+    StackResult, UnstackOutcome,
+};
+
 #[derive(Clone)]
 pub struct GitHub {
     config: crate::config::Config,
