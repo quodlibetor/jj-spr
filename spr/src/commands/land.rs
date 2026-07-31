@@ -42,7 +42,7 @@ fn resolve_cherry_pick(
 pub async fn land(
     mut opts: LandOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
     let revision = opts.revision.as_deref().unwrap_or("@");

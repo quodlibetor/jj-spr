@@ -100,7 +100,7 @@ fn resolve_cherry_pick(
 pub async fn diff(
     opts: DiffOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
     let mut result = Ok(());
@@ -263,7 +263,7 @@ async fn diff_impl(
     opts: &DiffOptions,
     message_on_prompt: &mut String,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &crate::github::GitHub,
     config: &crate::config::Config,
     local_commit: &mut crate::jj::PreparedCommit,
     master_base_oid: Oid,
