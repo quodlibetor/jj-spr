@@ -15,6 +15,7 @@ use crate::{
         PullRequestUpdate,
     },
     message::{MessageSection, validate_commit_message},
+    native_stacks::{BaseUnlock, ChainLink, Reconciliation, StackSession},
     output::{output, write_commit_title},
     utils::{parse_name_list, remove_all_parens, run_command},
 };
@@ -138,6 +139,21 @@ pub async fn diff(
         return result;
     };
 
+    // A change this run would open a pull request for has no number yet, and a
+    // dry run opens nothing, so there is no number to give it.
+    let would_create_pull_requests = prepared_commits
+        .iter()
+        .any(|commit| commit.pull_request_number.is_none());
+
+    // Registering the run's pull requests as a stack GitHub draws itself is a
+    // step around the loop rather than a way of running it: `None` is the whole
+    // of "GitHub is not drawing the stack", so nothing below asks what mode this
+    // is.
+    let mut stacks = config
+        .stack_display
+        .draws_the_stack()
+        .then(StackSession::new);
+
     #[allow(clippy::needless_collect)]
     let pull_request_tasks: Vec<_> = prepared_commits
         .iter()
@@ -153,6 +169,12 @@ pub async fn diff(
     // pushed has already been pushed and can be offered to it as a base. See
     // [`linear_base`] for when that offer is taken up.
     let mut change_below: Option<PushedChange> = None;
+
+    // The ordered pull requests of the run, which the registration needs and
+    // which no revset can answer: whether one change's pull request is chained
+    // to the one below is decided inside the loop, from trees and from what
+    // GitHub already has. Accumulated bottom-up, as the loop walks.
+    let mut links: Vec<ChainLink> = Vec::new();
 
     for (prepared_commit, pull_request_task) in zip(prepared_commits.iter_mut(), pull_request_tasks)
     {
@@ -184,11 +206,15 @@ pub async fn diff(
             master_base_oid,
             pull_request,
             change_below.as_ref(),
+            stacks.as_mut(),
         )
         .await;
 
         match pushed {
-            Ok(pushed) => change_below = Some(pushed),
+            Ok(pushed) => {
+                links.push(pushed.link());
+                change_below = Some(pushed);
+            }
             Err(error) => result = Err(error),
         }
     }
@@ -200,6 +226,45 @@ pub async fn diff(
             &mut result,
             jj.rewrite_commit_messages(prepared_commits.as_mut_slice()),
         );
+    }
+
+    // A dry run opens no pull request, so a change that would get one has no
+    // number, and a chain cannot be carried through a change it cannot name.
+    // The chains such a run works out are therefore not the ones it would
+    // register, and reporting them would be worse than reporting nothing: a
+    // stack that would be appended to reads as unchanged, and a pull request
+    // that would be registered again reads as one about to be left behind. So
+    // the registration is only reported for a run that opens nothing.
+    let plan_registration = !opts.dry_run || !would_create_pull_requests;
+
+    // Now that every pull request the run pushed exists and is pointing where
+    // it will end up, GitHub can be told that they are a stack.
+    let mut registrations: Vec<Reconciliation> = Vec::new();
+    if let Some(session) = stacks.as_mut()
+        && result.is_ok()
+        && plan_registration
+        && let Some(outcomes) = add_error(
+            &mut result,
+            session.register(gh, &links, !opts.dry_run).await,
+        )
+    {
+        registrations = outcomes;
+    }
+
+    // Asked however the run went, and after the registration either way: a run
+    // that failed before it could register is exactly the one that may have
+    // taken a stack apart and left it that way.
+    if let Some(orphaned) = stacks
+        .as_ref()
+        .and_then(StackSession::orphaned_pull_requests)
+    {
+        registrations.push(orphaned);
+    }
+
+    if !opts.dry_run {
+        for outcome in registrations.iter().filter(|o| o.is_notable()) {
+            add_error(&mut result, report_stack(outcome));
+        }
     }
 
     if opts.dry_run {
@@ -266,6 +331,26 @@ pub async fn diff(
             }
             output("", "")?;
         }
+
+        // What the registration would do cannot be worked out without asking
+        // GitHub — the run's own pull requests say nothing about what stack
+        // already holds them — so `register` above made that call even for a
+        // dry run, and every chain reports, including the ones that turn out
+        // not to be stacks.
+        for outcome in &registrations {
+            report_stack(outcome)?;
+        }
+
+        // An absent registration line must not read as "there is no GitHub
+        // stack to register".
+        if !plan_registration && config.stack_display.draws_the_stack() {
+            output(
+                "ℹ️",
+                "The GitHub stack is not shown: this run would open pull \
+                 requests, and a stack cannot be worked out until they have \
+                 numbers.",
+            )?;
+        }
     }
 
     result
@@ -293,6 +378,59 @@ struct PushedChange {
     /// for the change above: the diff would then leave out everything between
     /// master and this change.
     pushed_as_cherry_pick: bool,
+    /// The change's pull request, once it has one.
+    ///
+    /// A pull request this run is opening has no number until GitHub answers
+    /// with one, and a dry run never opens one, so this is `None` for a change
+    /// whose pull request does not exist yet.
+    pull_request_number: Option<u64>,
+    /// The pull request this change's own is based on, where the base ref of
+    /// this one is the head ref of that one. See [`chain_link`].
+    based_on: Option<u64>,
+    /// Whether the run moves this change's pull request onto a different base
+    /// branch, which no stack holding it can survive.
+    retargeted: bool,
+}
+
+impl PushedChange {
+    /// How the change looks to the stack registration.
+    fn link(&self) -> ChainLink {
+        ChainLink {
+            pull_request: self.pull_request_number,
+            based_on: self.based_on,
+            retargeted: self.retargeted,
+        }
+    }
+}
+
+/// Say what became of the run's stack registration.
+fn report_stack(outcome: &Reconciliation) -> Result<()> {
+    output("🧱", &format!("GitHub stack: {}", outcome.describe()))
+}
+
+/// The pull request below that this change's pull request is chained to, in the
+/// sense GitHub's stacks mean: this pull request's base ref is that one's head
+/// ref.
+///
+/// `linear_base` is not enough on its own to answer this. It says what the
+/// change below *offers* to be, and the run may not take the offer up: a change
+/// that needs no push exits before its base is looked at, so a stack migrating
+/// to `spr.baseStrategy = linear` leaves pull requests whose trees are already
+/// right still pointing at the synthetic base branches they had. Registering
+/// those as a stack would be refused for not forming one. So the base branch
+/// the pull request ends the run with is compared as well, which is the very
+/// thing GitHub checks.
+fn chain_link(
+    linear_base: Option<&PushedChange>,
+    base_branch: Option<&GitHubBranch>,
+) -> Option<u64> {
+    let below = linear_base?;
+
+    if base_branch?.branch_name() != below.branch.branch_name() {
+        return None;
+    }
+
+    below.pull_request_number
 }
 
 /// The pull request branch that the change above `change_below` should be
@@ -443,6 +581,7 @@ async fn diff_impl(
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
     change_below: Option<&PushedChange>,
+    stacks: Option<&mut StackSession>,
 ) -> Result<PushedChange> {
     // Parsed commit message of the local commit
     let message = &mut local_commit.message;
@@ -677,12 +816,20 @@ async fn diff_impl(
             }
 
             // Nothing was pushed, so the branch still points where it did, and
-            // that is what the change above this one has to build on.
+            // that is what the change above this one has to build on. It is
+            // still part of the stack the run is registering, though — a change
+            // in the middle that needs no push must not sever the chain — so it
+            // reports its pull request and what that is based on, which is the
+            // base it already has rather than one this run chose.
             return Ok(PushedChange {
                 local_oid: local_commit.oid,
                 head_oid: pull_request.head_oid,
                 branch: pull_request.head.clone(),
                 pushed_as_cherry_pick,
+                pull_request_number: Some(pull_request.number),
+                based_on: chain_link(linear_base, Some(&pull_request.base)),
+                // Nothing was pushed, so nothing was retargeted either.
+                retargeted: false,
             });
         }
     }
@@ -844,6 +991,30 @@ async fn diff_impl(
         )
     };
 
+    // Worked out here because the branches below take `base_branch` apart, and
+    // because a change that ends the run based on the one below it is part of
+    // the stack whether or not this run was what put it there.
+    let based_on = chain_link(linear_base, base_branch.as_ref());
+
+    // Whether this run moves the pull request onto a different base branch.
+    //
+    // This is the one predicate for it, and the three places below that send a
+    // base to GitHub are exactly the cases it covers: retargeting off a base
+    // branch that has become obsolete, setting a base that has changed, and
+    // going back to the master branch. Each of those requires the base to
+    // differ from the one the pull request has, and no other path sends one.
+    // Deriving them all from one expression is what keeps the unstacking below
+    // from drifting out of step with the retargeting it has to precede.
+    let retargeted = pull_request.as_ref().is_some_and(|pull_request| {
+        let target = base_branch.as_ref().unwrap_or(&config.master_ref);
+
+        pull_request.base.branch_name() != target.branch_name()
+    });
+
+    // The pull request the change ends the run with. One this run is opening
+    // has no number until GitHub answers with one, below.
+    let mut pull_request_number = local_commit.pull_request_number;
+
     let mut github_commit_message = opts.message.clone();
     if pull_request.is_some() && github_commit_message.is_none() && !opts.dry_run {
         let input = {
@@ -925,6 +1096,20 @@ async fn diff_impl(
             .arg(&config.remote_name)
             .arg(format!("{}:{}", pr_commit, pull_request_branch.on_github()));
 
+        // Where this run prepared a new commit for a base branch, that goes in
+        // the same push. Case 0 builds no such commit — the base is the branch
+        // below, which its own push moved — so the branch here is either one
+        // generated for this pull request or one jj-spr did not make at all,
+        // which it writes to as it did before there were base strategies. See
+        // [`may_push_base_commit_to`], which draws that line.
+        if let (Some(base_branch), Some(base_branch_commit)) = (&base_branch, base_branch_commit) {
+            cmd.arg(format!(
+                "{}:{}",
+                base_branch_commit,
+                base_branch.on_github()
+            ));
+        }
+
         if let Some(pull_request) = pull_request {
             // We are updating an existing Pull Request
 
@@ -953,24 +1138,28 @@ async fn diff_impl(
                 pull_request_updates.update_message(&pull_request, message);
             }
 
+            // Push the new commit onto the Pull Request branch (and also the new
+            // base commit, if we added that to cmd above). It comes before both
+            // of the branches below because either may ask GitHub to diff the
+            // pull request against a different base, and the head branch — with
+            // any base branch this run built for it — has to be on the remote in
+            // the state that base assumes before that is asked for.
+            run_command(&mut cmd)
+                .await
+                .reword("git push failed".to_string())?;
+
+            // GitHub refuses to change the base of a pull request that is in a
+            // stack, so any stack holding this one has to go first. Every path
+            // below that sends a base does so only when `retargeted`, so asking
+            // here rather than at each of them is what stops the condition
+            // drifting from the calls it has to precede; see where `retargeted`
+            // is worked out for why one predicate covers all of them.
+            if retargeted {
+                unstack_before_retargeting(stacks, gh, pull_request.number).await?;
+            }
+
             if let Some(base_branch) = base_branch {
                 // We are using a base branch.
-
-                if let Some(base_branch_commit) = base_branch_commit {
-                    // ...and we prepared a new commit for it, so we need to push an
-                    // update of the base branch.
-                    cmd.arg(format!(
-                        "{}:{}",
-                        base_branch_commit,
-                        base_branch.on_github()
-                    ));
-                }
-
-                // Push the new commit onto the Pull Request branch (and also the
-                // new base commit, if we added that to cmd above).
-                run_command(&mut cmd)
-                    .await
-                    .reword("git push failed".to_string())?;
 
                 // A base branch of ours that the Pull Request is moving off —
                 // which is what a stack migrating to `spr.baseStrategy =
@@ -1007,14 +1196,12 @@ async fn diff_impl(
                 }
             } else {
                 // The Pull Request is against the master branch (or we are
-                // retargeting it to master). In that case we only need to push the
-                // update to the Pull Request branch.
-                run_command(&mut cmd)
-                    .await
-                    .reword("git push failed".to_string())?;
-
-                // If the PR was based on a branch, retarget it to master and
-                // take that branch out of the way if it was ours.
+                // retargeting it to master), so there was no base branch of
+                // ours in the push above. There may still be one it is moving
+                // off: retarget it to master and, where that branch was ours,
+                // take it away — in that order, because a base branch deleted
+                // while the pull request still points at it closes the pull
+                // request.
                 if let Some(ref old_base) = old_base {
                     let deleted = gh
                         .retarget_to_master_branch(pull_request.number, old_base)
@@ -1042,23 +1229,20 @@ async fn diff_impl(
         } else {
             // We are creating a new Pull Request.
 
-            // If there's a base branch of our own, add it to the push
-            if let (Some(base_branch), Some(base_branch_commit)) =
-                (&base_branch, base_branch_commit)
-            {
-                cmd.arg(format!(
-                    "{}:{}",
-                    base_branch_commit,
-                    base_branch.on_github()
-                ));
-            }
-            // Push the pull request branch and the base branch if present
+            // Push the pull request branch and the base branch if present.
+            //
+            // Deliberately a second copy of the push rather than one hoisted
+            // above `if let Some(pull_request)`: hoisting it would put the push
+            // ahead of the "updating Pull Request #N" line the other branch
+            // prints first. Nothing else holds it here — a pull request that
+            // does not exist yet is in no stack, so the unstacking the other
+            // branch does after its push has nothing to do on this side.
             run_command(&mut cmd)
                 .await
                 .reword("git push failed".to_string())?;
 
             // Then call GitHub to create the Pull Request.
-            let pull_request_number = gh
+            let created = gh
                 .create_pull_request(
                     message,
                     base_branch
@@ -1071,22 +1255,21 @@ async fn diff_impl(
                 )
                 .await?;
 
-            let pull_request_url = config.pull_request_url(pull_request_number);
+            pull_request_number = Some(created);
+            let pull_request_url = config.pull_request_url(created);
 
             output(
                 "✨",
                 &format!(
                     "Created new Pull Request #{}: {}",
-                    pull_request_number, &pull_request_url,
+                    created, &pull_request_url
                 ),
             )?;
 
             message.insert(MessageSection::PullRequest, pull_request_url);
             local_commit.message_changed = true;
 
-            let result = gh
-                .request_reviewers(pull_request_number, requested_reviewers)
-                .await;
+            let result = gh.request_reviewers(created, requested_reviewers).await;
             match result {
                 Ok(()) => (),
                 Err(error) => {
@@ -1107,7 +1290,40 @@ async fn diff_impl(
         head_oid: pr_commit,
         branch: pull_request_branch,
         pushed_as_cherry_pick,
+        pull_request_number,
+        based_on,
+        retargeted,
     })
+}
+
+/// Take pull request `number` out of any stack it is in, so that GitHub will
+/// accept the base change about to be sent.
+///
+/// A no-op when GitHub is not drawing the stack, which is what makes this safe to
+/// call wherever a base is about to move without asking what mode the run is
+/// in. See [`StackSession::unlock_base`] for why the base cannot simply be sent
+/// and the refusal handled.
+async fn unstack_before_retargeting(
+    stacks: Option<&mut StackSession>,
+    gh: &crate::github::GitHub,
+    number: u64,
+) -> Result<()> {
+    let Some(session) = stacks else {
+        return Ok(());
+    };
+
+    if let BaseUnlock::Dissolved { stack_number } = session.unlock_base(gh, number).await? {
+        output(
+            "🧱",
+            &format!(
+                "Dissolved GitHub stack #{stack_number}: a stacked pull request's base cannot \
+                 be changed. A stack is registered again at the end of this run, under a new \
+                 number."
+            ),
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1471,6 +1687,9 @@ mod tests {
                 "main",
             ),
             pushed_as_cherry_pick: false,
+            pull_request_number: Some(41),
+            based_on: None,
+            retargeted: false,
         }
     }
 
@@ -1757,6 +1976,65 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// The link GitHub's stacks are made of: this pull request's base ref is
+    /// the head ref of the pull request below.
+    #[test]
+    fn a_pull_request_based_on_the_one_below_is_chained_to_it() {
+        let below = make_change_below("spr/test/parent-feature");
+        let base = below.branch.clone();
+
+        assert_eq!(chain_link(Some(&below), Some(&base)), Some(41));
+    }
+
+    /// The case `linear_base` alone gets wrong. A change whose trees are
+    /// already right needs no push, so the run never moves it off the synthetic
+    /// base branch it has — while the change below still offers itself as a
+    /// base. Registering that as a stack would be refused for not forming one.
+    #[test]
+    fn a_pull_request_left_on_its_synthetic_base_is_not_chained() {
+        let below = make_change_below("spr/test/parent-feature");
+        let base = crate::github::GitHubBranch::new_from_branch_name(
+            "spr/test/main.parent-feature",
+            "origin",
+            "main",
+        );
+
+        assert_eq!(chain_link(Some(&below), Some(&base)), None);
+    }
+
+    /// A pull request against the master branch has no base branch at all, and
+    /// so is the bottom of whatever stack it is in.
+    #[test]
+    fn a_pull_request_on_master_is_chained_to_nothing() {
+        let below = make_change_below("spr/test/parent-feature");
+
+        assert_eq!(chain_link(Some(&below), None), None);
+    }
+
+    /// Nothing below means nothing to be chained to, whatever the base says.
+    #[test]
+    fn a_pull_request_with_nothing_below_is_chained_to_nothing() {
+        let base = crate::github::GitHubBranch::new_from_branch_name(
+            "spr/test/parent-feature",
+            "origin",
+            "main",
+        );
+
+        assert_eq!(chain_link(None, Some(&base)), None);
+    }
+
+    /// A change below whose pull request this run is opening has no number
+    /// until GitHub answers with one, and a dry run never asks. There is
+    /// nothing to name it by, so the chain stops.
+    #[test]
+    fn a_pull_request_that_does_not_exist_yet_chains_nothing_to_it() {
+        let mut below = make_change_below("spr/test/parent-feature");
+        below.pull_request_number = None;
+        let base = below.branch.clone();
+
+        assert_eq!(chain_link(Some(&below), Some(&base)), None);
     }
 
     /// jj-spr never force-pushes: every commit it puts on a pull request branch

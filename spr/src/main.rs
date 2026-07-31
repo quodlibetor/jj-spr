@@ -136,14 +136,24 @@ pub async fn spr() -> Result<()> {
     let require_approval = get_config_bool("spr.requireApproval", &git_config).unwrap_or(false);
     let land_with_unmet_requirements =
         get_config_bool("spr.landWithUnmetRequirements", &git_config).unwrap_or(false);
-    let base_strategy = get_config_value("spr.baseStrategy", &git_config)
+    let stack_display = get_config_value("spr.stackDisplay", &git_config)
         .map(|value| value.parse())
         .transpose()?
         .unwrap_or_default();
+    // The two settings are not independent — see `resolve_base_strategy`, which
+    // is where that is said, so that nothing downstream has to ask about the
+    // combination.
+    let base_strategy = jj_spr::config::resolve_base_strategy(
+        stack_display,
+        get_config_value("spr.baseStrategy", &git_config)
+            .map(|value| value.parse())
+            .transpose()?,
+    )?;
 
     let config = jj_spr::config::Config {
         land_with_unmet_requirements,
         base_strategy,
+        stack_display,
         ..jj_spr::config::Config::new(
             github_owner,
             github_repo,

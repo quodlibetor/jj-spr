@@ -37,6 +37,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where that run has to build a base commit for it — as a change pushed as a
   cherry-pick, or stacked on one, always does.
 
+- `spr.stackDisplay` chooses how a pull request says which stack it belongs to.
+  There are two ways of saying it and they are alternatives, not layers — two
+  descriptions of the same stack can disagree — so it is one setting with three
+  values rather than two that can both be on. `section`, the default, writes a
+  `Stack` list into each pull request's body; `github` registers the pull
+  requests with GitHub's stacked pull requests and lets GitHub draw the stack;
+  `none` says nothing. Turning the description off is a thing you say, not a
+  thing you get by omission.
+
+  `github` needs `spr.baseStrategy = linear` — GitHub requires each pull
+  request in a stack to be based on the branch of the one below — and supplies
+  it where the strategy was not set, rather than overriding one that was.
+  GitHub refuses to change the base branch of a pull request that is in a
+  stack, so a run that has to retarget one takes the whole stack apart and
+  registers the pull requests it pushed as a new one, under a new number.
+  `jj spr land` and `jj spr close` do not know about stacks yet and have to
+  have the stack taken apart by hand first. `--dry-run` reports what the run
+  would register. `jj spr init` asks for the setting right after the base
+  strategy, offering `github` only where the strategy picked can carry a
+  stack.
+
 ### Fixed
 
 - `jj spr close` no longer closes the pull requests around the one it is asked

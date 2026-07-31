@@ -115,6 +115,14 @@ struct Scratch {
     target: Target,
     dir: tempfile::TempDir,
     prefix: String,
+    /// Stacks to take apart when this goes out of scope.
+    ///
+    /// A stack outlives the pull requests in it — closing them all leaves it
+    /// open — so closing the pull requests is not enough to clean one up, and
+    /// a stack left behind in the target repository is what makes a later run
+    /// find its pull requests already stacked. Recorded rather than unstacked
+    /// at the end of a test so that a failed assertion cleans up too.
+    stacks: std::cell::RefCell<Vec<u64>>,
 }
 
 impl Scratch {
@@ -158,6 +166,7 @@ impl Scratch {
             target,
             dir,
             prefix,
+            stacks: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -323,10 +332,73 @@ impl Scratch {
     fn repo_arg(&self) -> String {
         format!("{}/{}", self.target.owner, self.target.repo)
     }
+
+    /// The open stack pull request `number` is in, if any.
+    ///
+    /// Filtered on `open`, as everything that acts on a stack has to be:
+    /// GitHub keeps a stack for ever once it holds a merged pull request and
+    /// goes on listing it here.
+    fn open_stack_for(&self, number: u64) -> Option<StackOnGitHub> {
+        let listing = run(
+            "gh",
+            &[
+                "api",
+                &format!(
+                    "repos/{}/{}/stacks?pull_request={number}",
+                    self.target.owner, self.target.repo
+                ),
+                "--jq",
+                r#".[] | select(.open) | "\(.number) \([.pull_requests[].number] | join(","))""#,
+            ],
+            self.path(),
+        );
+
+        let line = listing.lines().next().filter(|l| !l.trim().is_empty())?;
+        let (stack_number, members) = line.split_once(' ').unwrap_or((line, ""));
+        let number: u64 = stack_number.parse().expect("a stack number");
+
+        // Noted for teardown as soon as it is seen, so that an assertion
+        // failing below this line still leaves the repository clean.
+        self.stacks.borrow_mut().push(number);
+
+        Some(StackOnGitHub {
+            number,
+            pull_requests: members
+                .split(',')
+                .filter(|m| !m.is_empty())
+                .map(|m| m.parse().expect("a pull request number"))
+                .collect(),
+        })
+    }
+}
+
+/// A stack as GitHub holds it: its number, and its members bottom to top.
+struct StackOnGitHub {
+    number: u64,
+    pull_requests: Vec<u64>,
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        // Stacks first: a pull request cannot be retargeted while it is in one,
+        // and a stack goes on holding pull requests that have been closed, so
+        // leaving this until after the closing below would leave a live stack
+        // in the repository for good.
+        for number in self.stacks.borrow().iter() {
+            let _ = Command::new("gh")
+                .args([
+                    "api",
+                    "--method",
+                    "POST",
+                    &format!(
+                        "repos/{}/{}/stacks/{number}/unstack",
+                        self.target.owner, self.target.repo
+                    ),
+                ])
+                .current_dir(self.path())
+                .output();
+        }
+
         // Close everything this run opened, whether or not the test passed —
         // a failed test must not leave pull requests behind.
         let open = Command::new("gh")
@@ -611,6 +683,52 @@ fn a_linear_stack_bases_each_pull_request_on_the_one_below() {
     );
 }
 
+/// Under `spr.stackDisplay = github` the pull requests a run pushes become a stack
+/// GitHub itself holds and draws.
+///
+/// Only GitHub can show this: a stack is a resource on GitHub's side, and
+/// whether the pull requests are chained the way it requires is a fact about
+/// the pull requests rather than about anything local.
+///
+/// The target repository must have stacked pull requests enabled. Without it
+/// GitHub answers 404 on every stacks route and this fails saying so, which is
+/// the honest outcome: the setting was asked for and could not be honoured.
+#[test]
+fn a_stack_pushed_by_jj_spr_becomes_a_github_stack() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "ghstack");
+    // Deliberately the only setting: `spr.stackDisplay = github` requires the linear
+    // base strategy and supplies it, and this is where that has to be true of
+    // the built binary rather than of a unit test.
+    scratch.set_config("spr.stackDisplay", "github");
+
+    let prs = scratch.push_stack(&["e2e ghstack bottom", "e2e ghstack top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.pr_head_branch(bottom),
+        "the setting should have brought the linear strategy with it: PR #{top} should be \
+         based on the branch of PR #{bottom}"
+    );
+
+    let stack = scratch
+        .open_stack_for(bottom)
+        .unwrap_or_else(|| panic!("PR #{bottom} should be in an open GitHub stack"));
+    assert_eq!(
+        stack.pull_requests, prs,
+        "the stack should hold the run's pull requests, bottom first"
+    );
+    assert_eq!(
+        scratch.open_stack_for(top).map(|s| s.number),
+        Some(stack.number),
+        "both pull requests should be in the same stack"
+    );
+}
+
 /// Amending the bottom of a linear stack moves both branches forward and never
 /// rewrites either: jj-spr does not force-push, and GitHub drops the review
 /// comments on commits that go missing.
@@ -784,4 +902,160 @@ fn closing_a_synthetic_pull_request_takes_away_its_generated_base_branch() {
             "a branch the closed PR owned is still on the remote: {branch}"
         );
     }
+}
+
+/// Adopting `spr.baseStrategy = linear` moves a stacked pull request off the
+/// base branch jj-spr generated for it and onto the head branch of the pull
+/// request below, and takes the branch it left away.
+///
+/// This is the arm of the push in `diff` where the pull request ends up on a
+/// base branch rather than on the default branch, and it is the only test that
+/// reaches the *retarget* inside that arm: every other stacked test either
+/// keeps the base it was pushed with or goes back to the default branch. The
+/// push, the retarget and the deletion all happen here, in that order — a base
+/// branch deleted while the pull request still targets it makes GitHub close
+/// it — so the state is asserted alongside the base and the branch's absence,
+/// as in the retarget-to-default tests above.
+///
+/// The change on top is amended because a migration needs something to carry
+/// it, which is also what makes the push observable. That is a gap rather than
+/// a rule: switching the strategy and nothing else is silently a no-op, because
+/// the early return for a change that needs no push comes before the base is
+/// looked at.
+#[test]
+fn migrating_a_stack_to_linear_retargets_it_and_takes_away_its_base_branch() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "linearmigrate");
+    // Set even though it is the default: this test is about what changing the
+    // strategy does, so it should say which one it starts from.
+    scratch.set_config("spr.baseStrategy", "synthetic");
+
+    let top_title = "e2e migrate top";
+    let prs = scratch.push_stack(&["e2e migrate bottom", top_title]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    let old_base = scratch.pr_base_branch(top);
+    let bottom_branch = scratch.pr_head_branch(bottom);
+    assert!(
+        old_base.starts_with(&scratch.prefix) && old_base != bottom_branch,
+        "the top PR should be stacked on a base branch jj-spr made for it alone, got {old_base:?}"
+    );
+    let before = scratch.pr_head_sha(top);
+
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    // `push_stack` leaves the working copy on the top of the stack, so this
+    // amends the change whose pull request is migrating.
+    std::fs::write(scratch.path().join(slug(top_title)), "migrated content").unwrap();
+    jj_spr(
+        &["diff", "--all", "-r", "trunk()..@", "-m", "migrate"],
+        scratch.path(),
+    );
+
+    assert_eq!(
+        scratch.compare(&before, &scratch.pr_head_sha(top)),
+        "ahead",
+        "PR #{top}'s branch should have been moved forward by the push"
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "retargeting PR #{top} closed it"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        bottom_branch,
+        "PR #{top} should now be based on the branch of PR #{bottom}"
+    );
+    assert!(
+        !scratch.remote_has_branch(&old_base),
+        "the base branch PR #{top} left behind is still on the remote: {old_base}"
+    );
+    assert_eq!(
+        scratch.pr_state(bottom),
+        "open",
+        "migrating PR #{top} closed PR #{bottom} below it"
+    );
+}
+
+/// Retargeting a pull request that GitHub holds in a stack takes it out of that
+/// stack first.
+///
+/// A stack owns its members' base refs: GitHub answers `422 Cannot change the
+/// base branch because the pull request is part of a stack` to *any* base sent
+/// for a stacked pull request. So a run that moves a base has to dissolve the
+/// stack before it sends one, and the pushing path guards every retarget with
+/// that.
+///
+/// Only GitHub can show this. The refusal comes from a resource on GitHub's
+/// side that nothing local models, and it is invisible until a stack is really
+/// there to hold the pull request — which is why this is the test that stands
+/// behind the guard. It is the *only* one: the retarget it makes is to the
+/// default branch, and no test sends a base to a stacked pull request by the
+/// other route. That is enough only for as long as the guard is asked once,
+/// above the two of them; anyone moving it back down into each has taken away
+/// the cover for one of them and needs a second test here.
+///
+/// The retarget being to the default branch covers that arm of the push as
+/// well. The branch the pull request leaves is the head branch of the pull
+/// request below, which is not jj-spr's to take away — deleting it would close
+/// that pull request — so its survival is asserted too.
+#[test]
+fn retargeting_a_pull_request_in_a_github_stack_takes_it_out_of_the_stack() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "unstackretarget");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    let prs = scratch.push_stack(&["e2e unstack bottom", "e2e unstack top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+    let bottom_branch = scratch.pr_head_branch(bottom);
+
+    let stack = scratch.open_stack_for(top).unwrap_or_else(|| {
+        panic!("PR #{top} should be in an open GitHub stack to be taken out of")
+    });
+    assert_eq!(
+        stack.pull_requests, prs,
+        "the stack should hold the run's pull requests, bottom first"
+    );
+
+    // Take the change on top out of the stack, so that its pull request belongs
+    // on the default branch while GitHub still has it stacked.
+    run(
+        "jj",
+        &["rebase", "-r", "@", "-d", "trunk()"],
+        scratch.path(),
+    );
+    jj_spr(&["diff", "-r", "@", "-m", "off the stack"], scratch.path());
+
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "retargeting PR #{top} closed it"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.default_branch(),
+        "PR #{top} should now target the default branch"
+    );
+    assert_eq!(
+        scratch.open_stack_for(top).map(|s| s.number),
+        None,
+        "PR #{top} should have been taken out of stack #{}",
+        stack.number
+    );
+    assert!(
+        scratch.remote_has_branch(&bottom_branch),
+        "the branch of PR #{bottom} below is not this one's to take away: {bottom_branch}"
+    );
+    assert_eq!(
+        scratch.pr_state(bottom),
+        "open",
+        "retargeting PR #{top} closed PR #{bottom} below it"
+    );
 }

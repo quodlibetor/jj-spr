@@ -70,6 +70,126 @@ impl BaseStrategy {
     }
 }
 
+/// How a pull request says which stack it belongs to.
+///
+/// The two ways of saying it are alternatives, not layers: GitHub draws the
+/// stack itself from its stacked pull requests, and the section is a list
+/// written into the pull request body for repositories where it does not. Both
+/// at once would describe the same stack twice, in two places that can disagree,
+/// so this is one setting with three values rather than two settings that can
+/// both be on — the disjointness is the shape of the type, and there is no
+/// combination left to refuse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StackDisplay {
+    /// Say nothing. A pull request stands on its own, and the stack is visible
+    /// only in the branches.
+    None,
+    /// Write a `Stack` section into each pull request's body, listing the stack
+    /// bottom-up with a marker on the pull request being read.
+    ///
+    /// The default, because it is the one that works everywhere: it asks nothing
+    /// of the repository, and a stack described this way is described on any
+    /// host. Turning it off is an explicit [`Self::None`].
+    #[default]
+    Section,
+    /// Register the pull requests as a stack with GitHub's Stacked Pull Requests
+    /// API and let GitHub draw it.
+    ///
+    /// Better where it is available — GitHub shows the stack on each pull
+    /// request and in the repository's list of stacks, and offers to merge it —
+    /// but it is not available everywhere. It is in public preview, and its
+    /// merge-queue support was still rolling out separately as of August 2026,
+    /// so a repository with a required merge queue may answer that it has no
+    /// stacks at all.
+    Github,
+}
+
+impl std::str::FromStr for StackDisplay {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "section" => Ok(Self::Section),
+            "github" => Ok(Self::Github),
+            other => Err(Error::new(format!(
+                "spr.stackDisplay must be 'none', 'section' or 'github', but is '{other}'"
+            ))),
+        }
+    }
+}
+
+impl StackDisplay {
+    /// Every value, in the order `jj spr init` offers them: the one that asks
+    /// most of the repository first, then the fallback, then off.
+    ///
+    /// Kept next to the enum rather than in `init`, so that a value added here
+    /// is offered rather than quietly left out of the one place that asks about
+    /// it.
+    pub const ALL: [Self; 3] = [Self::Github, Self::Section, Self::None];
+
+    /// The value `spr.stackDisplay` takes.
+    ///
+    /// The inverse of the [`FromStr`](std::str::FromStr) above: `jj spr init`
+    /// offers these names and then stores the one that was picked, so the two
+    /// directions have to agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Section => "section",
+            Self::Github => "github",
+        }
+    }
+
+    /// Whether GitHub is asked to draw the stack, which is what needs each pull
+    /// request based on the branch of the one below.
+    pub fn draws_the_stack(self) -> bool {
+        matches!(self, Self::Github)
+    }
+
+    /// Whether a `Stack` section is written into each pull request body.
+    ///
+    /// Nothing reads this yet; the section arrives with the change that writes
+    /// it. It is named here so that the setting is whole from the start rather
+    /// than growing a value later.
+    pub fn writes_a_section(self) -> bool {
+        matches!(self, Self::Section)
+    }
+}
+
+/// The base strategy to run under, given `spr.stackDisplay` and whatever
+/// `spr.baseStrategy` was set to — `None` where it was not set at all.
+///
+/// GitHub's stacks require each pull request's base ref to be the head ref of
+/// the one below, which is what [`BaseStrategy::Linear`] builds and
+/// [`BaseStrategy::Synthetic`] never does. So the two settings are not
+/// independent, and this is the one place that says so: resolving it here, as
+/// the configuration is built, keeps every decision downstream a question about
+/// the base strategy alone rather than about a combination of settings.
+///
+/// Asking for both [`StackDisplay::Github`] and the synthetic strategy is a
+/// contradiction worth surfacing rather than resolving, because either half
+/// could be the mistake. Leaving the strategy unset is not: it means no
+/// preference, so the stack display supplies one. The section asks nothing of
+/// the base strategy — it is a list in a body, and any shape of stack can be
+/// listed — so it leaves the choice alone.
+pub fn resolve_base_strategy(
+    stack_display: StackDisplay,
+    configured: Option<BaseStrategy>,
+) -> Result<BaseStrategy> {
+    match (stack_display.draws_the_stack(), configured) {
+        (true, Some(BaseStrategy::Synthetic)) => Err(Error::new(
+            "spr.stackDisplay = github needs spr.baseStrategy = linear: GitHub's stacked pull \
+             requests require each pull request to be based on the branch of the one below it, \
+             which is what the synthetic strategy does not do. Set spr.baseStrategy to 'linear', \
+             or set spr.stackDisplay to 'section'."
+                .to_string(),
+        )),
+        (true, _) => Ok(BaseStrategy::Linear),
+        (false, configured) => Ok(configured.unwrap_or_default()),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub owner: String,
@@ -93,6 +213,17 @@ pub struct Config {
     /// have to name it in a positional list that is already long enough to be
     /// hard to read. Set it with struct update syntax.
     pub base_strategy: BaseStrategy,
+    /// How a pull request says which stack it belongs to. See [`StackDisplay`].
+    ///
+    /// Neither value changes what `diff` pushes; each adds a step around the
+    /// run. [`StackDisplay::Github`] does want [`BaseStrategy::Linear`], which
+    /// `main.rs` sees to by resolving the two together through
+    /// [`resolve_base_strategy`] — the one place that enforces it. A `Config`
+    /// built by hand can hold any combination, and under
+    /// [`BaseStrategy::Synthetic`] no pull request is ever chained to the one
+    /// below, so no chain forms and nothing is registered. Set it with struct
+    /// update syntax, for the reasons above.
+    pub stack_display: StackDisplay,
 }
 
 impl Config {
@@ -115,6 +246,7 @@ impl Config {
             require_approval,
             land_with_unmet_requirements: false,
             base_strategy: BaseStrategy::default(),
+            stack_display: StackDisplay::default(),
         }
     }
 
@@ -626,6 +758,119 @@ mod tests {
                 "{strategy:?} is not offered by `jj spr init`"
             );
         }
+    }
+
+    /// The section is the default because it works everywhere; turning the
+    /// description off is a thing you say, not a thing you get by omission.
+    #[test]
+    fn the_stack_display_is_the_section_by_default() {
+        assert_eq!(config_factory().stack_display, StackDisplay::Section);
+        assert_eq!(StackDisplay::default(), StackDisplay::Section);
+    }
+
+    #[test]
+    fn every_stack_display_is_offered_under_a_name_that_parses_back() {
+        for display in StackDisplay::ALL {
+            assert_eq!(display.as_str().parse::<StackDisplay>().unwrap(), display);
+        }
+
+        for display in [
+            StackDisplay::None,
+            StackDisplay::Section,
+            StackDisplay::Github,
+        ] {
+            assert!(
+                StackDisplay::ALL.contains(&display),
+                "{display:?} is not offered by `jj spr init`"
+            );
+        }
+    }
+
+    /// Only one of them describes the stack in each place, and the type is what
+    /// says so: there is no value that does both, and none that is asked to.
+    #[test]
+    fn the_two_ways_of_describing_a_stack_are_disjoint() {
+        for display in StackDisplay::ALL {
+            assert!(
+                !(display.draws_the_stack() && display.writes_a_section()),
+                "{display:?} describes the stack twice"
+            );
+        }
+
+        assert!(StackDisplay::Github.draws_the_stack());
+        assert!(StackDisplay::Section.writes_a_section());
+        assert!(!StackDisplay::None.draws_the_stack());
+        assert!(!StackDisplay::None.writes_a_section());
+    }
+
+    /// A misspelt value must not quietly mean the default: it would look like
+    /// the setting had no effect.
+    #[test]
+    fn the_stack_display_rejects_anything_else() {
+        let error = "gh".parse::<StackDisplay>().unwrap_err();
+
+        assert!(
+            error.messages().iter().any(|m| m.contains("gh")),
+            "the error should name the value it rejected: {error:?}"
+        );
+    }
+
+    /// Unless GitHub is drawing the stack, the strategy is whatever was
+    /// configured, and the default when nothing was. The section asks nothing
+    /// of the base strategy, so it is in this group rather than the next.
+    #[test]
+    fn the_base_strategy_stands_on_its_own_unless_github_draws_the_stack() {
+        for display in [StackDisplay::None, StackDisplay::Section] {
+            assert_eq!(
+                resolve_base_strategy(display, None).unwrap(),
+                BaseStrategy::Synthetic
+            );
+            assert_eq!(
+                resolve_base_strategy(display, Some(BaseStrategy::Synthetic)).unwrap(),
+                BaseStrategy::Synthetic
+            );
+            assert_eq!(
+                resolve_base_strategy(display, Some(BaseStrategy::Linear)).unwrap(),
+                BaseStrategy::Linear
+            );
+        }
+    }
+
+    /// An unset strategy is no preference, so drawing the stack supplies the one
+    /// it needs rather than failing over a setting nobody wrote.
+    #[test]
+    fn drawing_the_stack_supplies_the_linear_strategy_when_none_was_chosen() {
+        assert_eq!(
+            resolve_base_strategy(StackDisplay::Github, None).unwrap(),
+            BaseStrategy::Linear
+        );
+    }
+
+    /// Asking for both is the same request twice, not a conflict.
+    #[test]
+    fn drawing_the_stack_agrees_with_the_linear_strategy() {
+        assert_eq!(
+            resolve_base_strategy(StackDisplay::Github, Some(BaseStrategy::Linear)).unwrap(),
+            BaseStrategy::Linear
+        );
+    }
+
+    /// The one combination that cannot be honoured: it must be reported rather
+    /// than resolved, because either half of it could be the mistake, and a
+    /// silently overridden strategy would build branches the user did not ask
+    /// for.
+    #[test]
+    fn drawing_the_stack_refuses_the_synthetic_strategy() {
+        let error =
+            resolve_base_strategy(StackDisplay::Github, Some(BaseStrategy::Synthetic)).unwrap_err();
+
+        assert!(
+            error
+                .messages()
+                .iter()
+                .any(|m| m.contains("spr.stackDisplay") && m.contains("spr.baseStrategy")),
+            "the error should name both settings: {error:?}"
+        );
     }
 
     /// A misspelt strategy must not quietly mean the default: the two
