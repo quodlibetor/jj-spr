@@ -250,7 +250,7 @@ pub async fn land(
                     .update_pull_request(
                         pull_request_number,
                         PullRequestUpdate {
-                            base: Some(pull_request.base.on_github().to_string()),
+                            base: Some(pull_request.base.branch_name().to_string()),
                             ..Default::default()
                         },
                     )
