@@ -163,11 +163,14 @@ jj spr close [OPTIONS]
 ```
 
 **Options:**
-- `-r, --revision <REV>` - Revision whose PR to close (default: `@`)
+- `-r, --revision <REV>` - Revision, or revision range, whose PRs to close
+  (default: `@-`)
+- `-a, --all` - Close the PRs of every commit from the base to the revision
+- `--base <REV>` - Base revision for `--all` (default: trunk)
 
 **Examples:**
 ```bash
-# Close PR for current working copy
+# Close PR for the parent of the working copy
 jj spr close
 
 # Close PR for specific change
@@ -192,6 +195,36 @@ linear`](configuration.md#basestrategy), which is the branch of the pull
 request below. Where `linear` fell back to generating a base branch after all,
 that branch *is* deleted — unless some open pull request still targets it,
 which the pull requests just retargeted onto it are the usual reason for.
+
+**GitHub stacks:** With
+[`spr.stackDisplay = github`](configuration.md#stackdisplay), the close itself
+needs nothing special: GitHub allows a stacked pull request to be closed, and
+keeps it in the stack in place with the stack still open. What a stack refuses
+is the retargeting that follows, because a stack owns its members' base refs.
+So closing takes apart whatever stack holds each pull request it has to move —
+usually the single stack they were all in, but a pull request based on the
+closed one's branch that jj-spr never pushed drags its stack in too. Run
+`jj spr diff` afterwards to register what is left as a stack again; it gets a
+new number and a new URL, and any pull request that was in the dissolved stack
+but is not in the run you push is left unstacked — jj-spr says which, not
+counting the one it just closed.
+
+Take the closed change out of the local chain before that `jj spr diff` —
+abandon it, or fold it into a neighbour. Closing takes the pull request number
+off the change but leaves the change where it was, so a run that pushes it
+opens a *new* pull request rather than putting the old one back. Merely
+skipping it in the revset does not work either: jj-spr does not step over a
+change, it builds around it. It chains a change onto the one below only when
+that one is its local parent, so whatever sat on the closed change gets a base
+branch of its own carrying that change's work — the chain breaks across the
+gap, and the changes you closed drop back out of the diffs above, which is the
+opposite of what the retargeting just reported.
+
+Closing a pull request with nothing stacked on it moves no base, so it takes
+no stack apart and the stack keeps its number. The closed pull request stays in
+it, which is what GitHub does with a closed member; there is no way to remove
+one pull request from a stack short of destroying the stack for every other
+member.
 
 ---
 

@@ -42,7 +42,7 @@ use std::collections::HashSet;
 
 use crate::{
     error::{Error, Result},
-    github::{GitHub, Stack, StackApiError, StackResult, UnstackOutcome},
+    github::{GitHub, Stack, StackApiError, StackResult, StackedPullRequest, UnstackOutcome},
     output::output,
 };
 
@@ -291,12 +291,13 @@ fn numbers(pull_requests: &[u64]) -> String {
 /// What `land` says about the pull requests it took out of a stack and left out
 /// of one, or `None` where it left none.
 ///
-/// `land`'s and no one else's: the sentence names the land. A second caller
-/// wanting one of these wants its own function here, beside this one, rather
-/// than this one made general — the whole point of keeping these sentences in
-/// this module is that they read as one voice about one subject, and a command
-/// word threaded through as a parameter would be prose assembled at the call
-/// site again.
+/// `land`'s and no one else's: the sentence names the land, and tells the reader
+/// to rebase because a land has just moved the ground under everything above it.
+/// [`left_unstacked_by_a_close`] is the sibling this shape asks for rather than
+/// a general one taking the command word as a parameter — the whole point of
+/// keeping these sentences in this module is that they read as one voice about
+/// one subject, and a word threaded in from the call site would be prose
+/// assembled there again.
 ///
 /// Kept here rather than at the call site for the same reason
 /// [`DissolveReason`] is: every sentence jj-spr says about a stack is written in
@@ -307,12 +308,57 @@ fn numbers(pull_requests: &[u64]) -> String {
 /// Plural throughout: a land dissolves the stack holding the pull request it is
 /// landing *and* any stack holding one of the pull requests above it, so what
 /// comes loose can span several stacks and can never be put back as one.
-pub fn left_unstacked(pull_requests: &[u64]) -> Option<String> {
+pub fn left_unstacked_by_a_land(pull_requests: &[u64]) -> Option<String> {
     (!pull_requests.is_empty()).then(|| {
         format!(
             "GitHub stack: {} left unstacked by the stacks this land took apart. Nothing puts a \
              stack back but `jj spr diff`, so rebase and push the ones you still want stacked — \
              `jj spr diff --all -r 'trunk()..@'`.",
+            numbers(pull_requests),
+        )
+    })
+}
+
+/// What `close` says about the pull requests it took out of a stack and left out
+/// of one, or `None` where it left none.
+///
+/// The sibling of [`left_unstacked_by_a_land`], and it differs by more than the
+/// command word — the land's remedy is not merely inapplicable here but wrong
+/// twice over, and both halves are load-bearing:
+///
+/// - **The closed change is still in the chain.** `close` takes the pull request
+///   number off the local change and leaves the change where it was, so
+///   `jj spr diff --all -r 'trunk()..@'` opens a *new* pull request for it and
+///   undoes the close that was asked for.
+/// - **Skipping it in the revset does not work either.** A run does not step
+///   over a change; it builds around it. A change is only chained onto the one
+///   below when that one is its local parent (`diff::linear_base`), so what sat
+///   on the closed change instead gets a base branch of its own carrying the
+///   closed change's tree. Two consequences, and the sentence has to name the
+///   second because it is the one that undoes what `close` announced: the chain
+///   breaks across the gap, so nothing below it is stacked with anything above
+///   ([`chains`] cuts and carries on, so either side can still register on its
+///   own — just not as one stack); and the closed change's work goes into that
+///   base branch, so it drops back out of the diffs above, which is the opposite
+///   of what the retargeting just told the user had happened.
+///
+/// So the remedy names the one thing that does work: take the closed change out
+/// of the local chain first. There is no rebase to mention, unlike the land's —
+/// a close puts nothing on the master branch, so nothing above it has moved.
+///
+/// Plural for the same reason as the land's: `close --all` closes several pull
+/// requests in one run, and each of them can free a different stack.
+pub fn left_unstacked_by_a_close(pull_requests: &[u64]) -> Option<String> {
+    (!pull_requests.is_empty()).then(|| {
+        format!(
+            "GitHub stack: {} left unstacked by the stacks this close took apart. Only \
+             `jj spr diff` puts a stack back, and only over changes it pushes as one unbroken \
+             chain — so take what you closed out of the chain first, by abandoning it or \
+             folding it into a neighbour, and push what is left. A closed change left in the \
+             chain is not skipped but built around: the run gives whatever sits on it a base \
+             branch carrying its work, so the chain breaks across it and the changes you \
+             closed drop back out of the diffs above. Pushed instead, it simply opens a new \
+             pull request.",
             numbers(pull_requests),
         )
     })
@@ -510,11 +556,11 @@ pub enum BaseUnlock {
 /// The stack bookkeeping for one run of a command that touches stacks.
 ///
 /// `diff` registers stacks and dissolves the ones in the way of a base it is
-/// moving; `land` only ever dissolves. Both hold one as an `Option`, which is
-/// `None` unless `spr.stackDisplay` is `github`. It remembers what it has already
-/// asked GitHub so that a run does not ask twice: which pull requests are known
-/// to be out of a stack, and whether the repository turned out not to support
-/// stacks at all.
+/// moving; `land` and `close` only ever dissolve. All three hold one as an
+/// `Option`, which is `None` when GitHub is not drawing the stack. It remembers what
+/// it has already asked GitHub so that a run does not ask twice: which pull
+/// requests are known to be out of a stack, and whether the repository turned
+/// out not to support stacks at all.
 #[derive(Debug, Default)]
 pub struct StackSession {
     /// Pull requests known to be in no stack, either because GitHub said so or
@@ -537,16 +583,22 @@ pub struct StackSession {
     /// Every pull request this run has left in a stack.
     registered: HashSet<u64>,
 
-    /// Pull requests this run merged, which are therefore not something a
-    /// dissolved stack lost.
+    /// Pull requests this run finished with, by merging or closing them, which
+    /// are therefore not something a dissolved stack lost.
     ///
-    /// A merged pull request is out of every stack for good and cannot be put
-    /// back into one, which is the same reason a stack's merged members are left
-    /// out of what a dissolve is reported to have lost. The difference is only
-    /// in the timing: `land` dissolves the stack while the pull request it is
-    /// about to land is still open, so it is in the dissolved list, and by the
-    /// time anything is reported it has merged.
-    merged: HashSet<u64>,
+    /// Such a pull request is out of every stack for good and cannot be put back
+    /// into one: nothing but `diff` registers a stack, and `diff` registers only
+    /// the pull requests of changes it pushes. That is the same reason a stack's
+    /// merged members are left out of what a dissolve is reported to have lost.
+    ///
+    /// Both callers need it, for slightly different reasons. `land` dissolves
+    /// before it merges, so its pull request is plainly an open member at the
+    /// time. `close` dissolves *after* closing — and a closed-unmerged pull
+    /// request is an [`unmerged_members`] member all the same, so it lands in
+    /// the dissolved list too. Changing that predicate, which
+    /// [`unmerged_members`] records as a known limitation, would make
+    /// [`Self::closed`] redundant: the two are coupled and should move together.
+    gone: HashSet<u64>,
 
     /// Stacks a dry run worked out that the run would take apart. Only a dry
     /// run fills this: a real run has already said so as it happened.
@@ -628,7 +680,14 @@ impl StackSession {
     /// Without this, every land under `spr.stackDisplay = github` would end by telling
     /// the user to put the pull request it had just landed back into a stack.
     pub fn merged(&mut self, number: u64) {
-        self.merged.insert(number);
+        self.gone.insert(number);
+    }
+
+    /// Record that pull request `number` has been closed. The same bookkeeping
+    /// as [`Self::merged`]; a separate name so that the call site says which of
+    /// the two it did.
+    pub fn closed(&mut self, number: u64) {
+        self.gone.insert(number);
     }
 
     /// The pull requests this run took out of a stack and left out of one.
@@ -642,7 +701,7 @@ impl StackSession {
             .iter()
             .flatten()
             .copied()
-            .filter(|number| !self.registered.contains(number) && !self.merged.contains(number))
+            .filter(|number| !self.registered.contains(number) && !self.gone.contains(number))
             .collect();
 
         lost.sort_unstable();
@@ -654,9 +713,10 @@ impl StackSession {
     /// [`Self::orphaned`] as something for `diff` to report, or `None` where
     /// there is nothing to report.
     ///
-    /// `land` does not use this: [`Reconciliation::Orphaned`] speaks of what a
-    /// run pushed and registered, and `land` pushes and registers nothing, so
-    /// it words its own sentence around [`Self::orphaned`].
+    /// `diff`'s and no one else's: [`Reconciliation::Orphaned`] speaks of what a
+    /// run pushed and registered, and `land` and `close` push and register
+    /// nothing, so each words its own sentence around [`Self::orphaned`] —
+    /// [`left_unstacked_by_a_land`] and [`left_unstacked_by_a_close`].
     pub fn orphaned_pull_requests(&self) -> Option<Reconciliation> {
         let lost = self.orphaned();
 
@@ -948,6 +1008,27 @@ enum Lookup {
 /// - **What a dissolved stack lost.** A merged member cannot be put back into a
 ///   stack and does not need to be, so reporting it as left behind would be
 ///   telling the user to fix something that is neither broken nor fixable.
+///
+/// **Known limitation, second job only.** A *closed* member is as unrecoverable
+/// as a merged one — `diff` registers only the pull requests of the changes it
+/// pushes, and a closed pull request has none — but it is counted as lost all
+/// the same. The run that does the closing covers itself: `close` records the
+/// pull request with [`StackSession::closed`], as `land` does with
+/// [`StackSession::merged`]. What is not covered is a member closed by an
+/// *earlier* run. `close` dissolves the stacks holding the pull requests it is
+/// about to *move*, not the one holding the pull request it closes, so a closed
+/// member is stranded in an open stack whenever that stack survives the close —
+/// because nothing was stacked on it, or because what was is in a different
+/// stack or in none. That is the ordinary state, not a corner. A later dissolve
+/// of the surviving stack then names the closed member, and the user is told to
+/// push back a change whose pull request they closed.
+///
+/// The fix is a second predicate here — open rather than merely unmerged — for
+/// the second job only, since a closed member left behind by an unstack
+/// genuinely does still hold its base ref and so must go on counting as stuck
+/// for the first. Left for its own change: it reaches `diff`'s reporting as
+/// well, and it would make [`StackSession::closed`] redundant for the closing
+/// run, which is a decision worth taking on its own.
 fn unmerged_members(stack: &Stack) -> Vec<u64> {
     stack
         .pull_requests
@@ -974,6 +1055,14 @@ pub enum DissolveReason {
     /// The pull request below this one has landed, so this one belongs on the
     /// master branch now.
     ToFollowALanding,
+
+    /// The pull request below this one has been closed, so this one belongs on
+    /// *that* pull request's base now.
+    ///
+    /// Not [`Self::ToFollowALanding`]: where the pull request above ends up is
+    /// the whole difference — the master branch after a land, the closed pull
+    /// request's own base after a close.
+    ToFollowAClosing,
 }
 
 impl DissolveReason {
@@ -998,6 +1087,12 @@ impl DissolveReason {
                  Run `jj spr diff` to register what is left as a stack again, under a new \
                  number."
             }
+            Self::ToFollowAClosing => {
+                "a stacked pull request's base cannot be changed, and this one is being \
+                 pointed at the base of the pull request below it, which has just been \
+                 closed. Run `jj spr diff` to register what is left as a stack again, under a \
+                 new number."
+            }
         }
     }
 }
@@ -1013,8 +1108,9 @@ impl DissolveReason {
 /// stack, so this releases every member — including pull requests the caller
 /// knows nothing about and cannot put back. See [`StackSession::unlock_base`],
 /// and [`StackSession::orphaned`] for what nothing put back — with
-/// [`left_unstacked`] and [`StackSession::orphaned_pull_requests`] as `land`'s
-/// and `diff`'s ways of saying it.
+/// [`left_unstacked_by_a_land`], [`left_unstacked_by_a_close`] and
+/// [`StackSession::orphaned_pull_requests`] as `land`'s, `close`'s and `diff`'s
+/// ways of saying it.
 pub async fn dissolve_any_stack_holding(
     stacks: Option<&mut StackSession>,
     gh: &GitHub,
@@ -1030,6 +1126,59 @@ pub async fn dissolve_any_stack_holding(
             "🧱",
             &format!("Dissolved GitHub stack #{stack_number}: {}", why.describe()),
         )?;
+    }
+
+    Ok(())
+}
+
+/// Dissolve the stacks holding the pull requests that are about to be retargeted
+/// off one that is being landed or closed, reporting rather than raising a
+/// failure.
+///
+/// [`crate::stacked::retarget_stacked_pull_requests`]' companion: a stack owns
+/// its members' base refs, so every pull request that call is about to move has
+/// to leave whatever stack holds it first. Usually one dissolve covers them all
+/// — they were in one stack together with the pull request leaving it — and what
+/// the rest of the loop catches is a pull request that ended up in a *different*
+/// stack, which is the ordinary state after pushing part of a stack.
+///
+/// Kept here rather than beside its companion because [`crate::stacked`] holds
+/// no stack knowledge at all: it is the retargeting both strategies share, it
+/// imports nothing from this module, and it has never heard of a
+/// [`StackSession`], a stack number, or `spr.stackDisplay = github`. Moving this there
+/// would drag all of that into the one module that is deliberately free of it.
+///
+/// **Reported, not raised.** Both callers reach this having already done the
+/// irreversible thing they came for — `land` has merged, `close` has closed and
+/// stripped the pull request number off the local change — so a failure here has
+/// nothing left to retry with, and raising would skip the retargeting of every
+/// *other* pull request as well and, in `close --all`, stop the changes above
+/// from being closed at all. A pull request left in a stack simply fails its own
+/// retarget, which is what keeps the head branch of the one leaving alive for
+/// it; see [`crate::stacked::Retargeted::may_delete_head_branch`]. The `Result`
+/// is the terminal write's, not the stacks call's: no stacks failure leaves this
+/// function.
+pub async fn dissolve_stacks_holding(
+    mut stacks: Option<&mut StackSession>,
+    gh: &GitHub,
+    pull_requests: &[StackedPullRequest],
+    why: DissolveReason,
+) -> Result<()> {
+    for pull_request in pull_requests {
+        if let Err(error) =
+            dissolve_any_stack_holding(stacks.as_deref_mut(), gh, pull_request.number, why).await
+        {
+            output(
+                "⚠️",
+                &format!(
+                    "Could not take Pull Request #{} out of its GitHub stack",
+                    pull_request.number
+                ),
+            )?;
+            for message in error.messages() {
+                output("  ", message)?;
+            }
+        }
     }
 
     Ok(())
@@ -1686,6 +1835,27 @@ mod tests {
         assert_eq!(session.orphaned_pull_requests(), None);
     }
 
+    /// The same for a pull request that was closed. `close` dissolves *after*
+    /// closing, and a closed-unmerged pull request is still an
+    /// [`unmerged_members`] member, so it lands in the dissolved list like any
+    /// other — without this every close under `spr.stackDisplay = github` would end by
+    /// telling the user to put back into a stack the pull request they had just
+    /// closed. `close --all` shows the rest of it: the run frees the whole stack
+    /// on its first close and then closes the members one by one, so what is
+    /// really loose is only what it did not reach.
+    #[test]
+    fn a_pull_request_that_was_closed_is_not_something_the_stack_lost() {
+        let mut session = StackSession::new();
+        session.dissolved = vec![vec![73, 74, 75]];
+
+        session.closed(73);
+        assert_eq!(session.orphaned(), vec![74, 75]);
+
+        session.closed(74);
+        session.closed(75);
+        assert!(session.orphaned().is_empty());
+    }
+
     /// Every sentence jj-spr says about dissolving a stack is written in one
     /// place, and each has to read as a clause completing "Dissolved GitHub
     /// stack #N: ...".
@@ -1695,6 +1865,7 @@ mod tests {
             DissolveReason::ToMoveABase,
             DissolveReason::ToLand,
             DissolveReason::ToFollowALanding,
+            DissolveReason::ToFollowAClosing,
         ] {
             let clause = why.describe();
 
@@ -1711,13 +1882,27 @@ mod tests {
         // The one that has to say what it costs: landing takes the stack away
         // for good, and `diff` is what puts one back.
         assert!(DissolveReason::ToLand.describe().contains("jj spr diff"));
+
+        // The two "the one below it left" reasons must not read alike: where
+        // the pull request above ends up is the whole difference between a land
+        // and a close, and it is what the reader is being told.
+        assert!(
+            DissolveReason::ToFollowALanding
+                .describe()
+                .contains("master branch"),
+        );
+        assert!(
+            DissolveReason::ToFollowAClosing
+                .describe()
+                .contains("base of the pull request below it"),
+        );
     }
 
     /// Only `land` says this, and only about what its dissolving left behind —
     /// which can span more than one stack, and can never be put back as one.
     #[test]
     fn what_a_land_left_unstacked_is_reported_in_the_plural() {
-        let sentence = left_unstacked(&[73, 75]).expect("there is something to report");
+        let sentence = left_unstacked_by_a_land(&[73, 75]).expect("there is something to report");
 
         assert!(sentence.contains("#73, #75"), "{sentence}");
         assert!(
@@ -1729,7 +1914,48 @@ mod tests {
             "nothing but `diff` puts a stack back: {sentence}"
         );
 
-        assert_eq!(left_unstacked(&[]), None);
+        assert_eq!(left_unstacked_by_a_land(&[]), None);
+    }
+
+    /// `close`'s version of the same report. It must not tell the reader to
+    /// rebase: a close puts nothing on the master branch, so nothing above it
+    /// has moved and there is only the push to make.
+    #[test]
+    fn what_a_close_left_unstacked_is_reported_without_a_rebase() {
+        let sentence = left_unstacked_by_a_close(&[73, 75]).expect("there is something to report");
+
+        assert!(sentence.contains("#73, #75"), "{sentence}");
+        assert!(
+            sentence.contains("stacks this close took apart"),
+            "`close --all` can take apart more than one stack: {sentence}"
+        );
+        assert!(
+            sentence.contains("jj spr diff"),
+            "nothing but `diff` puts a stack back: {sentence}"
+        );
+        assert!(
+            !sentence.contains("rebase"),
+            "a close moves nothing, so there is nothing to rebase onto: {sentence}"
+        );
+        // Both halves of why the land's blanket revset is wrong here. Neither
+        // is visible from this module, and a sentence that gave only one of
+        // them would send the user down the other.
+        assert!(
+            sentence.contains("out of the chain"),
+            "the closed change has to leave the local chain, or the chain breaks across it: \
+             {sentence}"
+        );
+        assert!(
+            sentence.contains("new pull request"),
+            "a run that pushes the closed change opens a new pull request for it: {sentence}"
+        );
+        assert!(
+            sentence.contains("drop back out of the diffs above"),
+            "skipping the closed change is not free either — the run builds a base branch \
+             around it: {sentence}"
+        );
+
+        assert_eq!(left_unstacked_by_a_close(&[]), None);
     }
 
     /// One chain registering must not silence what a different chain lost: the

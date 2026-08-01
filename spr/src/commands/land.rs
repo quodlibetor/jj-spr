@@ -12,7 +12,10 @@ use crate::{
     error::{Error, Result, ResultExt},
     github::{PullRequestState, PullRequestUpdate, ReviewStatus, StackedPullRequest},
     message::{MessageSection, build_github_body_for_merging},
-    native_stacks::{DissolveReason, StackSession, dissolve_any_stack_holding, left_unstacked},
+    native_stacks::{
+        DissolveReason, StackSession, dissolve_any_stack_holding, dissolve_stacks_holding,
+        left_unstacked_by_a_land,
+    },
     output::{output, write_commit_title},
     stacked::{
         may_delete_base_branch, retarget_stacked_pull_requests, spawn_branch_deletion,
@@ -253,7 +256,7 @@ pub async fn land(
     // fails above the dissolve has freed nothing, so this is silent.
     let reported = match stacks
         .as_ref()
-        .and_then(|session| left_unstacked(&session.orphaned()))
+        .and_then(|session| left_unstacked_by_a_land(&session.orphaned()))
     {
         Some(sentence) => output("🧱", &sentence),
         None => Ok(()),
@@ -411,7 +414,8 @@ async fn land_pull_request(
     //   while a stack holds the Pull Request. Of those, only the ones above it
     //   happen when the base is already the master branch, which is the bottom
     //   of every stack; and each of those leaves whatever stack holds it in the
-    //   loop before `retarget_stacked_pull_requests`, not here.
+    //   `dissolve_stacks_holding` call before `retarget_stacked_pull_requests`,
+    //   not here.
     // - The merge itself. The ordinary merge endpoint refuses a Pull Request a
     //   stack holds outright: `403 Merging stacked PRs via this endpoint is not
     //   supported. Use the asynchronous merge endpoint instead.` (observed
@@ -598,36 +602,14 @@ async fn land_pull_request(
     //
     // A stack holding any of them would refuse the move, so they leave theirs
     // first. Members of the stack this land already dissolved are out of one
-    // already and cost nothing here; what this catches is a Pull Request above
-    // that ended up in a *different* stack, which is the ordinary state after
-    // pushing part of a stack.
-    for stacked in &stacked_pull_requests {
-        // Reported rather than raised, like everything else after the merge:
-        // `retarget_stacked_pull_requests` is best-effort by contract because
-        // the land has already happened, and failing here would skip the
-        // retargeting of every *other* Pull Request as well. One left in a
-        // stack simply fails its own retarget below, which is what keeps the
-        // head branch alive for it.
-        if let Err(error) = dissolve_any_stack_holding(
-            stacks.as_mut(),
-            gh,
-            stacked.number,
-            DissolveReason::ToFollowALanding,
-        )
-        .await
-        {
-            output(
-                "⚠️",
-                &format!(
-                    "Could not take Pull Request #{} out of its GitHub stack",
-                    stacked.number
-                ),
-            )?;
-            for message in error.messages() {
-                output("  ", message)?;
-            }
-        }
-    }
+    // already and cost nothing here.
+    dissolve_stacks_holding(
+        stacks.as_mut(),
+        gh,
+        &stacked_pull_requests,
+        DissolveReason::ToFollowALanding,
+    )
+    .await?;
 
     let retargeted = retarget_stacked_pull_requests(
         gh,

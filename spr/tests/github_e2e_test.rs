@@ -1178,3 +1178,115 @@ fn landing_a_pull_request_in_a_github_stack_leaves_the_rest_of_the_stack_alone()
         "the base branch PR #{top} left behind is still on the remote: {middle_branch}"
     );
 }
+
+/// Closing a pull request a GitHub stack holds takes the stack apart first, so
+/// that the pull requests above it can be pointed at the closed one's own base
+/// and stay open.
+///
+/// Only GitHub can show this. Closing is a state change and GitHub allows it
+/// while a stack holds the pull request — the stack simply keeps the closed
+/// member in place — but the base changes that follow are refused with `422
+/// Cannot change the base branch because the pull request is part of a stack`,
+/// and that refusal exists nowhere but on GitHub's side. Without the dissolve
+/// the close "succeeds", the pull request above is left pointing at the closed
+/// one, and its branch is kept because nothing could be moved off it: exactly
+/// what the base and branch assertions here catch.
+///
+/// A stack of three, closing the middle, is the smallest shape with both a pull
+/// request below that must be left alone and one above that must be moved onto
+/// it.
+#[test]
+fn closing_a_pull_request_in_a_github_stack_retargets_the_rest_and_leaves_them_open() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "ghstackclose");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    let prs = scratch.push_stack(&[
+        "e2e ghstack close bottom",
+        "e2e ghstack close middle",
+        "e2e ghstack close top",
+    ]);
+    let (bottom, middle, top) = (prs[0], prs[1], prs[2]);
+
+    let stack = scratch
+        .open_stack_for(middle)
+        .unwrap_or_else(|| panic!("PR #{middle} should be in an open GitHub stack to be closed"));
+    assert_eq!(
+        stack.pull_requests, prs,
+        "the stack should hold the run's pull requests, bottom first"
+    );
+
+    let bottom_branch = scratch.pr_head_branch(bottom);
+    let middle_branch = scratch.pr_head_branch(middle);
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        middle_branch,
+        "PR #{top} should be based on the branch of PR #{middle} for this to be a stack"
+    );
+
+    // The change below `@` is the middle one: `push_stack` leaves `@` on top.
+    let closed = jj_spr(&["close", "-r", "@-"], scratch.path());
+    let said = closed.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Taking a stack apart is not undoable and does not undo itself, so it is
+    // said as it happens.
+    assert!(
+        said.contains(&format!("Dissolved GitHub stack #{}", stack.number)),
+        "closing PR #{middle} had to say it was taking stack #{} apart:\n{closed}",
+        stack.number
+    );
+    // ...and the stack does not come back: only `jj spr diff` registers one, and
+    // it gets a new number when it does. So the pull requests the dissolve freed
+    // have to be named — all of them except the one just closed, which nothing
+    // can put back into a stack and which needs no putting back.
+    assert!(
+        said.contains(&format!("GitHub stack: #{bottom}, #{top} left unstacked")),
+        "exactly the freed pull requests that are still open, and not the closed PR #{middle}, \
+         should be reported as left unstacked:\n{closed}"
+    );
+
+    assert_eq!(
+        scratch.pr_state(middle),
+        "closed",
+        "PR #{middle} should have been closed"
+    );
+
+    // The whole point: only the pull request that was asked for.
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "closing PR #{middle} closed PR #{top} above it"
+    );
+    assert_eq!(
+        scratch.pr_state(bottom),
+        "open",
+        "closing PR #{middle} closed PR #{bottom} below it"
+    );
+
+    // Onto the closed pull request's own base, not the default branch: closing
+    // puts nothing there, so PR #{top} would swallow PR #{bottom}'s changes.
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        bottom_branch,
+        "PR #{top} should have been retargeted at the closed PR's own base"
+    );
+    assert!(
+        !scratch.remote_has_branch(&middle_branch),
+        "the closed PR's branch is still on the remote, so PR #{top} was never moved off it: \
+         {middle_branch}"
+    );
+    assert!(
+        scratch.remote_has_branch(&bottom_branch),
+        "closing PR #{middle} took away the branch of PR #{bottom} below it: {bottom_branch}"
+    );
+
+    assert_eq!(
+        scratch.open_stack_for(top).map(|s| s.number),
+        None,
+        "stack #{} should have been dissolved to let PR #{top} move",
+        stack.number
+    );
+}

@@ -52,10 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub refuses to change the base branch of a pull request that is in a
   stack, so a run that has to retarget one takes the whole stack apart and
   registers the pull requests it pushed as a new one, under a new number.
-  `jj spr close` does not know about stacks yet and has to have the stack taken
-  apart by hand first. `--dry-run` reports what the run would register.
-  `jj spr init` asks for the setting right after the base strategy, offering
-  `github` only where the strategy picked can carry a stack.
+  `--dry-run` reports what the run would register. `jj spr init` asks for the
+  setting right after the base strategy, offering `github` only where the
+  strategy picked can carry a stack.
 
 - `jj spr land` works under `spr.stackDisplay = github`. It takes the GitHub stack
   holding the pull request apart before it merges anything, and then merges
@@ -83,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   having no changes, review and all. For the same reason, do not merge a
   stacked pull request from GitHub's own interface while GitHub is drawing the
   stack.
+
+- `jj spr close` works under `spr.stackDisplay = github`. Closing itself needs nothing:
+  GitHub allows it while a stack holds the pull request, and keeps the closed
+  one in the stack. Pointing the pull requests above at the closed one's base
+  is what a stack refuses, so closing takes apart whatever stack holds each of
+  them first — usually the one stack they were all in. It says which stacks it
+  dissolved and which pull requests are left unstacked, not counting the one it
+  just closed. To get a stack again, take the closed change out of the local
+  chain — abandon it, or fold it into a neighbour — and run `jj spr diff` over
+  what is left; the new stack has a new number. Closing a pull request with
+  nothing stacked on it moves no base, so it takes nothing apart at all and the
+  stack it is in keeps its number.
 
 ### Fixed
 
