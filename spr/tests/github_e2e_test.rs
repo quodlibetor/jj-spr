@@ -109,6 +109,33 @@ fn jj_spr(args: &[&str], dir: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// Run jj-spr and hand back everything it said, `Err` when it refused.
+///
+/// [`jj_spr`] panics with jj-spr's own output, which is what nearly every test
+/// wants. A test whose subject is *why* a command might be refused needs the
+/// failure as a value instead, so that it can be reported alongside what GitHub
+/// was saying at the time — which is the only thing that tells the two possible
+/// causes apart.
+fn try_jj_spr(args: &[&str], dir: &std::path::Path) -> Result<String, String> {
+    let out = Command::new(env!("CARGO_BIN_EXE_jj-spr"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run jj-spr");
+
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    if out.status.success() {
+        Ok(said)
+    } else {
+        Err(said)
+    }
+}
+
 /// A clone of the target repository, configured for spr, that closes whatever
 /// it opened when it goes out of scope.
 struct Scratch {
@@ -303,6 +330,104 @@ impl Scratch {
 
         branches.sort();
         branches
+    }
+
+    /// What GitHub reports about merging pull request `number`: the `mergeable`
+    /// verdict and the `mergeStateStatus` that `github::merge_requirements`
+    /// reads, on one line.
+    ///
+    /// GitHub works both out lazily and sends them back to `UNKNOWN` whenever
+    /// the pull request changes, so this waits for an answer rather than
+    /// reporting the `UNKNOWN` a first ask gets.
+    fn pr_merge_state(&self, number: u64) -> String {
+        let query = "query($owner:String!,$repo:String!,$number:Int!){\
+                     repository(owner:$owner,name:$repo){\
+                     pullRequest(number:$number){mergeable mergeStateStatus}}}";
+
+        let mut answer = String::new();
+        for _ in 0..10 {
+            answer = run(
+                "gh",
+                &[
+                    "api",
+                    "graphql",
+                    "-f",
+                    &format!("query={query}"),
+                    "-F",
+                    &format!("owner={}", self.target.owner),
+                    "-F",
+                    &format!("repo={}", self.target.repo),
+                    "-F",
+                    &format!("number={number}"),
+                    "--jq",
+                    r#".data.repository.pullRequest
+                       | "mergeable=\(.mergeable) mergeStateStatus=\(.mergeStateStatus)""#,
+                ],
+                self.path(),
+            );
+
+            if !answer.contains("UNKNOWN") {
+                return answer;
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        answer
+    }
+
+    /// The commit the default branch is at right now.
+    fn default_branch_sha(&self) -> String {
+        run(
+            "gh",
+            &[
+                "api",
+                &format!(
+                    "repos/{}/{}/commits/{}",
+                    self.target.owner,
+                    self.target.repo,
+                    self.default_branch()
+                ),
+                "--jq",
+                ".sha",
+            ],
+            self.path(),
+        )
+    }
+
+    /// The commits the default branch has gained since `before`, oldest first.
+    fn commits_landed_since(&self, before: &str) -> Vec<String> {
+        let path = format!(
+            "repos/{}/{}/compare/{before}...{}",
+            self.target.owner,
+            self.target.repo,
+            self.default_branch()
+        );
+
+        run("gh", &["api", &path, "--jq", ".commits[].sha"], self.path())
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The files one commit on the remote changes, sorted.
+    fn commit_files(&self, sha: &str) -> Vec<String> {
+        let path = format!(
+            "repos/{}/{}/commits/{sha}",
+            self.target.owner, self.target.repo
+        );
+
+        let mut files: Vec<String> = run(
+            "gh",
+            &["api", &path, "--jq", ".files[].filename"],
+            self.path(),
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+        files.sort();
+        files
     }
 
     /// The repository's default branch, which is the branch jj-spr retargets a
@@ -1288,5 +1413,173 @@ fn closing_a_pull_request_in_a_github_stack_retargets_the_rest_and_leaves_them_o
         None,
         "stack #{} should have been dissolved to let PR #{top} move",
         stack.number
+    );
+}
+
+/// Squash-landing a whole GitHub native stack, bottom first, puts exactly one
+/// commit per pull request on the default branch, each carrying that pull
+/// request's own change and nothing else.
+///
+/// This is the property that makes `squash` the merge method jj-spr defaults
+/// to, and only GitHub can show it. Every pull request in a native stack is
+/// based on the head branch of the one below, so its branch carries the whole
+/// stack's tree: what the *diff* of a landed pull request comes to is worked out
+/// by GitHub, from a merge base that moves as each land goes in, and nothing
+/// local models that. Landing the middle on its own already puts two changes in
+/// one commit — the test above says so — so the collapse asserted here is a
+/// property of landing the stack *in order*, not of any one land.
+///
+/// Nothing is done to the local repository between the lands. `jj spr land`
+/// leaves the working copy where it was — it says so, "Please manually rebase
+/// your working copy after landing" — and that is fine here, because nothing
+/// the next land needs comes from the working copy being current: `land` finds
+/// its pull request by the number recorded in the local commit's message, which
+/// no land rewrites, and the retarget onto the default branch that lets the next
+/// one merge has already been done on GitHub by the land below it. A `jj git
+/// fetch` and a `jj rebase` would be what a *person* wants next, to keep working
+/// on the rest of the stack; they are not what makes the next land work, so
+/// putting them here would only hide whether it does.
+#[test]
+fn squash_landing_a_github_stack_lands_one_commit_per_pull_request() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "ghstacksquash");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    // The tag keeps this run's commits off every earlier run's: what this test
+    // merges stays on the default branch, and a change that adds a file that is
+    // already there with the same content is empty.
+    let tag = run_tag();
+    let titles = [
+        format!("e2e squashland bottom {tag}"),
+        format!("e2e squashland middle {tag}"),
+        format!("e2e squashland top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+
+    let stack = scratch
+        .open_stack_for(prs[0])
+        .unwrap_or_else(|| panic!("PR #{} should be in an open GitHub stack", prs[0]));
+    assert_eq!(
+        stack.pull_requests, prs,
+        "the stack should hold the run's pull requests, bottom first"
+    );
+
+    let before = scratch.default_branch_sha();
+
+    // `push_stack` leaves `@` on the top of the stack, so the three changes are
+    // `@--`, `@-` and `@`, bottom to top.
+    for revision in ["@--", "@-", "@"] {
+        jj_spr(&["land", "-r", revision], scratch.path());
+    }
+
+    for number in &prs {
+        assert_eq!(
+            scratch.pr_field(*number, ".merged"),
+            "true",
+            "PR #{number} should have been merged"
+        );
+    }
+
+    let landed = scratch.commits_landed_since(&before);
+    assert_eq!(
+        landed.len(),
+        titles.len(),
+        "landing a stack of {} should put one commit on the default branch per pull request, \
+         got {landed:?}",
+        titles.len()
+    );
+
+    // Oldest first, which is the order they were landed in.
+    for (sha, title) in landed.iter().zip(&titles) {
+        assert_eq!(
+            scratch.commit_files(sha),
+            vec![slug(title)],
+            "the commit {sha} that landed for {title:?} should carry that change and no other"
+        );
+    }
+}
+
+/// Landing the bottom of a GitHub native stack needs no `--force`.
+///
+/// Only GitHub can show this, and it is the one land whose verdict is taken
+/// while a stack is still holding the pull request: the bottom of a stack is
+/// already based on the default branch, so `land` asks GitHub whether it will
+/// merge *before* dissolving anything, and that is the only order in which
+/// GitHub is ever asked about a stacked pull request. If GitHub answered
+/// `BLOCKED` for a pull request merely because a stack holds it, then
+/// `merge_requirements` would read that as unmet and, with the default
+/// `spr.landWithUnmetRequirements = false`, every land of the bottom of a stack
+/// would be refused — naming a failing check or a missing review as the cause,
+/// when the real cause was the stack. So this lands without `--force` on
+/// purpose: passing it would skip the very check being pinned.
+///
+/// A stack of three, landing the bottom, is the smallest shape where the pull
+/// request being landed is stacked and still based on the default branch.
+#[test]
+fn landing_the_bottom_of_a_github_stack_needs_no_force() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "ghstackbottom");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    // The tag keeps this run's commits off every earlier run's: what this test
+    // merges stays on the default branch, and a change that adds a file that is
+    // already there with the same content is empty.
+    let tag = run_tag();
+    let titles = [
+        format!("e2e bottomland bottom {tag}"),
+        format!("e2e bottomland middle {tag}"),
+        format!("e2e bottomland top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let (bottom, middle) = (prs[0], prs[1]);
+
+    let stack = scratch
+        .open_stack_for(bottom)
+        .unwrap_or_else(|| panic!("PR #{bottom} should be in an open GitHub stack to be landed"));
+    assert_eq!(
+        stack.pull_requests, prs,
+        "the stack should hold the run's pull requests, bottom first"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(bottom),
+        scratch.default_branch(),
+        "the bottom of a stack is on the default branch, which is what makes this the land \
+         that asks GitHub while the stack still holds the pull request"
+    );
+
+    // Read while the stack is still holding it, because that is the state in
+    // question: a refusal below is only interpretable next to what GitHub was
+    // reporting for a stacked pull request at the moment it was asked.
+    let stacked_verdict = scratch.pr_merge_state(bottom);
+
+    // `push_stack` leaves `@` on the top of the stack, so the bottom is `@--`.
+    let landed = try_jj_spr(&["land", "-r", "@--"], scratch.path()).unwrap_or_else(|said| {
+        panic!(
+            "landing the bottom of stack #{} without --force was refused. GitHub reported \
+             {stacked_verdict} for PR #{bottom} while the stack held it, and jj-spr said:\n{said}",
+            stack.number
+        )
+    });
+    assert!(
+        landed.contains(&format!("Dissolved GitHub stack #{}", stack.number)),
+        "landing PR #{bottom} had to say it was taking stack #{} apart:\n{landed}",
+        stack.number
+    );
+
+    assert_eq!(
+        scratch.pr_field(bottom, ".merged"),
+        "true",
+        "PR #{bottom} should have been merged"
+    );
+    assert_eq!(
+        scratch.pr_state(middle),
+        "open",
+        "landing below PR #{middle} closed it"
     );
 }

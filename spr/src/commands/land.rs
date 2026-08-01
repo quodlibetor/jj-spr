@@ -532,6 +532,31 @@ async fn land_pull_request(
     // used a base branch with this Pull Request or not. We have made sure the
     // target of the Pull Request is set to the master branch. So let GitHub do
     // the merge now!
+    //
+    // Squash, and only squash. That is not a default anybody is expected to
+    // want to change: it is the only one of GitHub's three merge methods that
+    // fits what jj-spr is, one Jujutsu change landing as one commit. Both of
+    // the others were made selectable and tried against a real repository on
+    // 2026-08-01, and both misbehave on a stacked Pull Request — one whose base
+    // is not the master branch, and whose head is therefore a merge commit
+    // (`pr_head_parents` in `commands::diff`):
+    //
+    // - `rebase` is refused by GitHub outright, with `Base branch was modified.
+    //   Review and try the merge again.` — which says nothing about the real
+    //   cause. Reproduced three times. Nothing lands, and since the stack has
+    //   been dissolved by this point the land costs the stack as well.
+    // - `merge` succeeds and lands the Pull Requests *below* the one asked for:
+    //   a merge commit takes the whole branch, so their commits reach the
+    //   master branch and GitHub closes them as merged on its own. jj-spr never
+    //   hears about it, so their head branches are left behind and their local
+    //   changes are never marked landed. It also puts jj-spr's own synthetic
+    //   merge commits on the master branch, which is the plumbing that keeps a
+    //   reviewer's incremental diffs working and has no business there.
+    //
+    // On a Pull Request that already sits on the master branch both do land a
+    // single commit, so the failure is specific to the branch shape rather than
+    // general. That is not a reason to offer them: it would be a setting whose
+    // useful case is the one where it changes nothing.
     let merged = octocrab::instance()
         .pulls(&config.owner, &config.repo)
         .merge(pull_request_number)
