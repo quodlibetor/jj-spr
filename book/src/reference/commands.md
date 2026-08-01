@@ -101,6 +101,33 @@ would close them. Until you rebase and run `jj spr diff` again, though, a
 retargeted pull request's diff on GitHub still includes the changes that just
 landed.
 
+**GitHub stacks:** With
+[`spr.stackDisplay = github`](configuration.md#stackdisplay), landing takes the
+GitHub stack holding the pull request apart before it merges anything, and then
+merges that pull request on its own. It has to: GitHub refuses to merge a pull
+request a stack holds, and offers its own stack merge instead. Run `jj spr diff`
+afterwards to register what is left as a stack again; it gets a new number and a
+new URL, and any pull request that was in the dissolved stack but is not in the
+run you push is left unstacked — jj-spr says which.
+
+Taking a stack apart cannot be undone, so landing asks GitHub whether it will
+merge before it dissolves anything, wherever it can. Landing the bottom pull
+request of a stack moves no base branch, so that answer is the same before the
+stack comes apart as after it, and a land GitHub turns down — a required check
+still running, a conflict, an unmet requirement — leaves the stack standing.
+Higher up the stack the base has to move onto the default branch first, and
+moving it is what needs the stack gone, so there a refusal still costs the
+stack.
+
+Landing deliberately does *not* take GitHub up on that stack merge
+(`PUT /pulls/{n}/merge-async`), which closes every pull request below the one
+you asked for as merged. More seriously, GitHub follows that merge by rebasing
+the head branch of the pull request *above* onto its new base, and the branches
+jj-spr pushes are merge commits that a rebase discards: the branch collapses
+onto its base and GitHub closes the pull request as having no changes, review
+and all. For the same reason, do not merge a stacked pull request from GitHub's
+own interface.
+
 **Important:** After landing, you must manually rebase your working copy:
 ```bash
 jj git fetch

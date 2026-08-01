@@ -15,7 +15,9 @@ use crate::{
         PullRequestUpdate,
     },
     message::{MessageSection, validate_commit_message},
-    native_stacks::{BaseUnlock, ChainLink, Reconciliation, StackSession},
+    native_stacks::{
+        ChainLink, DissolveReason, Reconciliation, StackSession, dissolve_any_stack_holding,
+    },
     output::{output, write_commit_title},
     utils::{parse_name_list, remove_all_parens, run_command},
 };
@@ -1155,7 +1157,13 @@ async fn diff_impl(
             // drifting from the calls it has to precede; see where `retargeted`
             // is worked out for why one predicate covers all of them.
             if retargeted {
-                unstack_before_retargeting(stacks, gh, pull_request.number).await?;
+                dissolve_any_stack_holding(
+                    stacks,
+                    gh,
+                    pull_request.number,
+                    DissolveReason::ToMoveABase,
+                )
+                .await?;
             }
 
             if let Some(base_branch) = base_branch {
@@ -1294,36 +1302,6 @@ async fn diff_impl(
         based_on,
         retargeted,
     })
-}
-
-/// Take pull request `number` out of any stack it is in, so that GitHub will
-/// accept the base change about to be sent.
-///
-/// A no-op when GitHub is not drawing the stack, which is what makes this safe to
-/// call wherever a base is about to move without asking what mode the run is
-/// in. See [`StackSession::unlock_base`] for why the base cannot simply be sent
-/// and the refusal handled.
-async fn unstack_before_retargeting(
-    stacks: Option<&mut StackSession>,
-    gh: &crate::github::GitHub,
-    number: u64,
-) -> Result<()> {
-    let Some(session) = stacks else {
-        return Ok(());
-    };
-
-    if let BaseUnlock::Dissolved { stack_number } = session.unlock_base(gh, number).await? {
-        output(
-            "🧱",
-            &format!(
-                "Dissolved GitHub stack #{stack_number}: a stacked pull request's base cannot \
-                 be changed. A stack is registered again at the end of this run, under a new \
-                 number."
-            ),
-        )?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

@@ -997,7 +997,9 @@ fn migrating_a_stack_to_linear_retargets_it_and_takes_away_its_base_branch() {
 /// default branch, and no test sends a base to a stacked pull request by the
 /// other route. That is enough only for as long as the guard is asked once,
 /// above the two of them; anyone moving it back down into each has taken away
-/// the cover for one of them and needs a second test here.
+/// the cover for one of them and needs a second test here. This is about
+/// `diff`'s two arms only — `land` sends a base as well, and the test below
+/// covers its guard.
 ///
 /// The retarget being to the default branch covers that arm of the push as
 /// well. The branch the pull request leaves is the head branch of the pull
@@ -1057,5 +1059,122 @@ fn retargeting_a_pull_request_in_a_github_stack_takes_it_out_of_the_stack() {
         scratch.pr_state(bottom),
         "open",
         "retargeting PR #{top} closed PR #{bottom} below it"
+    );
+}
+
+/// Landing a pull request a GitHub stack holds takes the stack apart first and
+/// merges that pull request on its own, leaving the ones above it open, still
+/// carrying their own changes, and pointed at the default branch.
+///
+/// Only GitHub can show this, and only against a stack GitHub is holding. This
+/// test is mostly about what did *not* happen: the alternative — merging
+/// through the stack, which is what GitHub's API is for — passes every local
+/// test and then destroys the pull request above, for the reasons set out at
+/// the top of `impl GitHub` in `github::stacks`. A stack of three, landing the
+/// middle, is the smallest
+/// shape that has both a pull request the stack merge would have dragged in and
+/// one it would have destroyed.
+#[test]
+fn landing_a_pull_request_in_a_github_stack_leaves_the_rest_of_the_stack_alone() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "ghstackland");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    // The tag keeps this run's commits off every earlier run's: what this test
+    // merges stays on the default branch, and a change that adds a file that is
+    // already there with the same content is empty.
+    let tag = run_tag();
+    let titles = [
+        format!("e2e ghstack land bottom {tag}"),
+        format!("e2e ghstack land middle {tag}"),
+        format!("e2e ghstack land top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let (bottom, middle, top) = (prs[0], prs[1], prs[2]);
+
+    let stack = scratch
+        .open_stack_for(middle)
+        .unwrap_or_else(|| panic!("PR #{middle} should be in an open GitHub stack to be landed"));
+    assert_eq!(
+        stack.pull_requests, prs,
+        "the stack should hold the run's pull requests, bottom first"
+    );
+
+    let middle_branch = scratch.pr_head_branch(middle);
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        middle_branch,
+        "PR #{top} should be based on the branch of PR #{middle} for this to be a stack"
+    );
+
+    // The change below `@` is the middle one: `push_stack` leaves `@` on top.
+    let landed = jj_spr(&["land", "-r", "@-"], scratch.path());
+    let said = landed.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Taking a stack apart is not undoable and does not undo itself, so it is
+    // said as it happens.
+    assert!(
+        said.contains(&format!("Dissolved GitHub stack #{}", stack.number)),
+        "landing PR #{middle} had to say it was taking stack #{} apart:\n{landed}",
+        stack.number
+    );
+
+    assert_eq!(
+        scratch.pr_field(middle, ".merged"),
+        "true",
+        "PR #{middle} should have been merged"
+    );
+
+    // The whole point: only the pull request that was asked for.
+    assert_eq!(
+        scratch.pr_state(bottom),
+        "open",
+        "landing PR #{middle} must not close PR #{bottom} below it"
+    );
+    assert_eq!(
+        scratch.pr_field(bottom, ".merged"),
+        "false",
+        "landing PR #{middle} must not merge PR #{bottom} below it"
+    );
+    // Its *content* does land with PR #{middle} — under the linear base
+    // strategy that pull request's head carries the whole stack's tree, so the
+    // squash commit on the default branch holds both changes. GitHub still
+    // reports PR #{bottom} as changing its own file, because it compares
+    // against the merge base rather than against the branch tip. So the
+    // difference from GitHub's stack merge is not that nothing below lands: it
+    // is that the pull requests around this one stay open, keep their branches,
+    // and keep their reviews.
+
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "landing below PR #{top} closed it"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.default_branch(),
+        "PR #{top} should now target the default branch"
+    );
+    // The killer symptom of the stack merge: the survivor's branch reset onto
+    // its base, so its diff is empty and its review is gone.
+    assert_ne!(
+        scratch.pr_field(top, ".changed_files"),
+        "0",
+        "PR #{top} still has to carry its own change"
+    );
+
+    assert_eq!(
+        scratch.open_stack_for(top).map(|s| s.number),
+        None,
+        "stack #{} should have been dissolved, not left holding a merged pull request",
+        stack.number
+    );
+
+    assert!(
+        !scratch.remote_has_branch(&middle_branch),
+        "the base branch PR #{top} left behind is still on the remote: {middle_branch}"
     );
 }

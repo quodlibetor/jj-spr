@@ -52,10 +52,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub refuses to change the base branch of a pull request that is in a
   stack, so a run that has to retarget one takes the whole stack apart and
   registers the pull requests it pushed as a new one, under a new number.
-  `jj spr land` and `jj spr close` do not know about stacks yet and have to
-  have the stack taken apart by hand first. `--dry-run` reports what the run
-  would register. `jj spr init` asks for the setting right after the base
-  strategy, offering `github` only where the strategy picked can carry a
+  `jj spr close` does not know about stacks yet and has to have the stack taken
+  apart by hand first. `--dry-run` reports what the run would register.
+  `jj spr init` asks for the setting right after the base strategy, offering
+  `github` only where the strategy picked can carry a stack.
+
+- `jj spr land` works under `spr.stackDisplay = github`. It takes the GitHub stack
+  holding the pull request apart before it merges anything, and then merges
+  that pull request on its own — which is what it does without the setting, and
+  what leaves the pull requests above it untouched. It has no choice about the
+  first part: GitHub refuses to merge a pull request a stack holds, and points
+  at its own stack merge instead. It says which stack it dissolved and which
+  pull requests are left unstacked; `jj spr diff` afterwards registers what is
+  left, under a new number.
+
+  Taking a stack apart cannot be undone, so a land that GitHub is going to
+  refuse asks first where it can. Landing the bottom pull request of a stack
+  moves no base branch, so GitHub's answer is the same before the stack comes
+  apart as after it — and a land it turns down for the ordinary reasons, a
+  required check still running or a conflict, leaves the stack standing. Higher
+  up the stack the base has to move onto the default branch before GitHub will
+  answer about the merge at all, and moving it means dissolving the stack, so
+  there the refusal still costs the stack.
+
+  It deliberately does not take that offer up. The stack merge closes every
+  pull request below the one asked for as merged and — worse — follows the
+  merge by rebasing the head branch of the pull request *above* onto its new
+  base. The branches jj-spr pushes are merge commits that a rebase discards, so
+  that branch collapses onto its base and GitHub closes the pull request as
+  having no changes, review and all. For the same reason, do not merge a
+  stacked pull request from GitHub's own interface while GitHub is drawing the
   stack.
 
 ### Fixed

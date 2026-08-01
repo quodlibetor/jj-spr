@@ -422,10 +422,31 @@ fn stack_route(config: &crate::config::Config, stack_number: u64, action: Option
 
 impl GitHub {
     // GitHub's Stacked Pull Requests API. `merge-async`, which merges a whole
-    // stack up to a chosen pull request, is deliberately not implemented here —
-    // note for whoever adds it that it is a `PUT`, and that a `POST` to it gets
-    // an ordinary route-not-found 404 that is easy to misread as this repository
-    // not having stacks enabled.
+    // stack up to a chosen pull request, is not implemented here and must not
+    // be: it destroys the pull requests above the one it merges.
+    //
+    // After the merge GitHub repoints the next survivor at the stack's base and
+    // force-pushes that survivor's head branch, rebasing it onto the new base.
+    // A pull request branch jj-spr pushes is a *merge* commit (`pr_head_parents`
+    // in `commands::diff`), and a linear rebase replays only the non-merge
+    // commits of the range — all of which are on the master branch by then,
+    // after the squash. So the branch collapses onto its base, GitHub sees a
+    // pull request with no changes, and closes it, review and all. Established
+    // end to end against a live repository on 2026-07-31, while this `land` was
+    // being written: merging the middle of a stack of three closed the top one
+    // and reset its head branch to the tip of the master branch. It happens
+    // with `merge_action` `default` and `direct_merge` alike, and whether or
+    // not the merged pull request's head branch is deleted afterwards.
+    // Ordinary single-parent branches survive the same treatment, which is why
+    // GitHub's own client does not hit this, and why an earlier probe of the
+    // API — which built its own plain branches — did not find it: the hazard is
+    // specific to jj-spr's branch shape.
+    //
+    // So `land` takes the stack apart and merges the pull request on its own
+    // instead; the comment above its dissolve says what that costs. And a note
+    // for whoever tries the endpoint anyway: it is a `PUT`, and a `POST` to it
+    // gets an ordinary route-not-found 404 that is easy to misread as this
+    // repository not having stacks enabled.
 
     /// Every stack in the repository.
     ///

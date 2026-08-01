@@ -12,6 +12,7 @@ use crate::{
     error::{Error, Result, ResultExt},
     github::{PullRequestState, PullRequestUpdate, ReviewStatus, StackedPullRequest},
     message::{MessageSection, build_github_body_for_merging},
+    native_stacks::{DissolveReason, StackSession, dissolve_any_stack_holding, left_unstacked},
     output::{output, write_commit_title},
     stacked::{
         may_delete_base_branch, retarget_stacked_pull_requests, spawn_branch_deletion,
@@ -151,18 +152,27 @@ async fn wait_for_mergeability(
 /// Give up on the land: say so, put the base back if this land moved it, and
 /// hand back the failure to return.
 ///
+/// `headline` is what went wrong, in the words of the step that was reached.
+/// Only the merge itself can say a merge failed — the checks before it refuse
+/// a land that GitHub was never asked to merge, and reporting those as a failed
+/// merge sends whoever reads it looking at branch protection rather than at the
+/// requirement that was actually unmet.
+///
 /// `retargeted_from` is the base this land pointed at the master branch, or
 /// `None` where it moved none — either because the Pull Request was on the
 /// master branch already, or because it has not been retargeted yet. That is
-/// the whole of the rollback: nothing else a land does before merging leaves a
-/// mark on GitHub to undo.
+/// the whole of the rollback: nothing else this land has done is undoable, and
+/// in particular the stack it dissolved can only be put back by `jj spr diff`,
+/// which is why the base-already-master path takes GitHub's verdict on the
+/// merge before it dissolves anything.
 async fn abandon_land(
     gh: &crate::github::GitHub,
     number: u64,
+    headline: &str,
     retargeted_from: Option<&crate::github::GitHubBranch>,
     mut error: Error,
 ) -> Result<()> {
-    output("❌", "GitHub Pull Request merge failed")?;
+    output("❌", headline)?;
 
     if let Some(base) = retargeted_from
         && let Err(rollback_error) = gh
@@ -212,10 +222,80 @@ fn resolve_cherry_pick(
 }
 
 pub async fn land(
+    opts: LandOptions,
+    jj: &crate::jj::Jujutsu,
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+) -> Result<()> {
+    // GitHub's own stacks, held as an `Option` exactly as `diff` holds them:
+    // `None` is the whole of "GitHub is not drawing the stack", so nothing below asks
+    // what mode this is.
+    //
+    // Held out here, one frame above the land itself, for the sake of the
+    // sentence below: whatever the land did to the stacks it found has to be
+    // said however the land went.
+    let mut stacks = config
+        .stack_display
+        .draws_the_stack()
+        .then(StackSession::new);
+
+    let landed = land_pull_request(opts, jj, gh, config, &mut stacks).await;
+
+    // What the stacks this land took apart were holding, less what has landed:
+    // `land` registers nothing — only `diff` does — so every other member is
+    // loose, and a dissolved stack leaves no record to find them from
+    // afterwards.
+    //
+    // Said however the land went, which is the point of it being here. A land
+    // that fails below the dissolve is exactly the one that has taken a stack
+    // apart and left it that way: it has named the stack it took apart, but
+    // only this names the Pull Requests that came loose from it. A land that
+    // fails above the dissolve has freed nothing, so this is silent.
+    let reported = match stacks
+        .as_ref()
+        .and_then(|session| left_unstacked(&session.orphaned()))
+    {
+        Some(sentence) => output("🧱", &sentence),
+        None => Ok(()),
+    };
+
+    // The land's own answer wins: a terminal that would not take that sentence
+    // must not turn a failed land into some other failure.
+    landed.and(reported)
+}
+
+/// Land the one Pull Request `opts` names, in one of two orders.
+///
+/// Which order depends on where the Pull Request already sits, and the
+/// difference is what a refused land costs:
+///
+/// - base already the master branch: **ask GitHub, dissolve, merge**. Nothing
+///   has to move for that verdict, so it can be had before the stack is taken
+///   apart — and dissolving is not undoable, so a land refused for the ordinary
+///   reasons keeps its stack.
+/// - otherwise: **dissolve, retarget onto the master branch, ask, merge**. This
+///   one cannot ask first. The retarget is itself a base change GitHub refuses
+///   while a stack holds the Pull Request, so the dissolve has to come before
+///   it; and retargeting sends GitHub's verdicts back to `UNKNOWN`, so the
+///   asking has to come after. A refusal here costs the stack, and that is not
+///   avoidable.
+///
+/// The two are complementary, so the mergeability check runs exactly once
+/// either way and the merge is never reached without it.
+///
+/// `retargeted_from` marks the rollback boundary: it is `Some` only past the
+/// retarget above, and every failure from there on goes through
+/// [`abandon_land`], which puts that base back.
+///
+/// The Pull Requests a dissolved stack left loose are *not* reported here —
+/// [`land`] does that from `stacks`, so that they are named however this
+/// returns.
+async fn land_pull_request(
     mut opts: LandOptions,
     jj: &crate::jj::Jujutsu,
     gh: &crate::github::GitHub,
     config: &crate::config::Config,
+    stacks: &mut Option<StackSession>,
 ) -> Result<()> {
     let revision = opts.revision.as_deref().unwrap_or("@");
     let prepared_commit = jj.get_prepared_commit_for_revision(config, revision)?;
@@ -284,10 +364,80 @@ pub async fn land(
         )));
     }
 
-    // Okay, we are confident now that the PR can be merged and the result of
-    // that merge would be a master commit with the same tree as if we
-    // cherry-picked the commit onto master.
     let pr_head_oid = pull_request.head_oid;
+
+    // Whether to hold GitHub's verdict on the base branch's requirements
+    // against this land. Settled before either mergeability check because it
+    // decides not only whether an unmet requirement refuses the land, but
+    // whether the check waits for a verdict at all: a land that means to
+    // proceed regardless has no reason to spend ten seconds waiting for an
+    // answer it will discard.
+    let enforce_requirements = config.enforce_merge_requirements(opts.force);
+
+    // Where this Pull Request already sits on the master branch, ask GitHub
+    // whether it will merge it *before* taking its stack apart. That question
+    // is the ordinary way a land fails — a required check still running, a
+    // conflict, a requirement its base branch sets that is not met — and
+    // dissolving is not undoable, so a land refused here would otherwise cost
+    // the stack for nothing. Nothing has to move for this verdict, so GitHub
+    // reaches the same one either side of the dissolve; the only difference is
+    // what a refusal costs.
+    //
+    // Nothing has changed on GitHub yet, so there is nothing to put back: the
+    // stack still stands and no base has moved. That is what the `None` says —
+    // the rollback restores the base this land retargets, and `base_is_master`
+    // is exactly the case where it retargets none.
+    if base_is_master
+        && let Err(error) =
+            wait_for_mergeability(gh, pull_request_number, pr_head_oid, enforce_requirements).await
+    {
+        return abandon_land(
+            gh,
+            pull_request_number,
+            "Not landing this Pull Request",
+            None,
+            error,
+        )
+        .await;
+    }
+
+    // The stack holding this Pull Request has to go, and it does not come back:
+    // only `diff` registers stacks. Two things need it gone, and it is the
+    // second that makes it unconditional:
+    //
+    // - Every base ref this land moves — this Pull Request's onto the master
+    //   branch just below, the ones above it after the merge, and the rollback
+    //   that puts this one back if the merge fails — is a change GitHub refuses
+    //   while a stack holds the Pull Request. Of those, only the ones above it
+    //   happen when the base is already the master branch, which is the bottom
+    //   of every stack; and each of those leaves whatever stack holds it in the
+    //   loop before `retarget_stacked_pull_requests`, not here.
+    // - The merge itself. The ordinary merge endpoint refuses a Pull Request a
+    //   stack holds outright: `403 Merging stacked PRs via this endpoint is not
+    //   supported. Use the asynchronous merge endpoint instead.` (observed
+    //   2026-08-01). So even landing the bottom of a stack, which moves no base
+    //   at all before merging, cannot proceed with the stack standing.
+    //
+    // The asynchronous endpoint it points at is the one jj-spr must not use: it
+    // destroys the Pull Requests above the one it merges. The account of how,
+    // and of how that was established, is at the top of `impl GitHub` in
+    // `github::stacks`, which is where it belongs — repeating the mechanism
+    // here would only give it somewhere to drift out of step.
+    //
+    // As late as it can be, because dissolving is not undoable: everything
+    // above is a lookup or a fetch — including, where the base is already the
+    // master branch, GitHub's verdict on the merge — so a land that fails up
+    // there can still be retried with the stack intact. Where the base is not
+    // the master branch that verdict has to wait for the retarget below, which
+    // in turn has to wait for this. The dissolve names the stack, and the report
+    // at the end names what it freed.
+    dissolve_any_stack_holding(
+        stacks.as_mut(),
+        gh,
+        pull_request_number,
+        DissolveReason::ToLand,
+    )
+    .await?;
 
     if !base_is_master {
         // The base of the Pull Request on GitHub is not set to master. This
@@ -336,23 +486,41 @@ pub async fn land(
         .await?;
     }
 
-    // Whether to hold GitHub's verdict on the base branch's requirements
-    // against this land. Settled before the check because it decides not only
-    // whether an unmet requirement refuses the land, but whether the check
-    // waits for a verdict at all: a land that means to proceed regardless has
-    // no reason to spend ten seconds waiting for an answer it will discard.
-    let enforce_requirements = config.enforce_merge_requirements(opts.force);
-
-    // The base this land moved, which is the whole of what a failure from here
-    // on has to put back. Bound next to the block above that moves it, rather
-    // than worked out again at each failure, so that there is one place to be
-    // right about.
+    // The base this land moved onto the master branch, and so the base a
+    // failure from here on has to put back. `None` where the Pull Request was
+    // already on the master branch and the block above moved nothing — the one
+    // thing that decides the rollback, decided next to the retarget it undoes.
     let retargeted_from = (!base_is_master).then_some(&pull_request.base);
 
-    if let Err(error) =
-        wait_for_mergeability(gh, pull_request_number, pr_head_oid, enforce_requirements).await
+    // Whether GitHub will merge this Pull Request.
+    //
+    // Where the base was already the master branch, that answer was taken well
+    // above, before the dissolve, and is not asked for a second time. The
+    // dissolve since then *is* a change on GitHub's side — it is what turns a
+    // guaranteed 403 into a merge — but it moves no base and touches no branch
+    // content, and the merge below is pinned to `pr_head_oid`, so a verdict
+    // that had gone stale would cost a rejected merge rather than a wrong one.
+    //
+    // Where the base was not the master branch, here is the earliest the
+    // question can be put. The retarget just above sends GitHub's verdicts back
+    // to `UNKNOWN`, so an answer taken before it would be about the base this
+    // Pull Request has just left; and the retarget is itself a base change,
+    // which GitHub refuses while a stack holds the Pull Request, so it cannot
+    // come before the dissolve either. Dissolve, retarget, then ask is the only
+    // order there is — which is why this path, unlike the other, pays for a
+    // refusal with the stack.
+    if !base_is_master
+        && let Err(error) =
+            wait_for_mergeability(gh, pull_request_number, pr_head_oid, enforce_requirements).await
     {
-        return abandon_land(gh, pull_request_number, retargeted_from, error).await;
+        return abandon_land(
+            gh,
+            pull_request_number,
+            "Not landing this Pull Request",
+            retargeted_from,
+            error,
+        )
+        .await;
     }
 
     // We have checked that merging the Pull Request branch into the master
@@ -387,10 +555,27 @@ pub async fn land(
 
     let merge = match merged {
         Ok(merge) => merge,
-        Err(error) => return abandon_land(gh, pull_request_number, retargeted_from, error).await,
+        Err(error) => {
+            return abandon_land(
+                gh,
+                pull_request_number,
+                "GitHub Pull Request merge failed",
+                retargeted_from,
+                error,
+            )
+            .await;
+        }
     };
 
     output("🛬", "Landed!")?;
+
+    // The dissolve above happened while this Pull Request was still open, so it
+    // is in the list of what the stack was holding. It is out of every stack for
+    // good now and cannot be put back into one, so it is not something the
+    // dissolve lost.
+    if let Some(session) = stacks.as_mut() {
+        session.merged(pull_request_number);
+    }
 
     // Nothing this land aims at this base branch: the retargeting below sends
     // the Pull Requests above to the master branch, not here. That is why it
@@ -410,6 +595,40 @@ pub async fn land(
     // The Pull Requests that were stacked on this one are now based on the
     // master branch, so point them at it and take the base branches they leave
     // out of the way, where those are ours.
+    //
+    // A stack holding any of them would refuse the move, so they leave theirs
+    // first. Members of the stack this land already dissolved are out of one
+    // already and cost nothing here; what this catches is a Pull Request above
+    // that ended up in a *different* stack, which is the ordinary state after
+    // pushing part of a stack.
+    for stacked in &stacked_pull_requests {
+        // Reported rather than raised, like everything else after the merge:
+        // `retarget_stacked_pull_requests` is best-effort by contract because
+        // the land has already happened, and failing here would skip the
+        // retargeting of every *other* Pull Request as well. One left in a
+        // stack simply fails its own retarget below, which is what keeps the
+        // head branch alive for it.
+        if let Err(error) = dissolve_any_stack_holding(
+            stacks.as_mut(),
+            gh,
+            stacked.number,
+            DissolveReason::ToFollowALanding,
+        )
+        .await
+        {
+            output(
+                "⚠️",
+                &format!(
+                    "Could not take Pull Request #{} out of its GitHub stack",
+                    stacked.number
+                ),
+            )?;
+            for message in error.messages() {
+                output("  ", message)?;
+            }
+        }
+    }
+
     let retargeted = retarget_stacked_pull_requests(
         gh,
         &stacked_pull_requests,

@@ -5,15 +5,17 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Registering the pull requests a run pushed as a stack GitHub itself draws.
+//! Registering the pull requests a run pushed as a stack GitHub itself draws,
+//! and taking one back out of a stack when something has to be done that a
+//! stack does not allow.
 //!
 //! This is a stage a run passes through, not a way of doing what `diff` does.
 //! Nothing here changes what is pushed or what a pull request is based on —
 //! `spr.baseStrategy = linear` already builds the chain of base refs that
 //! GitHub's Stacked Pull Requests API requires, and this only tells GitHub that
-//! the chain is one. So it is plain functions over a session value that `diff`
-//! holds as an [`Option`]: `None` is the whole of "the feature is off", and no
-//! call site asks what mode it is in.
+//! the chain is one. So it is plain functions over a session value that each
+//! command holds as an [`Option`]: `None` is the whole of "the feature is off",
+//! and no call site asks what mode it is in.
 //!
 //! Two facts about the API shape everything here, both established by probing
 //! the live API on 2026-07-31 rather than read out of GitHub's documentation,
@@ -41,6 +43,7 @@ use std::collections::HashSet;
 use crate::{
     error::{Error, Result},
     github::{GitHub, Stack, StackApiError, StackResult, UnstackOutcome},
+    output::output,
 };
 
 /// One change a run dealt with, as the stack registration sees it.
@@ -285,6 +288,36 @@ fn numbers(pull_requests: &[u64]) -> String {
         .join(", ")
 }
 
+/// What `land` says about the pull requests it took out of a stack and left out
+/// of one, or `None` where it left none.
+///
+/// `land`'s and no one else's: the sentence names the land. A second caller
+/// wanting one of these wants its own function here, beside this one, rather
+/// than this one made general — the whole point of keeping these sentences in
+/// this module is that they read as one voice about one subject, and a command
+/// word threaded through as a parameter would be prose assembled at the call
+/// site again.
+///
+/// Kept here rather than at the call site for the same reason
+/// [`DissolveReason`] is: every sentence jj-spr says about a stack is written in
+/// this module, in one voice. [`Reconciliation::Orphaned`] says the same thing
+/// in `diff`'s words, which are about what a run pushed and registered — `land`
+/// pushes and registers nothing, so it needs its own.
+///
+/// Plural throughout: a land dissolves the stack holding the pull request it is
+/// landing *and* any stack holding one of the pull requests above it, so what
+/// comes loose can span several stacks and can never be put back as one.
+pub fn left_unstacked(pull_requests: &[u64]) -> Option<String> {
+    (!pull_requests.is_empty()).then(|| {
+        format!(
+            "GitHub stack: {} left unstacked by the stacks this land took apart. Nothing puts a \
+             stack back but `jj spr diff`, so rebase and push the ones you still want stacked — \
+             `jj spr diff --all -r 'trunk()..@'`.",
+            numbers(pull_requests),
+        )
+    })
+}
+
 /// `stack #12` / `stacks #12, #13`.
 fn stacks(stack_numbers: &[u64]) -> String {
     let plural = if stack_numbers.len() == 1 { "" } else { "s" };
@@ -310,10 +343,13 @@ fn stacks(stack_numbers: &[u64]) -> String {
 ///
 /// 1. **The stack already holds the chain**, as a run of adjacent members.
 ///    Nothing to do. This is not merely the equal case: a stack keeps its
-///    merged and closed members forever, so the ordinary state after landing
-///    the bottom of a stack is that GitHub holds *more* than the run pushed,
-///    with the chain sitting inside it. Recreating for that would churn the
-///    stack's number and URL on every push.
+///    merged and closed members forever, so GitHub can perfectly well hold
+///    *more* than the run pushed with the chain sitting inside it — a member
+///    closed unmerged, or one merged from GitHub's own interface, leaves the
+///    stack exactly like that. Recreating for those would churn the stack's
+///    number and URL on every push. (`jj spr land` does not produce this
+///    state: it dissolves the stack rather than merging within it, so the run
+///    after a land finds no stack at all and creates one.)
 /// 2. **The chain continues the stack.** Whatever the stack ends with is the
 ///    bottom of the chain, and the rest is new, so it can be appended — the one
 ///    thing the API can do to a stack that exists.
@@ -459,8 +495,8 @@ fn effects<'a>(
     (dissolved, registers)
 }
 
-/// What became of a pull request asked to leave the stack it is in, so that its
-/// base ref can be changed.
+/// What became of a pull request asked to leave the stack it is in, so that
+/// GitHub will accept something it refuses while a stack holds one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaseUnlock {
     /// The pull request was in no stack, so nothing held its base ref.
@@ -471,12 +507,14 @@ pub enum BaseUnlock {
     Dissolved { stack_number: u64 },
 }
 
-/// The stack registration for one run of `diff`.
+/// The stack bookkeeping for one run of a command that touches stacks.
 ///
-/// Held by `diff` as an `Option`, which is `None` unless `spr.stackDisplay` is
-/// `github`. It remembers what it has already asked GitHub so that a run does not
-/// ask twice: which pull requests are known to be out of a stack, and whether
-/// the repository turned out not to support stacks at all.
+/// `diff` registers stacks and dissolves the ones in the way of a base it is
+/// moving; `land` only ever dissolves. Both hold one as an `Option`, which is
+/// `None` unless `spr.stackDisplay` is `github`. It remembers what it has already
+/// asked GitHub so that a run does not ask twice: which pull requests are known
+/// to be out of a stack, and whether the repository turned out not to support
+/// stacks at all.
 #[derive(Debug, Default)]
 pub struct StackSession {
     /// Pull requests known to be in no stack, either because GitHub said so or
@@ -498,6 +536,17 @@ pub struct StackSession {
 
     /// Every pull request this run has left in a stack.
     registered: HashSet<u64>,
+
+    /// Pull requests this run merged, which are therefore not something a
+    /// dissolved stack lost.
+    ///
+    /// A merged pull request is out of every stack for good and cannot be put
+    /// back into one, which is the same reason a stack's merged members are left
+    /// out of what a dissolve is reported to have lost. The difference is only
+    /// in the timing: `land` dissolves the stack while the pull request it is
+    /// about to land is still open, so it is in the dissolved list, and by the
+    /// time anything is reported it has merged.
+    merged: HashSet<u64>,
 
     /// Stacks a dry run worked out that the run would take apart. Only a dry
     /// run fills this: a real run has already said so as it happened.
@@ -571,23 +620,45 @@ impl StackSession {
         Ok(outcomes)
     }
 
-    /// The pull requests this run took out of a stack and left out of one, as
-    /// something to report, or `None` where there are none.
+    /// Record that pull request `number` has merged, so that a stack this run
+    /// dissolved is not reported as having lost it.
+    ///
+    /// `land` dissolves the stack while the pull request it is about to land is
+    /// still open, so it goes into the dissolved list like any other member.
+    /// Without this, every land under `spr.stackDisplay = github` would end by telling
+    /// the user to put the pull request it had just landed back into a stack.
+    pub fn merged(&mut self, number: u64) {
+        self.merged.insert(number);
+    }
+
+    /// The pull requests this run took out of a stack and left out of one.
     ///
     /// Deliberately not part of [`Self::register`]'s answer: the run may fail
     /// before it ever registers, and that is precisely the case worth
     /// reporting, so the caller asks separately and asks whatever happened.
-    pub fn orphaned_pull_requests(&self) -> Option<Reconciliation> {
+    pub fn orphaned(&self) -> Vec<u64> {
         let mut lost: Vec<u64> = self
             .dissolved
             .iter()
             .flatten()
             .copied()
-            .filter(|number| !self.registered.contains(number))
+            .filter(|number| !self.registered.contains(number) && !self.merged.contains(number))
             .collect();
 
         lost.sort_unstable();
         lost.dedup();
+
+        lost
+    }
+
+    /// [`Self::orphaned`] as something for `diff` to report, or `None` where
+    /// there is nothing to report.
+    ///
+    /// `land` does not use this: [`Reconciliation::Orphaned`] speaks of what a
+    /// run pushed and registered, and `land` pushes and registers nothing, so
+    /// it words its own sentence around [`Self::orphaned`].
+    pub fn orphaned_pull_requests(&self) -> Option<Reconciliation> {
+        let lost = self.orphaned();
 
         (!lost.is_empty()).then_some(Reconciliation::Orphaned {
             pull_requests: lost,
@@ -714,11 +785,13 @@ impl StackSession {
     }
 
     /// Take pull request `number` out of the stack it is in, so that GitHub
-    /// will accept a change to its base ref.
+    /// will accept something it refuses while a stack holds one — a change to
+    /// its base ref, or an ordinary merge of it.
     ///
-    /// GitHub refuses any `PATCH` to a stacked pull request that carries a
-    /// `base` field — the same 422 whether the value differs or not — so this
-    /// has to happen before a run retargets one rather than after it fails.
+    /// The base ref is the case with a subtlety. GitHub refuses any `PATCH` to
+    /// a stacked pull request that carries a `base` field — the same 422
+    /// whether the value differs or not — so this has to happen before a run
+    /// retargets one rather than after it fails.
     /// Asking first also keeps the decision on facts this side of the network:
     /// `diff` knows exactly where it is about to send a base, whereas telling
     /// that refusal apart from every other 422 means matching GitHub's prose,
@@ -882,6 +955,84 @@ fn unmerged_members(stack: &Stack) -> Vec<u64> {
         .filter(|pull_request| !pull_request.is_merged())
         .map(|pull_request| pull_request.number)
         .collect()
+}
+
+/// Why a stack is being dissolved, as something to tell the user.
+///
+/// An enum rather than the sentence itself so that every word jj-spr says about
+/// dissolving a stack is written here, beside [`Reconciliation::describe`], in
+/// one voice. The callers are two command modules, and a `&str` parameter would
+/// have each of them keeping its own copy of prose about a subject neither owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DissolveReason {
+    /// A base ref is about to move, and a stack owns its members' base refs.
+    ToMoveABase,
+
+    /// A pull request the stack holds is being landed.
+    ToLand,
+
+    /// The pull request below this one has landed, so this one belongs on the
+    /// master branch now.
+    ToFollowALanding,
+}
+
+impl DissolveReason {
+    /// A clause completing "Dissolved GitHub stack #N: ...".
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ToMoveABase => {
+                "a stacked pull request's base cannot be changed. A stack is registered again \
+                 at the end of this run, under a new number."
+            }
+            Self::ToLand => {
+                "a pull request a stack holds cannot be merged on its own. GitHub's ordinary \
+                 merge refuses it outright, and its stack merge lands every pull request \
+                 below this one as well and then rebases the one above onto the master \
+                 branch, closing it. So the stack comes apart and this pull request is merged \
+                 by itself. Run `jj spr diff` afterwards to register what is left as a stack \
+                 again, under a new number."
+            }
+            Self::ToFollowALanding => {
+                "a stacked pull request's base cannot be changed, and this one is being \
+                 pointed at the master branch now that the pull request below it has landed. \
+                 Run `jj spr diff` to register what is left as a stack again, under a new \
+                 number."
+            }
+        }
+    }
+}
+
+/// Dissolve any stack holding pull request `number`, releasing every member.
+///
+/// A no-op when GitHub is not drawing the stack, which is what makes this safe to
+/// call wherever a stack would be in the way without asking what mode the run
+/// is in.
+///
+/// Named for what it does rather than for what the caller wanted, because the
+/// two are not the same size: there is no way to take one pull request out of a
+/// stack, so this releases every member — including pull requests the caller
+/// knows nothing about and cannot put back. See [`StackSession::unlock_base`],
+/// and [`StackSession::orphaned`] for what nothing put back — with
+/// [`left_unstacked`] and [`StackSession::orphaned_pull_requests`] as `land`'s
+/// and `diff`'s ways of saying it.
+pub async fn dissolve_any_stack_holding(
+    stacks: Option<&mut StackSession>,
+    gh: &GitHub,
+    number: u64,
+    why: DissolveReason,
+) -> Result<()> {
+    let Some(session) = stacks else {
+        return Ok(());
+    };
+
+    if let BaseUnlock::Dissolved { stack_number } = session.unlock_base(gh, number).await? {
+        output(
+            "🧱",
+            &format!("Dissolved GitHub stack #{stack_number}: {}", why.describe()),
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Tests for the stack registration.
@@ -1508,6 +1659,77 @@ mod tests {
             .is_notable(),
             "a stack about to be destroyed must be reported"
         );
+    }
+
+    /// A pull request that has landed is out of every stack for good and cannot
+    /// be put back into one, so the stack it was dissolved out of did not lose
+    /// it. `land` dissolves while it is still open, so without this every land
+    /// would end by telling the user to restack what it had just landed.
+    #[test]
+    fn a_pull_request_that_landed_is_not_something_the_stack_lost() {
+        let mut session = StackSession::new();
+        session.dissolved = vec![vec![73, 74, 75]];
+
+        session.merged(74);
+
+        assert_eq!(session.orphaned(), vec![73, 75]);
+        assert_eq!(
+            session.orphaned_pull_requests(),
+            Some(Reconciliation::Orphaned {
+                pull_requests: vec![73, 75]
+            })
+        );
+
+        session.merged(73);
+        session.merged(75);
+        assert!(session.orphaned().is_empty());
+        assert_eq!(session.orphaned_pull_requests(), None);
+    }
+
+    /// Every sentence jj-spr says about dissolving a stack is written in one
+    /// place, and each has to read as a clause completing "Dissolved GitHub
+    /// stack #N: ...".
+    #[test]
+    fn every_reason_for_dissolving_a_stack_reads_as_a_clause() {
+        for why in [
+            DissolveReason::ToMoveABase,
+            DissolveReason::ToLand,
+            DissolveReason::ToFollowALanding,
+        ] {
+            let clause = why.describe();
+
+            assert!(
+                clause.starts_with(char::is_lowercase),
+                "{why:?} has to continue the sentence, not start one: {clause}"
+            );
+            assert!(
+                clause.ends_with('.'),
+                "{why:?} has to finish the sentence: {clause}"
+            );
+        }
+
+        // The one that has to say what it costs: landing takes the stack away
+        // for good, and `diff` is what puts one back.
+        assert!(DissolveReason::ToLand.describe().contains("jj spr diff"));
+    }
+
+    /// Only `land` says this, and only about what its dissolving left behind —
+    /// which can span more than one stack, and can never be put back as one.
+    #[test]
+    fn what_a_land_left_unstacked_is_reported_in_the_plural() {
+        let sentence = left_unstacked(&[73, 75]).expect("there is something to report");
+
+        assert!(sentence.contains("#73, #75"), "{sentence}");
+        assert!(
+            sentence.contains("stacks this land took apart"),
+            "a land can take apart more than one stack: {sentence}"
+        );
+        assert!(
+            sentence.contains("jj spr diff"),
+            "nothing but `diff` puts a stack back: {sentence}"
+        );
+
+        assert_eq!(left_unstacked(&[]), None);
     }
 
     /// One chain registering must not silence what a different chain lost: the
