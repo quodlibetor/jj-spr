@@ -69,7 +69,8 @@ jj spr diff -m "Address review comments"
 
 ### `jj spr land`
 
-Land (squash-merge) an approved pull request.
+Land an approved pull request: squash-merge it, or put it in the merge queue of
+the default branch where that branch has one.
 
 **Usage:**
 ```bash
@@ -79,6 +80,8 @@ jj spr land [OPTIONS]
 **Options:**
 - `-r, --revision <REV>` - Revision to land (default: `@`)
 - `--cherry-pick` - Land PR independently (for use with stacks)
+- `--queue` - Put the PR in the merge queue, whatever `spr.landStrategy` says
+- `--no-queue` - Squash-merge the PR now, whatever `spr.landStrategy` says
 
 **Examples:**
 ```bash
@@ -97,6 +100,28 @@ jj spr land --cherry-pick -r <change-id>
 jj git fetch
 jj rebase -r @ -d main@origin
 ```
+
+#### Merge queues
+
+A branch with a merge queue takes no merge that does not go through the queue,
+so `jj spr land` asks GitHub whether the default branch has one and queues the
+pull request where it does. Nothing needs configuring for that;
+[`spr.landStrategy`](./configuration.md) is for saying so explicitly, or for
+merging directly as somebody entitled to bypass the queue.
+
+A queued land ends as soon as the pull request is in the queue. GitHub merges it
+later, so unlike a squash-merge, `jj spr land` does not delete the pull request
+branches — the queue merges the pull request branch, and deleting it would take
+the pull request out of the queue. Fetch and rebase once GitHub has merged it,
+and use `jj spr cleanup --confirm` to remove the branches left behind, which it
+sees as orphans once GitHub has closed the pull request.
+
+A merge queue exists for the default branch and takes a pull request based on
+it, so a stacked pull request is retargeted at the default branch before it is
+queued, exactly as it is before a squash-merge. Where the local change has
+parents that have not landed, that means the queue merges those parents'
+commits too, and `jj spr land` warns before it queues. Land the pull requests
+below it first to avoid that.
 
 ---
 

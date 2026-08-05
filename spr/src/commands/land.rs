@@ -9,12 +9,115 @@ use indoc::formatdoc;
 use std::{io::Write, process::Stdio, time::Duration};
 
 use crate::{
+    config::LandStrategy,
     error::{Error, Result, ResultExt},
-    github::{PullRequestState, PullRequestUpdate, ReviewStatus},
+    github::{MergeQueue, PullRequestState, PullRequestUpdate, ReviewStatus},
     message::{MessageSection, build_github_body_for_merging},
     output::{output, write_commit_title},
     utils::run_command,
 };
+
+/// What this land will ask GitHub for, once it is known which of the two the
+/// default branch takes.
+enum Landing {
+    /// Squash-merge the Pull Request now.
+    Merge,
+    /// Put the Pull Request in this merge queue and leave the merging to
+    /// GitHub.
+    Queue(MergeQueue),
+}
+
+/// The strategy to land under, given the flags this land was passed and the
+/// configured one.
+///
+/// The flags name a strategy for one land rather than switching something on:
+/// `--no-queue` is how a caller who may bypass the queue says to merge now in a
+/// repository configured to queue, which is the same thing `spr.landStrategy =
+/// merge` says for every land. Neither flag leaves the setting to decide.
+///
+/// Passing both is refused by `clap`, so the order the two are read in here
+/// never decides anything.
+fn resolve_land_strategy(queue: bool, no_queue: bool, configured: LandStrategy) -> LandStrategy {
+    match (queue, no_queue) {
+        (true, _) => LandStrategy::Queue,
+        (_, true) => LandStrategy::Merge,
+        _ => configured,
+    }
+}
+
+/// Work out what this land will ask GitHub for, asking GitHub itself where the
+/// strategy is to be decided by what the default branch allows.
+///
+/// A branch either has a merge queue, and then takes no merge that does not go
+/// through it, or has none, and then there is no queue to join. So under
+/// [`LandStrategy::Auto`] the branch decides, and under [`LandStrategy::Queue`]
+/// a branch without a queue refuses the land here — with a sentence about the
+/// branch, which is where the problem is, rather than through the mutation
+/// failing further down.
+async fn decide_landing(
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+    strategy: LandStrategy,
+) -> Result<Landing> {
+    let branch_name = config.master_ref.branch_name();
+
+    Ok(match strategy {
+        // Nothing is asked of GitHub here: a caller entitled to bypass the
+        // queue may merge into a branch that has one, and it is GitHub's answer
+        // to the merge itself that says whether this caller is.
+        LandStrategy::Merge => Landing::Merge,
+        LandStrategy::Queue => match gh.get_merge_queue(branch_name).await? {
+            Some(queue) => Landing::Queue(queue),
+            None => {
+                return Err(Error::new(format!(
+                    "spr.landStrategy asks for the merge queue, but GitHub keeps no merge queue \
+                     for branch '{branch_name}'. Set spr.landStrategy to 'auto' or 'merge', or \
+                     pass --no-queue, to merge the Pull Request instead."
+                )));
+            }
+        },
+        LandStrategy::Auto => match gh.get_merge_queue(branch_name).await? {
+            Some(queue) => Landing::Queue(queue),
+            None => Landing::Merge,
+        },
+    })
+}
+
+/// Whether `commit` sits directly on the master branch, with no change of its
+/// own below it that has not landed.
+///
+/// Asked of the local stack rather than of what the Pull Request is based on,
+/// because the two answer different questions. A Pull Request keeps whatever
+/// base branch it was given until something moves it, so a change at the bottom
+/// of what was once a stack still points at a generated base branch long after
+/// everything below it landed. That is not a change with unlanded parents, and
+/// it is unlanded parents this asks about.
+fn sits_directly_on_master(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    commit: &crate::jj::PreparedCommit,
+) -> Result<bool> {
+    Ok(jj.get_master_base_for_commit(config, commit.oid)? == commit.parent_oid)
+}
+
+/// How long a wait of `seconds` is, in words, for a report to a person.
+///
+/// Rounded to the minute throughout: these are GitHub's own estimates of how
+/// long a queue will take to reach a Pull Request, and a figure to the second
+/// would claim a precision the estimate does not have.
+fn describe_wait(seconds: i64) -> String {
+    let minutes = (seconds + 30) / 60;
+    let (hours, minutes_past_hour) = (minutes / 60, minutes % 60);
+
+    match (hours, minutes_past_hour) {
+        (0, 0) => "less than a minute".to_string(),
+        (0, 1) => "about a minute".to_string(),
+        (0, minutes) => format!("about {minutes} minutes"),
+        (1, 0) => "about an hour".to_string(),
+        (hours, 0) => format!("about {hours} hours"),
+        (hours, minutes) => format!("about {hours}h {minutes}m"),
+    }
+}
 
 /// Wait for GitHub to work out whether it will merge Pull Request `number`, and
 /// hold this land to that answer.
@@ -117,6 +220,16 @@ pub struct LandOptions {
     #[clap(long)]
     cherry_pick: bool,
 
+    /// Put the Pull Request in the merge queue of the default branch and leave
+    /// the merging to GitHub, whatever spr.landStrategy says
+    #[clap(long, conflicts_with = "no_queue")]
+    queue: bool,
+
+    /// Squash-merge the Pull Request now rather than putting it in the merge
+    /// queue of the default branch, whatever spr.landStrategy says
+    #[clap(long)]
+    no_queue: bool,
+
     /// Jujutsu revision to operate on (if not specified, uses '@')
     #[clap(short = 'r', long)]
     revision: Option<String>,
@@ -184,6 +297,39 @@ pub async fn land(
     )
     .await
     .reword("git fetch failed".to_string())?;
+
+    // What this land is going to ask for, settled before it asks GitHub for
+    // anything else. Nothing below this changes the answer, and a land refused
+    // for wanting a queue the default branch does not keep should be refused
+    // before it has moved a base.
+    let landing = decide_landing(
+        gh,
+        config,
+        resolve_land_strategy(opts.queue, opts.no_queue, config.land_strategy),
+    )
+    .await?;
+
+    // Retargeting a Pull Request at the master branch says it is to be merged
+    // into that branch as it stands. Where the local change has parents that
+    // have not landed, what that merges is this change *and* those parents,
+    // because the Pull Request branch carries them.
+    //
+    // Said only of a queued land, and as a warning rather than a refusal.
+    // Nothing about the merge is different — a merged land has moved the base
+    // for the same reason since long before there was a queue — but a queued
+    // one is answered by GitHub minutes or hours later, by which time there is
+    // nothing left to read the wrong ordering off, so it is worth saying at the
+    // one moment somebody is watching.
+    if let Landing::Queue(_) = landing
+        && !sits_directly_on_master(jj, config, &prepared_commit)?
+    {
+        output(
+            "⚠️",
+            "This change has parents that have not landed. Queueing this Pull \
+             Request asks the merge queue to merge those parents' commits along \
+             with it. Land the Pull Requests below this one first to avoid that.",
+        )?;
+    }
 
     // TODO: Implement Jujutsu-native cherry-pick and merge validation
     // For now, we'll trust GitHub's merge validation and skip local validation
@@ -268,6 +414,55 @@ pub async fn land(
             error,
         )
         .await;
+    }
+
+    // Where the master branch has a merge queue, the land ends by joining it.
+    //
+    // Everything below this point is about a Pull Request that has been merged:
+    // the branches it used are gone, and the commit it landed can be fetched.
+    // None of that has happened yet for a queued Pull Request, and the branch
+    // in particular must stay — the queue merges that branch, and deleting it
+    // would take the Pull Request out of the queue rather than tidy up after
+    // it. What GitHub does when the queue reaches the Pull Request is left for
+    // a later `jj spr diff` or `jj spr cleanup` to notice.
+    if let Landing::Queue(queue) = landing {
+        let entry = match gh
+            .enqueue_pull_request(&pull_request.node_id, pr_head_oid)
+            .await
+        {
+            Ok(entry) => entry,
+            Err(error) => {
+                return abandon_land(
+                    gh,
+                    pull_request_number,
+                    "Not adding this Pull Request to the merge queue",
+                    retargeted_from,
+                    error,
+                )
+                .await;
+            }
+        };
+
+        // GitHub's own estimate where it has one, and the entry's rather than
+        // the queue's: the queue was asked about before this Pull Request
+        // joined it, so its estimate is for whoever queues next.
+        let wait = match entry.estimated_time_to_merge {
+            Some(seconds) => format!(", {}", describe_wait(seconds)),
+            None => String::new(),
+        };
+
+        output(
+            "🚦",
+            &format!("Queued for merge at position {}{}", entry.position, wait),
+        )?;
+        output("🔗", &queue.url)?;
+        output(
+            "ℹ️ ",
+            "The merge queue merges this Pull Request when it reaches it. Its \
+             branches stay until then.",
+        )?;
+
+        return Ok(());
     }
 
     // We have checked that merging the Pull Request branch into the master
@@ -388,7 +583,6 @@ pub async fn land(
 
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +625,45 @@ mod tests {
                 value
             );
         }
+    }
+
+    #[test]
+    fn test_land_strategy_falls_back_to_the_configured_one() {
+        for configured in [LandStrategy::Auto, LandStrategy::Merge, LandStrategy::Queue] {
+            assert_eq!(resolve_land_strategy(false, false, configured), configured);
+        }
+    }
+
+    #[test]
+    fn test_land_strategy_flags_beat_the_configured_one() {
+        for configured in [LandStrategy::Auto, LandStrategy::Merge, LandStrategy::Queue] {
+            assert_eq!(
+                resolve_land_strategy(true, false, configured),
+                LandStrategy::Queue
+            );
+            assert_eq!(
+                resolve_land_strategy(false, true, configured),
+                LandStrategy::Merge
+            );
+        }
+    }
+
+    #[test]
+    fn test_describe_wait_rounds_to_the_nearest_minute() {
+        assert_eq!(describe_wait(0), "less than a minute");
+        assert_eq!(describe_wait(29), "less than a minute");
+        assert_eq!(describe_wait(30), "about a minute");
+        assert_eq!(describe_wait(89), "about a minute");
+        assert_eq!(describe_wait(90), "about 2 minutes");
+        assert_eq!(describe_wait(12 * 60), "about 12 minutes");
+    }
+
+    #[test]
+    fn test_describe_wait_counts_hours_once_there_are_any() {
+        assert_eq!(describe_wait(59 * 60), "about 59 minutes");
+        assert_eq!(describe_wait(60 * 60), "about an hour");
+        assert_eq!(describe_wait(65 * 60), "about 1h 5m");
+        assert_eq!(describe_wait(2 * 60 * 60), "about 2 hours");
+        assert_eq!(describe_wait(150 * 60), "about 2h 30m");
     }
 }

@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first commit in a pull reuqest now uses the local commit's description.
 - `jj spr diff` remembers when PRs were created as cherry picks so
   `--cherry-pick` doesn't need to be specified each time the PR is updated.
+- `jj spr land` puts a pull request in the merge queue where the default branch
+  has one, instead of asking for a merge GitHub would refuse. The pull request
+  is retargeted at the default branch first, as it is before a squash-merge,
+  and a land whose local change has parents that have not landed says so before
+  queueing, because the queue will merge those parents' commits too. A queued
+  land stops there: GitHub merges later, so the pull request branches are left
+  in place — the queue merges the pull request branch — and `jj spr cleanup`
+  removes them once it has. `--queue` and `--no-queue` choose for one land.
 - `spr.landStrategy` chooses how `jj spr land` lands a pull request. `merge`
   squash-merges it there and then, which is what jj-spr has always done, and
   `queue` puts it in the merge queue GitHub keeps for the default branch. The
