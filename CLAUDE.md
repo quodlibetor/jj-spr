@@ -154,5 +154,6 @@ Stored in git config under `spr.*` namespace:
 - `spr.githubRepository` - Owner/repo name
 - `spr.branchPrefix` - Prefix for generated branches (default: `spr/`)
 - `spr.requireApproval` - Require PR approval before landing
+- `spr.landStrategy` - How `jj spr land` lands a pull request: `merge` squash-merges it there and then, `queue` puts it in the merge queue GitHub keeps for the default branch, and `auto` (the default) asks GitHub which of the two that branch allows
 - `spr.githubHost` - Custom GitHub Enterprise host
 - `spr.githubToken` - GitHub API token (typically stored via `jj spr init`)

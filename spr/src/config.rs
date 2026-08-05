@@ -7,7 +7,69 @@
 
 use std::collections::HashSet;
 
-use crate::{error::Result, github::GitHubBranch, utils::slugify};
+use crate::{
+    error::{Error, Result},
+    github::GitHubBranch,
+    utils::slugify,
+};
+
+/// How `jj spr land` asks GitHub to land a pull request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LandStrategy {
+    /// Ask GitHub which of the two below the default branch allows, and use
+    /// that one.
+    ///
+    /// The default, and the answer for nearly every repository: a branch with a
+    /// merge queue takes no merge that does not go through it, and a branch
+    /// without one has no queue to join, so the branch decides and there is
+    /// nothing left to configure.
+    #[default]
+    Auto,
+    /// Squash-merge the pull request now.
+    Merge,
+    /// Put the pull request in the merge queue of the default branch, and leave
+    /// the merging to GitHub.
+    Queue,
+}
+
+impl std::str::FromStr for LandStrategy {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "merge" => Ok(Self::Merge),
+            "queue" => Ok(Self::Queue),
+            other => Err(Error::new(format!(
+                "spr.landStrategy must be 'auto', 'merge' or 'queue', but is '{other}'"
+            ))),
+        }
+    }
+}
+
+impl LandStrategy {
+    /// Every strategy, in the order `jj spr init` offers them: the default
+    /// first, then the two it chooses between.
+    ///
+    /// Kept next to the enum rather than in `init`, so that a strategy added
+    /// here is offered rather than quietly left out of the one place that asks
+    /// about it.
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Merge, Self::Queue];
+
+    /// The value `spr.landStrategy` takes for this strategy.
+    ///
+    /// The inverse of the [`FromStr`](std::str::FromStr) above, and here rather
+    /// than spelled out wherever a strategy is written: `jj spr init` offers
+    /// these names and then stores the one that was picked, so the two
+    /// directions have to agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Merge => "merge",
+            Self::Queue => "queue",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -17,6 +79,8 @@ pub struct Config {
     pub master_ref: GitHubBranch,
     pub branch_prefix: String,
     pub require_approval: bool,
+    /// How a land asks GitHub to land a pull request. See [`LandStrategy`].
+    pub land_strategy: LandStrategy,
 }
 
 impl Config {
@@ -37,6 +101,7 @@ impl Config {
             master_ref,
             branch_prefix,
             require_approval,
+            land_strategy: LandStrategy::default(),
         }
     }
 
@@ -341,6 +406,62 @@ mod tests {
             std::path::Path::new("/nonexistent/path"),
         );
         assert!(result.is_err(), "Should fail for invalid repo path");
+    }
+
+    #[test]
+    fn test_land_strategy_default_is_auto() {
+        assert_eq!(config_factory().land_strategy, LandStrategy::Auto);
+        assert_eq!(LandStrategy::default(), LandStrategy::Auto);
+    }
+
+    #[test]
+    fn test_land_strategy_parses_each_name() {
+        assert_eq!("auto".parse::<LandStrategy>().unwrap(), LandStrategy::Auto);
+        assert_eq!(
+            "merge".parse::<LandStrategy>().unwrap(),
+            LandStrategy::Merge
+        );
+        assert_eq!(
+            "queue".parse::<LandStrategy>().unwrap(),
+            LandStrategy::Queue
+        );
+        // Config files are written by hand, so neither surrounding space nor
+        // capitalisation is a reason to refuse one.
+        assert_eq!(
+            " Queue\n".parse::<LandStrategy>().unwrap(),
+            LandStrategy::Queue
+        );
+    }
+
+    /// What `jj spr init` offers is what it writes into the configuration, so
+    /// every name it can store has to be one the setting reads back — and the
+    /// list it offers has to hold every strategy, or a strategy exists that
+    /// nothing asks about.
+    #[test]
+    fn every_land_strategy_is_offered_under_a_name_that_parses_back() {
+        for strategy in LandStrategy::ALL {
+            assert_eq!(strategy.as_str().parse::<LandStrategy>().unwrap(), strategy);
+        }
+
+        for strategy in [LandStrategy::Auto, LandStrategy::Merge, LandStrategy::Queue] {
+            assert!(
+                LandStrategy::ALL.contains(&strategy),
+                "{strategy:?} is not offered by `jj spr init`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_land_strategy_rejects_anything_else() {
+        let error = "merge-queue".parse::<LandStrategy>().unwrap_err();
+        // The value that was rejected belongs in the message: the setting can
+        // come from any of several config files, and knowing which word to look
+        // for is most of finding the one that holds it.
+        assert!(
+            error.messages().iter().any(|m| m.contains("merge-queue")),
+            "expected the rejected value in {:?}",
+            error.messages()
+        );
     }
 
     #[test]

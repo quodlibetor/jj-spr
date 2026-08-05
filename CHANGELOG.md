@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first commit in a pull reuqest now uses the local commit's description.
 - `jj spr diff` remembers when PRs were created as cherry picks so
   `--cherry-pick` doesn't need to be specified each time the PR is updated.
+- `spr.landStrategy` chooses how `jj spr land` lands a pull request. `merge`
+  squash-merges it there and then, which is what jj-spr has always done, and
+  `queue` puts it in the merge queue GitHub keeps for the default branch. The
+  default, `auto`, asks GitHub which of the two that branch allows, so a
+  repository that requires a merge queue needs no configuration at all.
+  `jj spr init` asks for it.
 
 ## [0.1.0] - 2025-11-15
 

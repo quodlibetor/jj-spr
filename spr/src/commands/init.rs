@@ -9,7 +9,9 @@ use indoc::formatdoc;
 use lazy_regex::regex;
 
 use crate::{
-    config::{AuthTokenSource, get_auth_token_with_source, set_jj_config},
+    config::{
+        AuthTokenSource, LandStrategy, get_auth_token_with_source, get_config_value, set_jj_config,
+    },
     error::{Error, Result, ResultExt},
     output::output,
 };
@@ -198,7 +200,64 @@ pub async fn init() -> Result<()> {
 
     set_jj_config("spr.branchPrefix", &branch_prefix, &path)?;
 
+    // How a pull request is landed
+
+    console::Term::stdout().write_line("")?;
+
+    output(
+        "❓",
+        &formatdoc!(
+            "How should `jj spr land` land a pull request?
+             'auto' asks GitHub which of the other two the default branch \
+             allows, and is right for nearly every repository: a branch with a \
+             merge queue takes no merge that does not go through it, and a \
+             branch without one has no queue to join.
+             'merge' squash-merges the pull request there and then.
+             'queue' puts it in the merge queue GitHub keeps for the default \
+             branch, and leaves the merging to GitHub."
+        ),
+    )?;
+
+    let land_strategy = select_one(
+        "Land strategy",
+        &LandStrategy::ALL,
+        LandStrategy::as_str,
+        get_config_value("spr.landStrategy", &config)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    )?;
+
+    set_jj_config("spr.landStrategy", land_strategy.as_str(), &path)?;
+
     Ok(())
+}
+
+/// Ask which of `options` to use, starting on `current` and returning the one
+/// that was picked.
+///
+/// The strategy settings are all of this shape — a small closed set of names
+/// that round-trip through the configuration — and the part worth not
+/// repeating is starting the cursor on what is configured already, so that
+/// running `jj spr init` again over an existing repository and pressing Enter
+/// through it changes nothing.
+fn select_one<T: Copy + PartialEq>(
+    prompt: &str,
+    options: &[T],
+    name: impl Fn(T) -> &'static str,
+    current: T,
+) -> Result<T> {
+    let chosen = dialoguer::Select::new()
+        .with_prompt(prompt)
+        .items(options.iter().map(|&option| name(option)))
+        .default(
+            options
+                .iter()
+                .position(|&option| option == current)
+                .unwrap_or(0),
+        )
+        .interact()?;
+
+    Ok(options[chosen])
 }
 
 fn validate_branch_prefix(branch_prefix: &str) -> Result<()> {
