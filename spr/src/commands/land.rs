@@ -16,6 +16,100 @@ use crate::{
     utils::run_command,
 };
 
+/// Wait for GitHub to work out whether it will merge Pull Request `number`, and
+/// hold this land to that answer.
+///
+/// Two things have to be true: the Pull Request still has to have the head
+/// `head_oid` this land is about, and GitHub has to call it mergeable. A Pull
+/// Request GitHub still reports as based on something other than the master
+/// branch is one it has not caught up with, so that is waited for rather than
+/// judged.
+///
+/// The retrying is waiting for GitHub to catch up rather than for the Pull
+/// Request to change. GitHub works the verdict out lazily and sends it back to
+/// undecided whenever the Pull Request changes, so a land that has just
+/// retargeted one asks before there is anything to read. After ten seconds of
+/// no answer the land gives up rather than guess.
+async fn wait_for_mergeability(
+    gh: &crate::github::GitHub,
+    number: u64,
+    head_oid: git2::Oid,
+) -> Result<()> {
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+
+        let mergeability = gh.get_pull_request_mergeability(number).await?;
+
+        if mergeability.head_oid != head_oid {
+            return Err(Error::new(formatdoc!(
+                "The Pull Request seems to have been updated externally.
+                     Please try again!"
+            )));
+        }
+
+        if mergeability.base.is_master_branch() && mergeability.mergeable.is_some() {
+            if mergeability.mergeable != Some(true) {
+                return Err(Error::new(formatdoc!(
+                    "GitHub concluded the Pull Request is not mergeable at \
+                    this point. Please rebase your changes and try again!"
+                )));
+            }
+
+            // TODO: Implement Jujutsu-native commit fetching and tree comparison
+            // For now, skip the merge commit validation
+            // This would need to be rewritten using jj commands
+
+            return Ok(());
+        }
+
+        if attempts >= 10 {
+            // After ten failed attempts we give up.
+            return Err(Error::new(
+                "GitHub Pull Request did not update. Please try again!",
+            ));
+        }
+
+        // Wait one second before retrying
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Give up on the land: say so, put the base back if this land moved it, and
+/// hand back the failure to return.
+///
+/// `headline` is what went wrong, in the words of the step that was reached.
+///
+/// `retargeted_from` is the base this land pointed at the master branch, or
+/// `None` where it moved none. That is the whole of the rollback: nothing else
+/// this land has done is undoable.
+async fn abandon_land(
+    gh: &crate::github::GitHub,
+    number: u64,
+    headline: &str,
+    retargeted_from: Option<&crate::github::GitHubBranch>,
+    mut error: Error,
+) -> Result<()> {
+    output("❌", headline)?;
+
+    if let Some(base) = retargeted_from
+        && let Err(rollback_error) = gh
+            .update_pull_request(
+                number,
+                PullRequestUpdate {
+                    base: Some(base.on_github().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+    {
+        error.push(format!("{}", rollback_error));
+    }
+
+    Err(error)
+}
+
 #[derive(Debug, clap::Parser)]
 pub struct LandOptions {
     /// Merge a Pull Request that was created or updated with spr diff
@@ -159,108 +253,64 @@ pub async fn land(
         .await?;
     }
 
-    // Check whether GitHub says this PR is mergeable. This happens in a
-    // retry-loop because recent changes to the Pull Request can mean that
-    // GitHub has not finished the mergeability check yet.
-    let mut attempts = 0;
-    let result = loop {
-        attempts += 1;
+    // The base this land moved onto the master branch, and so the base a
+    // failure from here on has to put back. `None` where the Pull Request was
+    // already on the master branch and the block above moved nothing.
+    let retargeted_from = (!base_is_master).then_some(&pull_request.base);
 
-        let mergeability = gh
-            .get_pull_request_mergeability(pull_request_number)
-            .await?;
+    // Check whether GitHub says this PR is mergeable.
+    if let Err(error) = wait_for_mergeability(gh, pull_request_number, pr_head_oid).await {
+        return abandon_land(
+            gh,
+            pull_request_number,
+            "GitHub Pull Request merge failed",
+            retargeted_from,
+            error,
+        )
+        .await;
+    }
 
-        if mergeability.head_oid != pr_head_oid {
-            break Err(Error::new(formatdoc!(
-                "The Pull Request seems to have been updated externally.
-                     Please try again!"
-            )));
-        }
-
-        if mergeability.base.is_master_branch() && mergeability.mergeable.is_some() {
-            if mergeability.mergeable != Some(true) {
-                break Err(Error::new(formatdoc!(
-                    "GitHub concluded the Pull Request is not mergeable at \
-                    this point. Please rebase your changes and try again!"
-                )));
+    // We have checked that merging the Pull Request branch into the master
+    // branch produces the intended result, and that's independent of whether we
+    // used a base branch with this Pull Request or not. We have made sure the
+    // target of the Pull Request is set to the master branch. So let GitHub do
+    // the merge now!
+    let merged = octocrab::instance()
+        .pulls(&config.owner, &config.repo)
+        .merge(pull_request_number)
+        .method(octocrab::params::pulls::MergeMethod::Squash)
+        .title(pull_request.title)
+        .message(build_github_body_for_merging(&pull_request.sections))
+        .sha(format!("{}", pr_head_oid))
+        .send()
+        .await
+        .convert()
+        .context(format!(
+            "squash-merging PR #{} (head {})",
+            pull_request_number, pr_head_oid
+        ))
+        .and_then(|merge| {
+            if merge.merged {
+                Ok(merge)
+            } else {
+                Err(Error::new(formatdoc!(
+                    "GitHub Pull Request merge failed: {}",
+                    merge.message.unwrap_or_default()
+                )))
             }
+        });
 
-            // TODO: Implement Jujutsu-native commit fetching and tree comparison
-            // For now, skip the merge commit validation
-            // This would need to be rewritten using jj commands
-
-            break Ok(());
-        }
-
-        if attempts >= 10 {
-            // After ten failed attempts we give up.
-            break Err(Error::new(
-                "GitHub Pull Request did not update. Please try again!",
-            ));
-        }
-
-        // Wait one second before retrying
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    };
-
-    let result = match result {
-        Ok(()) => {
-            // We have checked that merging the Pull Request branch into the master
-            // branch produces the intended result, and that's independent of whether we
-            // used a base branch with this Pull Request or not. We have made sure the
-            // target of the Pull Request is set to the master branch. So let GitHub do
-            // the merge now!
-            octocrab::instance()
-                .pulls(&config.owner, &config.repo)
-                .merge(pull_request_number)
-                .method(octocrab::params::pulls::MergeMethod::Squash)
-                .title(pull_request.title)
-                .message(build_github_body_for_merging(&pull_request.sections))
-                .sha(format!("{}", pr_head_oid))
-                .send()
-                .await
-                .convert()
-                .context(format!(
-                    "squash-merging PR #{} (head {})",
-                    pull_request_number, pr_head_oid
-                ))
-                .and_then(|merge| {
-                    if merge.merged {
-                        Ok(merge)
-                    } else {
-                        Err(Error::new(formatdoc!(
-                            "GitHub Pull Request merge failed: {}",
-                            merge.message.unwrap_or_default()
-                        )))
-                    }
-                })
-        }
-        Err(err) => Err(err),
-    };
-
-    let merge = match result {
+    let merge = match merged {
         Ok(merge) => merge,
-        Err(mut error) => {
-            output("❌", "GitHub Pull Request merge failed")?;
-
-            // If we changed the target branch of the Pull Request earlier, then
-            // undo this change now.
-            if !base_is_master {
-                let result = gh
-                    .update_pull_request(
-                        pull_request_number,
-                        PullRequestUpdate {
-                            base: Some(pull_request.base.on_github().to_string()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                if let Err(e) = result {
-                    error.push(format!("{}", e));
-                }
-            }
-
-            return Err(error);
+        Err(error) => {
+            return abandon_land(
+                gh,
+                pull_request_number,
+                "GitHub Pull Request merge failed",
+                retargeted_from,
+                error,
+            )
+            .await;
         }
     };
 
