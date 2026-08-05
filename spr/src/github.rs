@@ -27,6 +27,9 @@ pub struct GitHub {
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub number: u64,
+    /// GitHub's own identifier for the pull request, which is what its GraphQL
+    /// API takes where the REST API takes [`PullRequest::number`].
+    pub node_id: String,
     pub state: PullRequestState,
     pub title: String,
     pub body: Option<String>,
@@ -121,6 +124,19 @@ pub struct MergeQueue {
     pub next_entry_estimated_time_to_merge: Option<i64>,
 }
 
+/// One Pull Request's place in a merge queue.
+#[derive(Debug, Clone)]
+pub struct MergeQueueEntry {
+    /// Where GitHub says the entry sits in the queue, in GitHub's own
+    /// numbering. Passed through as given: the API documents the field as "the
+    /// position of this entry in the queue" and does not say what it counts
+    /// from, so renumbering it would be inventing a fact.
+    pub position: i64,
+    /// Seconds GitHub estimates this entry will wait, where it will estimate at
+    /// all.
+    pub estimated_time_to_merge: Option<i64>,
+}
+
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "src/gql/schema.docs.graphql",
@@ -156,6 +172,14 @@ pub struct OpenPullRequestBranchesQuery;
     response_derives = "Debug"
 )]
 pub struct MergeQueueQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/enqueue_pull_request_mutation.graphql",
+    response_derives = "Debug"
+)]
+pub struct EnqueuePullRequestMutation;
 
 impl GitHub {
     pub fn new(
@@ -372,6 +396,7 @@ impl GitHub {
 
         Ok::<_, Error>(PullRequest {
             number: pr.number as u64,
+            node_id: pr.id,
             state: match pr.state {
                 pull_request_query::PullRequestState::OPEN => PullRequestState::Open,
                 _ => PullRequestState::Closed,
@@ -545,6 +570,59 @@ impl GitHub {
             url: queue.url,
             next_entry_estimated_time_to_merge: queue.next_entry_estimated_time_to_merge,
         }))
+    }
+
+    /// Put the Pull Request `node_id` names in the merge queue of its base
+    /// branch, and hand back the entry GitHub made for it.
+    ///
+    /// `head_oid` is the commit this enqueue is about. GitHub refuses the
+    /// enqueue where the Pull Request has moved on from it, which is what makes
+    /// this safe to ask for on the strength of a mergeability verdict taken a
+    /// moment earlier: the queue merges later, on its own schedule, so a push
+    /// that arrives in between would otherwise be queued by a land that never
+    /// looked at it.
+    pub async fn enqueue_pull_request(
+        &self,
+        node_id: &str,
+        head_oid: git2::Oid,
+    ) -> Result<MergeQueueEntry> {
+        let variables = enqueue_pull_request_mutation::Variables {
+            pull_request_id: node_id.to_string(),
+            expected_head_oid: format!("{}", head_oid),
+        };
+        let request_body = EnqueuePullRequestMutation::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<enqueue_pull_request_mutation::ResponseData> =
+            res.json().await?;
+
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(
+                "adding the Pull Request to the merge queue failed",
+            ));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+
+        // GitHub answers a successful mutation with the entry it made. An
+        // answer without one means the mutation reported no error and did
+        // nothing, which is not something to report as queued.
+        response_body
+            .data
+            .and_then(|data| data.enqueue_pull_request)
+            .and_then(|payload| payload.merge_queue_entry)
+            .map(|entry| MergeQueueEntry {
+                position: entry.position,
+                estimated_time_to_merge: entry.estimated_time_to_merge,
+            })
+            .ok_or_else(|| {
+                Error::new("GitHub did not say the Pull Request was added to the merge queue")
+            })
     }
 
     pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {
