@@ -106,6 +106,21 @@ pub struct PullRequestMergeability {
     pub merge_commit: Option<git2::Oid>,
 }
 
+/// The merge queue GitHub keeps for one branch.
+///
+/// Its existence is the whole of what a caller has to know to decide how to
+/// land: a branch that has one takes no other kind of merge. The two fields are
+/// for saying so to whoever asked — where the queue is, and how long joining
+/// the back of it looks like taking.
+#[derive(Debug, Clone)]
+pub struct MergeQueue {
+    pub url: String,
+    /// Seconds GitHub estimates a Pull Request queued now would wait, where it
+    /// will estimate at all. It gives no answer for an empty queue, or for one
+    /// it has not seen enough of to guess from.
+    pub next_entry_estimated_time_to_merge: Option<i64>,
+}
+
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "src/gql/schema.docs.graphql",
@@ -114,6 +129,9 @@ pub struct PullRequestMergeability {
 )]
 pub struct PullRequestQuery;
 type GitObjectID = String;
+// Named for GitHub's `URI` scalar, which is how `graphql_client` looks it up.
+#[allow(clippy::upper_case_acronyms)]
+type URI = String;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -130,6 +148,14 @@ pub struct PullRequestMergeabilityQuery;
     response_derives = "Debug"
 )]
 pub struct OpenPullRequestBranchesQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/merge_queue_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct MergeQueueQuery;
 
 impl GitHub {
     pub fn new(
@@ -473,6 +499,52 @@ impl GitHub {
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
         })
+    }
+
+    /// The merge queue GitHub keeps for `branch_name`, or `None` where it keeps
+    /// none.
+    ///
+    /// `None` is the ordinary answer and not a failure: most branches have no
+    /// merge queue, and GitHub says so by returning null for the queue rather
+    /// than by refusing the question. A repository jj-spr cannot see at all
+    /// still fails, because that is a different thing from a branch without a
+    /// queue and a caller reading `None` as "merge it directly" must not be
+    /// told it by a lookup that never reached GitHub.
+    pub async fn get_merge_queue(&self, branch_name: &str) -> Result<Option<MergeQueue>> {
+        let variables = merge_queue_query::Variables {
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
+            branch: branch_name.to_string(),
+        };
+        let request_body = MergeQueueQuery::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<merge_queue_query::ResponseData> = res.json().await?;
+
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(format!(
+                "querying the merge queue of branch '{branch_name}' failed"
+            )));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+
+        let merge_queue = response_body
+            .data
+            .ok_or_else(|| Error::new("failed to fetch the merge queue"))?
+            .repository
+            .ok_or_else(|| Error::new("failed to find repository"))?
+            .merge_queue;
+
+        Ok(merge_queue.map(|queue| MergeQueue {
+            url: queue.url,
+            next_entry_estimated_time_to_merge: queue.next_entry_estimated_time_to_merge,
+        }))
     }
 
     pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {
