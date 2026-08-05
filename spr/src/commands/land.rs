@@ -213,6 +213,96 @@ async fn abandon_land(
     Err(error)
 }
 
+/// Tidy up after GitHub has merged the Pull Request: take away the branches it
+/// used, and fetch what landed so that the caller can rebase onto it.
+///
+/// `base` is the base branch to take away as well, or `None` where the Pull
+/// Request was on the master branch and had none of its own. `merge_sha` is the
+/// commit the merge produced, where GitHub said which it was.
+///
+/// Only ever called once GitHub has merged: the branch deletions are what makes
+/// that so. A Pull Request in a merge queue is merged *from* its branch, so
+/// taking that branch away before the queue reaches it would withdraw the Pull
+/// Request rather than tidy up after it.
+async fn clean_up_after_merging(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    head: &crate::github::GitHubBranch,
+    base: Option<&crate::github::GitHubBranch>,
+    merge_sha: Option<&str>,
+) -> Result<()> {
+    let mut remove_old_branch_child_process = jj
+        .git_command()
+        .arg("push")
+        .arg("--no-verify")
+        .arg("--delete")
+        .arg("--")
+        .arg(&config.remote_name)
+        .arg(head.on_github())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let remove_old_base_branch_child_process = match base {
+        None => None,
+        Some(base) => Some(
+            jj.git_command()
+                .arg("push")
+                .arg("--no-verify")
+                .arg("--delete")
+                .arg("--")
+                .arg(&config.remote_name)
+                .arg(base.on_github())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        ),
+    };
+
+    // Rebase us on top of the now-landed commit
+    if let Some(sha) = merge_sha {
+        // Try this up to three times, because fetching the very moment after
+        // the merge might still not find the new commit.
+        for i in 0..3 {
+            // Fetch current master and the merge commit from GitHub.
+            let git_fetch = jj
+                .git_command()
+                .arg("fetch")
+                .arg("--no-write-fetch-head")
+                .arg("--")
+                .arg(&config.remote_name)
+                .arg(config.master_ref.on_github())
+                .arg(sha)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .await?;
+            if git_fetch.status.success() {
+                break;
+            } else if i == 2 {
+                console::Term::stderr().write_all(&git_fetch.stderr)?;
+                return Err(Error::new("git fetch failed"));
+            }
+        }
+        // TODO: Implement Jujutsu-native rebase after landing
+        // For now, the user will need to manually rebase after landing
+        output(
+            "⚠️",
+            "Please manually rebase your working copy after landing",
+        )?;
+    }
+
+    // Wait for the "git push" to delete the old Pull Request branch to finish,
+    // but ignore the result. GitHub may be configured to delete the branch
+    // automatically, in which case it's gone already and this command fails.
+    remove_old_branch_child_process.wait().await?;
+    if let Some(mut proc) = remove_old_base_branch_child_process {
+        proc.wait().await?;
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, clap::Parser)]
 pub struct LandOptions {
     /// Merge a Pull Request that was created or updated with spr diff
@@ -511,77 +601,14 @@ pub async fn land(
 
     output("🛬", "Landed!")?;
 
-    let mut remove_old_branch_child_process = jj
-        .git_command()
-        .arg("push")
-        .arg("--no-verify")
-        .arg("--delete")
-        .arg("--")
-        .arg(&config.remote_name)
-        .arg(pull_request.head.on_github())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    let remove_old_base_branch_child_process = if base_is_master {
-        None
-    } else {
-        Some(
-            jj.git_command()
-                .arg("push")
-                .arg("--no-verify")
-                .arg("--delete")
-                .arg("--")
-                .arg(&config.remote_name)
-                .arg(pull_request.base.on_github())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        )
-    };
-
-    // Rebase us on top of the now-landed commit
-    if let Some(sha) = merge.sha {
-        // Try this up to three times, because fetching the very moment after
-        // the merge might still not find the new commit.
-        for i in 0..3 {
-            // Fetch current master and the merge commit from GitHub.
-            let git_fetch = jj
-                .git_command()
-                .arg("fetch")
-                .arg("--no-write-fetch-head")
-                .arg("--")
-                .arg(&config.remote_name)
-                .arg(config.master_ref.on_github())
-                .arg(&sha)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-                .await?;
-            if git_fetch.status.success() {
-                break;
-            } else if i == 2 {
-                console::Term::stderr().write_all(&git_fetch.stderr)?;
-                return Err(Error::new("git fetch failed"));
-            }
-        }
-        // TODO: Implement Jujutsu-native rebase after landing
-        // For now, the user will need to manually rebase after landing
-        output(
-            "⚠️",
-            "Please manually rebase your working copy after landing",
-        )?;
-    }
-
-    // Wait for the "git push" to delete the old Pull Request branch to finish,
-    // but ignore the result. GitHub may be configured to delete the branch
-    // automatically, in which case it's gone already and this command fails.
-    remove_old_branch_child_process.wait().await?;
-    if let Some(mut proc) = remove_old_base_branch_child_process {
-        proc.wait().await?;
-    }
-
-    Ok(())
+    clean_up_after_merging(
+        jj,
+        config,
+        &pull_request.head,
+        (!base_is_master).then_some(&pull_request.base),
+        merge.sha.as_deref(),
+    )
+    .await
 }
 #[cfg(test)]
 mod tests {
