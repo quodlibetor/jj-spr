@@ -137,6 +137,22 @@ pub struct MergeQueueEntry {
     pub estimated_time_to_merge: Option<i64>,
 }
 
+/// What has become of a Pull Request that was put in a merge queue.
+///
+/// The three fields together say which of the three things has happened, and no
+/// one of them says it alone. An entry and no merge commit is a Pull Request
+/// still waiting. A merge commit is one the queue merged. Neither an entry nor
+/// a merge commit means the queue let go of it without merging — its checks
+/// failed on the merged result, or somebody took it out — and `state` tells
+/// apart a Pull Request that is still open, and so could be queued again, from
+/// one that was closed.
+#[derive(Debug, Clone)]
+pub struct QueuedPullRequest {
+    pub state: PullRequestState,
+    pub merge_commit: Option<git2::Oid>,
+    pub entry: Option<MergeQueueEntry>,
+}
+
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "src/gql/schema.docs.graphql",
@@ -180,6 +196,14 @@ pub struct MergeQueueQuery;
     response_derives = "Debug"
 )]
 pub struct EnqueuePullRequestMutation;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/merge_queue_entry_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct MergeQueueEntryQuery;
 
 impl GitHub {
     pub fn new(
@@ -623,6 +647,57 @@ impl GitHub {
             .ok_or_else(|| {
                 Error::new("GitHub did not say the Pull Request was added to the merge queue")
             })
+    }
+
+    /// Where Pull Request `number` has got to in the merge queue it was put in.
+    ///
+    /// Asked repeatedly by a land that waits, so it fetches what tells the
+    /// three outcomes apart and nothing else.
+    pub async fn get_queued_pull_request(&self, number: u64) -> Result<QueuedPullRequest> {
+        let variables = merge_queue_entry_query::Variables {
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
+            number: number as i64,
+        };
+        let request_body = MergeQueueEntryQuery::build_query(variables);
+        let res = self
+            .graphql_client
+            .post("https://api.github.com/graphql")
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<merge_queue_entry_query::ResponseData> = res.json().await?;
+
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(format!(
+                "querying PR #{number} in the merge queue failed"
+            )));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+
+        let pr = response_body
+            .data
+            .ok_or_else(|| Error::new("failed to fetch PR"))?
+            .repository
+            .ok_or_else(|| Error::new("failed to find repository"))?
+            .pull_request
+            .ok_or_else(|| Error::new("failed to find PR"))?;
+
+        Ok(QueuedPullRequest {
+            state: match pr.state {
+                merge_queue_entry_query::PullRequestState::OPEN => PullRequestState::Open,
+                _ => PullRequestState::Closed,
+            },
+            merge_commit: pr
+                .merge_commit
+                .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
+            entry: pr.merge_queue_entry.map(|entry| MergeQueueEntry {
+                position: entry.position,
+                estimated_time_to_merge: entry.estimated_time_to_merge,
+            }),
+        })
     }
 
     pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {

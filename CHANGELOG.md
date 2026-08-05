@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   land stops there: GitHub merges later, so the pull request branches are left
   in place — the queue merges the pull request branch — and `jj spr cleanup`
   removes them once it has. `--queue` and `--no-queue` choose for one land.
+- `jj spr land --wait` stays until the merge queue has merged the pull request,
+  and then deletes the branches it used and fetches what landed, the way a
+  squash-merging land does. It gives up if GitHub takes the pull request out of
+  the queue without merging it, which is what a queue does to one whose checks
+  fail on the merged result.
 - `spr.landStrategy` chooses how `jj spr land` lands a pull request. `merge`
   squash-merges it there and then, which is what jj-spr has always done, and
   `queue` puts it in the merge queue GitHub keeps for the default branch. The

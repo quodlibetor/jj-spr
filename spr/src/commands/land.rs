@@ -100,6 +100,76 @@ fn sits_directly_on_master(
     Ok(jj.get_master_base_for_commit(config, commit.oid)? == commit.parent_oid)
 }
 
+/// How often a land that waits asks GitHub what the merge queue has done with
+/// the Pull Request.
+///
+/// A merge queue takes minutes at best, so asking often buys nothing but rate
+/// limit.
+const MERGE_QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Wait for the merge queue to merge Pull Request `number`, and hand back the
+/// commit it merged it as.
+///
+/// Three things can happen to a queued Pull Request, and this returns on all
+/// three: GitHub merges it, which is what the merge commit says; GitHub lets go
+/// of it without merging, which is what an entry that has gone without one says
+/// — a queue drops a Pull Request whose checks fail on the merged result; or
+/// somebody closes it. Only the first is a land.
+///
+/// There is no giving up on time here, unlike every other wait in this file.
+/// Those wait for GitHub to work something out, where taking too long means
+/// something is wrong; this one waits for a queue to reach the Pull Request,
+/// which legitimately takes as long as the queue ahead of it does. A caller who
+/// no longer wants to wait can stop waiting — the Pull Request stays in the
+/// queue either way, which is the whole point of the flag being optional.
+async fn wait_for_the_merge_queue(
+    gh: &crate::github::GitHub,
+    number: u64,
+    mut reported: Option<i64>,
+) -> Result<git2::Oid> {
+    loop {
+        // Asked after the wait rather than before it. What is known on the way
+        // in is that GitHub has just made the entry — it answered the enqueue
+        // with it — so there is nothing to learn from asking straight away, and
+        // an entry GitHub has not caught up with yet reads exactly like one it
+        // has dropped.
+        tokio::time::sleep(MERGE_QUEUE_POLL_INTERVAL).await;
+
+        let queued = gh.get_queued_pull_request(number).await?;
+
+        if let Some(merge_commit) = queued.merge_commit {
+            return Ok(merge_commit);
+        }
+
+        match queued.entry {
+            None if queued.state == PullRequestState::Open => {
+                return Err(Error::new(
+                    "GitHub took this Pull Request out of the merge queue without merging it. A \
+                     merge queue drops a Pull Request whose required checks fail once its changes \
+                     are merged with the ones ahead of it. The Pull Request is still open: see it \
+                     on GitHub for why, and land it again once it is fixed.",
+                ));
+            }
+            None => {
+                return Err(Error::new(
+                    "This Pull Request was closed without being merged while it was in the merge \
+                     queue.",
+                ));
+            }
+            // Only when its place changes, so that a long wait behind an
+            // unmoving queue does not fill a terminal with the same line.
+            Some(entry) if reported != Some(entry.position) => {
+                reported = Some(entry.position);
+                output(
+                    "🚦",
+                    &format!("Waiting in the merge queue at position {}", entry.position),
+                )?;
+            }
+            Some(_) => (),
+        }
+    }
+}
+
 /// How long a wait of `seconds` is, in words, for a report to a person.
 ///
 /// Rounded to the minute throughout: these are GitHub's own estimates of how
@@ -319,6 +389,12 @@ pub struct LandOptions {
     /// queue of the default branch, whatever spr.landStrategy says
     #[clap(long)]
     no_queue: bool,
+
+    /// Stay until the merge queue has merged the Pull Request, and then delete
+    /// the branches it used and fetch what landed. A land that merges the Pull
+    /// Request itself has nothing to wait for
+    #[clap(long)]
+    wait: bool,
 
     /// Jujutsu revision to operate on (if not specified, uses '@')
     #[clap(short = 'r', long)]
@@ -546,13 +622,35 @@ pub async fn land(
             &format!("Queued for merge at position {}{}", entry.position, wait),
         )?;
         output("🔗", &queue.url)?;
-        output(
-            "ℹ️ ",
-            "The merge queue merges this Pull Request when it reaches it. Its \
-             branches stay until then.",
-        )?;
 
-        return Ok(());
+        if !opts.wait {
+            output(
+                "ℹ️ ",
+                "The merge queue merges this Pull Request when it reaches it. Its \
+                 branches stay until then.",
+            )?;
+
+            return Ok(());
+        }
+
+        // The place just reported, so that a queue that has not moved by the
+        // first look does not say the same thing twice.
+        let merge_commit =
+            wait_for_the_merge_queue(gh, pull_request_number, Some(entry.position)).await?;
+
+        output("🛬", "Landed!")?;
+
+        // The same tidying a squash-merging land does, at the point where the
+        // merge actually happened rather than at the end of the land that asked
+        // for it.
+        return clean_up_after_merging(
+            jj,
+            config,
+            &pull_request.head,
+            (!base_is_master).then_some(&pull_request.base),
+            Some(&format!("{}", merge_commit)),
+        )
+        .await;
     }
 
     // We have checked that merging the Pull Request branch into the master

@@ -82,6 +82,7 @@ jj spr land [OPTIONS]
 - `--cherry-pick` - Land PR independently (for use with stacks)
 - `--queue` - Put the PR in the merge queue, whatever `spr.landStrategy` says
 - `--no-queue` - Squash-merge the PR now, whatever `spr.landStrategy` says
+- `--wait` - Stay until the merge queue has merged the PR, then clean up after it
 
 **Examples:**
 ```bash
@@ -115,6 +116,19 @@ branches — the queue merges the pull request branch, and deleting it would tak
 the pull request out of the queue. Fetch and rebase once GitHub has merged it,
 and use `jj spr cleanup --confirm` to remove the branches left behind, which it
 sees as orphans once GitHub has closed the pull request.
+
+`--wait` does that for you instead: it stays until GitHub has merged the pull
+request, then deletes the branches and fetches what landed, the way a
+squash-merging land does. It waits for as long as the queue takes, and stopping
+it leaves the pull request queued.
+
+```bash
+# Queue the PR and return
+jj spr land -r <change-id>
+
+# Queue the PR and stay until the queue has merged it
+jj spr land --wait -r <change-id>
+```
 
 A merge queue exists for the default branch and takes a pull request based on
 it, so a stacked pull request is retargeted at the default branch before it is
