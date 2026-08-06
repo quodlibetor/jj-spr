@@ -108,6 +108,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request, and a base branch set by hand went the same way. A generated base
   branch is kept too while any open pull request still targets it, which the
   ones just retargeted onto it are the usual reason for.
+- `jj spr land` now asks GitHub which open pull requests are based on the
+  branches it is about to delete, instead of reading only the local change
+  stack. A pull request whose change jj does not have — abandoned locally, or in
+  a workspace this one has not fetched — was neither retargeted nor protected,
+  so under `spr.baseStrategy = linear` a land left it pointing at the head
+  branch it had just deleted, with only GitHub's own asynchronous cleanup to
+  rescue it.
 
 ## [0.1.0] - 2025-11-15
 

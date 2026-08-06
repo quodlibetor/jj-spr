@@ -701,6 +701,71 @@ fn landing_below_a_pull_request_retargets_it_and_leaves_it_open() {
     );
 }
 
+/// The same has to hold for a pull request the *local* repository cannot see.
+///
+/// `land` reads the local change stack to find what is stacked on the pull
+/// request it is landing, so a change that is not there — abandoned locally, or
+/// living in a workspace this one has not fetched — is invisible to it. Under
+/// `spr.baseStrategy = linear` that pull request is based on the very head
+/// branch `land` deletes on its way out.
+///
+/// Run against a real repository with the GitHub half of the lookup removed,
+/// this fails on the base branch rather than on the state: the pull request is
+/// left open, still pointing at the deleted head branch. So the assertion that
+/// matters here is the retargeting, not the survival — GitHub does eventually
+/// retarget such a pull request itself, but asynchronously, after `land` has
+/// returned, and racing the branch deletion `land` has already started.
+///
+/// Only GitHub knows such a pull request is there, which is why `land` asks it
+/// as well as jj. Only an end-to-end test can show it: the whole point is a
+/// pull request that exists on GitHub and nowhere else.
+#[test]
+fn landing_below_a_pull_request_jj_cannot_see_leaves_it_open() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "landunseen");
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let tag = run_tag();
+    let (bottom_title, top_title) = (
+        format!("e2e unseen bottom {tag}"),
+        format!("e2e unseen top {tag}"),
+    );
+    let prs = scratch.push_stack(&[&bottom_title, &top_title]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.pr_head_branch(bottom),
+        "under the linear strategy PR #{top} should be based on PR #{bottom}'s head branch"
+    );
+
+    // Take the top change out of the local repository. Everything jj could have
+    // told `land` about PR #top goes with it, leaving the pull request itself
+    // untouched on GitHub — which is the situation under test.
+    run("jj", &["abandon", "@"], scratch.path());
+
+    jj_spr(&["land", "-r", "@-"], scratch.path());
+
+    assert_eq!(
+        scratch.pr_field(bottom, ".merged"),
+        "true",
+        "PR #{bottom} should have been merged"
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "landing below PR #{top} closed it, even though GitHub could say it was there"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.default_branch(),
+        "PR #{top} should have been retargeted at the default branch"
+    );
+}
+
 /// The same has to hold when the pull request below was merged on GitHub rather
 /// than by `jj spr land`: there was no land to retarget anything, so the next
 /// `jj spr diff` is what finds the pull request pointing at a base branch whose

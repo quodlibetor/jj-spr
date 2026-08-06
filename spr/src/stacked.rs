@@ -18,10 +18,12 @@
 //! branch, so the pull requests above belong there, while `close` puts them
 //! nowhere, so they belong on the closed pull request's own base.
 //!
-//! How the callers find those pull requests differs too, and that difference
-//! matters more: `close` asks GitHub which pull requests target the branch,
-//! while `land` reads the local stack and so cannot see one whose change jj
-//! does not have. Both hand what they found to
+//! Both ask GitHub which pull requests target the branch, because that is the
+//! only answer that covers one whose change jj does not have — abandoned
+//! locally, or in a workspace this one has not fetched. `land` reads the local
+//! change stack as well, since under `spr.baseStrategy = synthetic` no pull
+//! request targets the head branch at all and only the local stack says which
+//! is stacked on which. Both hand what they found to
 //! [`retarget_stacked_pull_requests`], which is why the head branch this module
 //! agrees to delete is only as safe as the list it was given.
 
@@ -195,11 +197,13 @@ pub async fn retarget_stacked_pull_requests(
 /// onto this very branch, so it is the one thing that can put a second pull
 /// request there, and deleting the branch would close it.
 ///
-/// `based_on_base` is what the caller found to be based on `base`, and the
-/// caller decides how hard it looked: `close` asks GitHub after retargeting,
-/// which is the only answer that covers a pull request it did not move itself.
-/// `land` passes an empty list — it retargets onto the master branch, so it
-/// aims nothing here, and it does not ask whether anything else did.
+/// `based_on_base` is what the caller found to be based on `base`. Both callers
+/// ask GitHub, which is the only answer that covers a pull request they did not
+/// move themselves; when they ask differs, because it has to. `close` asks
+/// after retargeting, since retargeting is what aims pull requests at this very
+/// branch. `land` aims nothing here — it sends them to the master branch — so
+/// it asks before it merges anything, where a failed lookup still leaves a land
+/// that can be retried.
 ///
 /// `None` means the caller tried to find out and could not. The branch stays:
 /// not knowing what a deletion would close is exactly the situation to leave a
