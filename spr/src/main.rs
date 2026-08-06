@@ -21,7 +21,7 @@ use reqwest::{self, header};
 #[derive(Parser, Debug)]
 #[clap(
     name = "jj-spr",
-    version,
+    version = env!("JJ_SPR_VERSION"),
     about = "Jujutsu subcommand: Submit pull requests for individual, amendable, rebaseable commits to GitHub"
 )]
 pub struct Cli {

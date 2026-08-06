@@ -61,6 +61,23 @@ fn test_binary_exists_and_has_correct_identity() {
 }
 
 #[test]
+fn test_version_names_the_commit_it_was_built_from() {
+    let output = run_jj_spr(&["--version"], None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Anything running this test was built from a checkout, so the build
+    // script had a revision to report.
+    let prefix = format!("jj-spr {} (", env!("CARGO_PKG_VERSION"));
+    let rev = stdout
+        .trim()
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("--version should name a build revision, got {stdout:?}"));
+
+    assert!(!rev.is_empty(), "build revision should not be empty");
+}
+
+#[test]
 fn test_help_shows_jujutsu_subcommand_identity() {
     let output = run_jj_spr(&["--help"], None);
     assert!(output.status.success(), "Should show help");
