@@ -8,11 +8,16 @@
 use std::iter::zip;
 
 use crate::{
+    config::BaseStrategy,
     error::{Error, Result, ResultExt, add_error},
     github::{
-        GitHub, PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate,
+        GitHub, GitHubBranch, PullRequest, PullRequestRequestReviewers, PullRequestState,
+        PullRequestUpdate,
     },
     message::{MessageSection, validate_commit_message},
+    native_stacks::{
+        ChainLink, DissolveReason, Reconciliation, StackSession, dissolve_any_stack_holding,
+    },
     output::{output, write_commit_title},
     utils::{parse_name_list, remove_all_parens, run_command},
 };
@@ -100,7 +105,7 @@ fn resolve_cherry_pick(
 pub async fn diff(
     opts: DiffOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
     let mut result = Ok(());
@@ -136,6 +141,21 @@ pub async fn diff(
         return result;
     };
 
+    // A change this run would open a pull request for has no number yet, and a
+    // dry run opens nothing, so there is no number to give it.
+    let would_create_pull_requests = prepared_commits
+        .iter()
+        .any(|commit| commit.pull_request_number.is_none());
+
+    // Registering the run's pull requests as a stack GitHub draws itself is a
+    // step around the loop rather than a way of running it: `None` is the whole
+    // of "GitHub is not drawing the stack", so nothing below asks what mode this
+    // is.
+    let mut stacks = config
+        .stack_display
+        .draws_the_stack()
+        .then(StackSession::new);
+
     #[allow(clippy::needless_collect)]
     let pull_request_tasks: Vec<_> = prepared_commits
         .iter()
@@ -146,6 +166,17 @@ pub async fn diff(
         .collect();
 
     let mut message_on_prompt = "".to_string();
+
+    // The changes are walked bottom-up, so the change below the one being
+    // pushed has already been pushed and can be offered to it as a base. See
+    // [`linear_base`] for when that offer is taken up.
+    let mut change_below: Option<PushedChange> = None;
+
+    // The ordered pull requests of the run, which the registration needs and
+    // which no revset can answer: whether one change's pull request is chained
+    // to the one below is decided inside the loop, from trees and from what
+    // GitHub already has. Accumulated bottom-up, as the loop walks.
+    let mut links: Vec<ChainLink> = Vec::new();
 
     for (prepared_commit, pull_request_task) in zip(prepared_commits.iter_mut(), pull_request_tasks)
     {
@@ -167,7 +198,7 @@ pub async fn diff(
         // This makes it easier to run the code to update the local commit message
         // with all the changes that the implementation makes at the end, even if
         // the implementation encounters an error or exits early.
-        result = diff_impl(
+        let pushed = diff_impl(
             &opts,
             &mut message_on_prompt,
             jj,
@@ -176,8 +207,18 @@ pub async fn diff(
             prepared_commit,
             master_base_oid,
             pull_request,
+            change_below.as_ref(),
+            stacks.as_mut(),
         )
         .await;
+
+        match pushed {
+            Ok(pushed) => {
+                links.push(pushed.link());
+                change_below = Some(pushed);
+            }
+            Err(error) => result = Err(error),
+        }
     }
 
     // This updates the commit message in the local Jujutsu repository (if it was
@@ -187,6 +228,45 @@ pub async fn diff(
             &mut result,
             jj.rewrite_commit_messages(prepared_commits.as_mut_slice()),
         );
+    }
+
+    // A dry run opens no pull request, so a change that would get one has no
+    // number, and a chain cannot be carried through a change it cannot name.
+    // The chains such a run works out are therefore not the ones it would
+    // register, and reporting them would be worse than reporting nothing: a
+    // stack that would be appended to reads as unchanged, and a pull request
+    // that would be registered again reads as one about to be left behind. So
+    // the registration is only reported for a run that opens nothing.
+    let plan_registration = !opts.dry_run || !would_create_pull_requests;
+
+    // Now that every pull request the run pushed exists and is pointing where
+    // it will end up, GitHub can be told that they are a stack.
+    let mut registrations: Vec<Reconciliation> = Vec::new();
+    if let Some(session) = stacks.as_mut()
+        && result.is_ok()
+        && plan_registration
+        && let Some(outcomes) = add_error(
+            &mut result,
+            session.register(gh, &links, !opts.dry_run).await,
+        )
+    {
+        registrations = outcomes;
+    }
+
+    // Asked however the run went, and after the registration either way: a run
+    // that failed before it could register is exactly the one that may have
+    // taken a stack apart and left it that way.
+    if let Some(orphaned) = stacks
+        .as_ref()
+        .and_then(StackSession::orphaned_pull_requests)
+    {
+        registrations.push(orphaned);
+    }
+
+    if !opts.dry_run {
+        for outcome in registrations.iter().filter(|o| o.is_notable()) {
+            add_error(&mut result, report_stack(outcome));
+        }
     }
 
     if opts.dry_run {
@@ -253,22 +333,258 @@ pub async fn diff(
             }
             output("", "")?;
         }
+
+        // What the registration would do cannot be worked out without asking
+        // GitHub — the run's own pull requests say nothing about what stack
+        // already holds them — so `register` above made that call even for a
+        // dry run, and every chain reports, including the ones that turn out
+        // not to be stacks.
+        for outcome in &registrations {
+            report_stack(outcome)?;
+        }
+
+        // An absent registration line must not read as "there is no GitHub
+        // stack to register".
+        if !plan_registration && config.stack_display.draws_the_stack() {
+            output(
+                "ℹ️",
+                "The GitHub stack is not shown: this run would open pull \
+                 requests, and a stack cannot be worked out until they have \
+                 numbers.",
+            )?;
+        }
     }
 
     result
 }
 
+/// A change this run has already dealt with, offered to the change stacked on
+/// top of it as the base its pull request could have.
+///
+/// Only [`diff_impl`] makes one, and only for a change that has a pull request
+/// or is about to get one, so "the change below has no pull request" — one of
+/// the conditions that sends a change back to a base branch of its own — needs
+/// no field: it is the absence of a `PushedChange`.
+#[derive(Clone, Debug)]
+struct PushedChange {
+    /// The local commit that was pushed. The change above this one is the one
+    /// whose parent this is.
+    local_oid: Oid,
+    /// The commit `branch` now points at, which is what a change based on this
+    /// one has to merge to contain it.
+    head_oid: Oid,
+    /// The pull request's head branch.
+    branch: GitHubBranch,
+    /// Whether the pushed commit carries this change cherry-picked onto
+    /// master rather than the change's own tree, which makes it the wrong base
+    /// for the change above: the diff would then leave out everything between
+    /// master and this change.
+    pushed_as_cherry_pick: bool,
+    /// The change's pull request, once it has one.
+    ///
+    /// A pull request this run is opening has no number until GitHub answers
+    /// with one, and a dry run never opens one, so this is `None` for a change
+    /// whose pull request does not exist yet.
+    pull_request_number: Option<u64>,
+    /// The pull request this change's own is based on, where the base ref of
+    /// this one is the head ref of that one. See [`chain_link`].
+    based_on: Option<u64>,
+    /// Whether the run moves this change's pull request onto a different base
+    /// branch, which no stack holding it can survive.
+    retargeted: bool,
+}
+
+impl PushedChange {
+    /// How the change looks to the stack registration.
+    fn link(&self) -> ChainLink {
+        ChainLink {
+            pull_request: self.pull_request_number,
+            based_on: self.based_on,
+            retargeted: self.retargeted,
+        }
+    }
+}
+
+/// Say what became of the run's stack registration.
+fn report_stack(outcome: &Reconciliation) -> Result<()> {
+    output("🧱", &format!("GitHub stack: {}", outcome.describe()))
+}
+
+/// The pull request below that this change's pull request is chained to, in the
+/// sense GitHub's stacks mean: this pull request's base ref is that one's head
+/// ref.
+///
+/// `linear_base` is not enough on its own to answer this. It says what the
+/// change below *offers* to be, and the run may not take the offer up: a change
+/// that needs no push exits before its base is looked at, so a stack migrating
+/// to `spr.baseStrategy = linear` leaves pull requests whose trees are already
+/// right still pointing at the synthetic base branches they had. Registering
+/// those as a stack would be refused for not forming one. So the base branch
+/// the pull request ends the run with is compared as well, which is the very
+/// thing GitHub checks.
+fn chain_link(
+    linear_base: Option<&PushedChange>,
+    base_branch: Option<&GitHubBranch>,
+) -> Option<u64> {
+    let below = linear_base?;
+
+    if base_branch?.branch_name() != below.branch.branch_name() {
+        return None;
+    }
+
+    below.pull_request_number
+}
+
+/// The pull request branch that the change above `change_below` should be
+/// based on, if it should be based on one at all.
+///
+/// `None` means the change gets a synthetic base branch of its own (or master,
+/// where it sits directly on master). That is always the answer under
+/// [`BaseStrategy::Synthetic`], and is the fallback under
+/// [`BaseStrategy::Linear`] when the change below cannot serve as a base:
+///
+/// - there is no change below in this run, so nothing was pushed that this
+///   change could point at;
+/// - the change below is not this change's parent, because this run was given
+///   revisions that do not form one chain;
+/// - the change below was pushed as a cherry-pick, so its branch does not
+///   carry the tree this change is built on;
+/// - this change is itself a cherry-pick, and so belongs on master rather than
+///   on anything the stack below it built;
+/// - this change sits directly on master, which is what it is against then,
+///   whatever was pushed below it.
+///
+/// Falling back is per change and never rewrites anything: the change simply
+/// gets the base branch it would have had under the synthetic strategy.
+///
+/// A `Some` answer means the whole of case 0 applies, so that the decision is
+/// made in one place: the caller uses it both to choose the base branch and to
+/// decide that no base commit is to be built or pushed.
+// The two flags are in the same order as in `determine_base_branch`, which is
+// asked the same two questions a few lines away: swapping them would compile
+// and would quietly change the base of every pull request in a stack.
+fn linear_base(
+    strategy: BaseStrategy,
+    change_below: Option<&PushedChange>,
+    parent_oid: Oid,
+    directly_based_on_master: bool,
+    cherry_pick: bool,
+) -> Option<&PushedChange> {
+    if strategy != BaseStrategy::Linear || cherry_pick || directly_based_on_master {
+        return None;
+    }
+
+    change_below.filter(|below| below.local_oid == parent_oid && !below.pushed_as_cherry_pick)
+}
+
+/// Determine which branch the pull request should be based on, and which one it
+/// is based on now. Returns `(base_branch, old_base)`.
+///
+/// - `base_branch`: the branch the pull request should end up targeting, if it
+///   already has one to keep or has one below to take over. `None` says only
+///   that there is no such branch, not that the pull request belongs on master:
+///   a change that is not on master and has no branch to point at gets one made
+///   for it further down, where the commit for it is built. Nor is a `Some`
+///   answer the last word — a change that needs a base commit built for it and
+///   whose branch may not be written to gets one made for it too; see
+///   [`may_push_base_commit_to`].
+/// - `old_base`: the non-master branch the pull request targets now, if any.
+///   That may well be the branch it ends up on, so compare the two before
+///   treating it as one the pull request is leaving. Whether a branch it *is*
+///   leaving may then be taken away is a separate question again, and one only
+///   [`crate::config::Config::is_synthetic_base_branch`] answers: the branch a
+///   pull request left under [`BaseStrategy::Linear`] is the head branch of the
+///   pull request below, and deleting it would close that one.
+///
+/// `cherry_pick` is whether this diff is a cherry-pick at all, which the
+/// `Cherry Pick:` marker on the commit message answers as much as `--cherry-pick`
+/// does — so pass the resolved answer, not the flag.
+fn determine_base_branch(
+    pull_request: Option<&PullRequest>,
+    linear_base: Option<&PushedChange>,
+    directly_based_on_master: bool,
+    cherry_pick: bool,
+) -> (Option<GitHubBranch>, Option<GitHubBranch>) {
+    let old_base = pull_request
+        .map(|pr| pr.base.clone())
+        .filter(|base| !base.is_master_branch());
+
+    let base_branch = if directly_based_on_master || cherry_pick {
+        // The change is on master, so that is what the pull request is against.
+        None
+    } else if let Some(below) = linear_base {
+        Some(below.branch.clone())
+    } else {
+        // Keep the base branch the pull request already has. That includes the
+        // head branch of the change below, which is what a pull request pushed
+        // under [`BaseStrategy::Linear`] is based on: this run may not have the
+        // change below in it — the default `jj spr diff` is one revision — but
+        // that is no reason to move the pull request off a base that is still
+        // right. What may not happen is *writing* to such a branch; see
+        // [`may_push_base_commit_to`], which is asked at the one place a base
+        // commit is built.
+        old_base.clone()
+    };
+
+    (base_branch, old_base)
+}
+
+/// Whether a base commit this run builds may be pushed to `branch`.
+///
+/// A base branch jj-spr generated belongs to the one pull request based on it,
+/// so it can be written to freely, and a branch jj-spr did not make at all is
+/// treated as it always has been: the base commit goes there, as it did before
+/// there was more than one base strategy. In between is the head branch of
+/// another pull request, which is what [`BaseStrategy::Linear`] makes a stacked
+/// pull request's base: pushing there would put a commit jj-spr invented into
+/// somebody's pull request. Such a change gets a base branch of its own.
+fn may_push_base_commit_to(config: &crate::config::Config, branch: &GitHubBranch) -> bool {
+    !config.is_spr_branch(branch.branch_name())
+        || config.is_synthetic_base_branch(branch.branch_name())
+}
+
+/// The parents of the new commit for a pull request branch.
+///
+/// The branch's previous tip always comes first, which is what makes every
+/// update to a pull request branch a fast-forward: the new commit descends from
+/// the old one, so jj-spr never has to force-push and GitHub never loses the
+/// review history. Whatever the base moved to is merged in as a second parent
+/// — under [`BaseStrategy::Linear`] that is the head commit of the change
+/// below, which is exactly what makes the base's branch an ancestor of this
+/// one and so keeps GitHub's diff to this change alone.
+fn pr_head_parents(pr_head_oid: Oid, pr_base_parent: Option<Oid>) -> Vec<Oid> {
+    let mut parents = vec![pr_head_oid];
+
+    if let Some(oid) = pr_base_parent
+        && oid != pr_head_oid
+    {
+        parents.push(oid);
+    }
+
+    parents
+}
+
+/// Push one change and create or update its pull request.
+///
+/// Returns what the change above it needs to know to be based on it: see
+/// [`PushedChange`].
+// Everything but `local_commit`, `pull_request` and `change_below` is the same
+// for every change in the run, and is only threaded through because there is
+// nothing yet to hold it. Those want bundling into a struct; until then the
+// lint has nothing to tell us that the call site does not.
 #[allow(clippy::too_many_arguments)]
 async fn diff_impl(
     opts: &DiffOptions,
     message_on_prompt: &mut String,
     jj: &crate::jj::Jujutsu,
-    gh: &mut crate::github::GitHub,
+    gh: &crate::github::GitHub,
     config: &crate::config::Config,
     local_commit: &mut crate::jj::PreparedCommit,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
-) -> Result<()> {
+    change_below: Option<&PushedChange>,
+    stacks: Option<&mut StackSession>,
+) -> Result<PushedChange> {
     // Parsed commit message of the local commit
     let message = &mut local_commit.message;
 
@@ -280,6 +596,20 @@ async fn diff_impl(
 
     // Check if the local commit is based directly on the master branch.
     let directly_based_on_master = local_commit.parent_oid == master_base_oid;
+
+    // Whether the commit pushed for this change carries the change cherry-picked
+    // onto master rather than the change's own tree. Cherry-picking a change
+    // that is on master anyway gives that same tree, so it does not count.
+    let pushed_as_cherry_pick = effective_cherry_pick && !directly_based_on_master;
+
+    // The change below, if this change's pull request is to be based on it.
+    let linear_base = linear_base(
+        config.base_strategy,
+        change_below,
+        local_commit.parent_oid,
+        directly_based_on_master,
+        effective_cherry_pick,
+    );
 
     // Determine the trees the Pull Request branch and the base branch should
     // have when we're done here.
@@ -487,21 +817,31 @@ async fn diff_impl(
                 }
             }
 
-            return Ok(());
+            // Nothing was pushed, so the branch still points where it did, and
+            // that is what the change above this one has to build on. It is
+            // still part of the stack the run is registering, though — a change
+            // in the middle that needs no push must not sever the chain — so it
+            // reports its pull request and what that is based on, which is the
+            // base it already has rather than one this run chose.
+            return Ok(PushedChange {
+                local_oid: local_commit.oid,
+                head_oid: pull_request.head_oid,
+                branch: pull_request.head.clone(),
+                pushed_as_cherry_pick,
+                pull_request_number: Some(pull_request.number),
+                based_on: chain_link(linear_base, Some(&pull_request.base)),
+                // Nothing was pushed, so nothing was retargeted either.
+                retargeted: false,
+            });
         }
     }
 
-    // Check if there is a base branch on GitHub already. That's the case when
-    // there is an existing Pull Request, and its base is not the master branch.
-    let base_branch = if let Some(ref pr) = pull_request {
-        if pr.base.is_master_branch() {
-            None
-        } else {
-            Some(pr.base.clone())
-        }
-    } else {
-        None
-    };
+    let (base_branch, old_base) = determine_base_branch(
+        pull_request.as_ref(),
+        linear_base,
+        directly_based_on_master,
+        effective_cherry_pick,
+    );
 
     // We are going to construct `pr_base_parent: Option<Oid>`.
     // The value will be the commit we have to merge into the new Pull Request
@@ -510,19 +850,34 @@ async fn diff_impl(
     // that's also rebasing).
     // If it's `None`, then we will not merge anything into the new Pull Request
     // commit.
-    // If we are updating an existing PR, then there are three cases here:
+    // If we are updating an existing PR, then there are four cases here:
+    // (0) the change below this one has been pushed and its pull request branch
+    //     already carries the tree this change is built on (the linear base
+    //     strategy): that branch is the base, and no base commit is derived at
+    //     all. It comes before case 1 because the base may be changing even
+    //     when the trees say nothing has to be merged — a pull request moving
+    //     off a base branch onto the branch below it has to gain that branch's
+    //     tip as an ancestor in the same push, or GitHub would diff it against
+    //     the wrong commit. `needs_merging_master` is not consulted: the change
+    //     below is this change's parent and was pushed in this run, so whatever
+    //     master it needed is already in its head commit, and merging that
+    //     commit brings master in with it.
     // (1) the parent tree of this commit is unchanged and we do not need to
     //     merge in master, which means that the local commit was amended, but
     //     not rebased. We don't need to merge anything into the Pull Request
     //     branch.
     // (2) the parent tree has changed, but the parent of the local commit is on
-    //     master (or we are cherry-picking) and we are not already using a base
-    //     branch: in this case we can merge the master commit we are based on
-    //     into the PR branch, without going via a base branch. Thus, we don't
-    //     introduce a base branch here and the PR continues to target the
-    //     master branch.
+    //     master (or we are cherry-picking) and we are not using a base branch:
+    //     in this case we can merge the master commit we are based on into the
+    //     PR branch, without going via a base branch. This also applies when
+    //     the PR previously had a base branch — a synthetic one, or under the
+    //     linear strategy the head branch of the change below — but the commit
+    //     is now directly on master (e.g. after the bottom of a stack was
+    //     landed). The PR is retargeted to master, and the branch it leaves is
+    //     deleted only if jj-spr generated it as a base branch.
     // (3) the parent tree has changed, and we need to use a base branch (either
-    //     because one was already created earlier, or we find that we are not
+    //     because one was already created earlier, or the one the PR has is not
+    //     ours to write to, or we find that we are not
     //     directly based on master now): we need to construct a new commit for
     //     the base branch. That new commit's tree is always that of that local
     //     commit's parent (thus making sure that the difference between base
@@ -539,16 +894,50 @@ async fn diff_impl(
     // base of the PR) was set above to be the tree of the master commit the
     // local commit is based one, whereas `new_base_tree` is the tree of the
     // parent of the local commit. So if the local commit for this new PR is on
-    // master, those two are the same (and we want to apply case 1). If the
-    // commit is not directly based on master, we have to create this new PR
-    // with a base branch, so that is case 3.
+    // master, those two are the same (and we want to apply case 1). If a change
+    // below is serving as its base, that is case 0, exactly as for an existing
+    // pull request — case 0 is chosen before the pull request is consulted at
+    // all. Otherwise, if the commit is not directly based on master, we have to
+    // create this new PR with a base branch, so that is case 3.
+    //
+    // `base_branch_commit` is the commit to push to the base branch. It is the
+    // same commit as `pr_base_parent` wherever this run built one, and `None`
+    // in case 0, where the base branch is the branch below and the push for
+    // that change is what moved it: merging its tip is this change's business,
+    // writing to it is not.
 
-    let (pr_base_parent, base_branch) = if pr_base_tree == new_base_tree && !needs_merging_master {
+    let (pr_base_parent, base_branch, base_branch_commit) = if let Some(below) = linear_base {
+        // Case 0
+        //
+        // `graph_descendant_of` says no when the two commits are the same, so
+        // that has to be asked separately: a branch tip already at the change
+        // below needs no merge.
+        let contains_below = pr_head_oid == below.head_oid
+            || jj
+                .git_repo
+                .graph_descendant_of(pr_head_oid, below.head_oid)?;
+
+        (
+            if contains_below {
+                None
+            } else {
+                Some(below.head_oid)
+            },
+            // `determine_base_branch` has already answered with this branch,
+            // being asked the same question. Saying so here rather than
+            // trusting that keeps "case 0 targets the branch below" a fact
+            // about these lines: were the two ever to disagree, the pull
+            // request would be retargeted at master while its head merged the
+            // branch below, and its diff would swallow the whole stack.
+            base_branch.or_else(|| Some(below.branch.clone())),
+            None,
+        )
+    } else if pr_base_tree == new_base_tree && !needs_merging_master {
         // Case 1
-        (None, base_branch)
+        (None, base_branch, None)
     } else if base_branch.is_none() && (directly_based_on_master || effective_cherry_pick) {
         // Case 2
-        (Some(master_base_oid), None)
+        (Some(master_base_oid), None, None)
     } else {
         // Case 3
 
@@ -587,16 +976,46 @@ async fn diff_impl(
             )?
         };
 
-        // If `base_branch` is `None` (which means a base branch does not exist
-        // yet), then make a `GitHubBranch` with a new name for a base branch
-        let base_branch = if let Some(base_branch) = base_branch {
-            base_branch
-        } else {
-            config.new_github_branch(&config.get_base_branch_name(&jj.get_all_ref_names()?, title))
+        // The commit has to go somewhere: onto the base branch the pull request
+        // already has, where that is a branch we may write to, and otherwise
+        // onto a `GitHubBranch` with a new name for a base branch. The pull
+        // request is retargeted at whichever it turns out to be.
+        let base_branch = match base_branch {
+            Some(base_branch) if may_push_base_commit_to(config, &base_branch) => base_branch,
+            _ => config
+                .new_github_branch(&config.get_base_branch_name(&jj.get_all_ref_names()?, title)),
         };
 
-        (Some(new_base_branch_commit), Some(base_branch))
+        (
+            Some(new_base_branch_commit),
+            Some(base_branch),
+            Some(new_base_branch_commit),
+        )
     };
+
+    // Worked out here because the branches below take `base_branch` apart, and
+    // because a change that ends the run based on the one below it is part of
+    // the stack whether or not this run was what put it there.
+    let based_on = chain_link(linear_base, base_branch.as_ref());
+
+    // Whether this run moves the pull request onto a different base branch.
+    //
+    // This is the one predicate for it, and the three places below that send a
+    // base to GitHub are exactly the cases it covers: retargeting off a base
+    // branch that has become obsolete, setting a base that has changed, and
+    // going back to the master branch. Each of those requires the base to
+    // differ from the one the pull request has, and no other path sends one.
+    // Deriving them all from one expression is what keeps the unstacking below
+    // from drifting out of step with the retargeting it has to precede.
+    let retargeted = pull_request.as_ref().is_some_and(|pull_request| {
+        let target = base_branch.as_ref().unwrap_or(&config.master_ref);
+
+        pull_request.base.branch_name() != target.branch_name()
+    });
+
+    // The pull request the change ends the run with. One this run is opening
+    // has no number until GitHub answers with one, below.
+    let mut pull_request_number = local_commit.pull_request_number;
 
     let mut github_commit_message = opts.message.clone();
     if pull_request.is_some() && github_commit_message.is_none() && !opts.dry_run {
@@ -624,17 +1043,7 @@ async fn diff_impl(
     // Construct the new commit for the Pull Request branch. First parent is the
     // current head commit of the Pull Request (we set this to the master base
     // commit earlier if the Pull Request does not yet exist)
-    let mut pr_commit_parents = vec![pr_head_oid];
-
-    // If we prepared a commit earlier that needs merging into the Pull Request
-    // branch, then that commit is a parent of the new Pull Request commit.
-    if let Some(oid) = pr_base_parent {
-        // ...unless if that's the same commit as the one we added to
-        // pr_commit_parents first.
-        if pr_commit_parents.first() != Some(&oid) {
-            pr_commit_parents.push(oid);
-        }
-    }
+    let pr_commit_parents = pr_head_parents(pr_head_oid, pr_base_parent);
 
     // Create the new commit
     let pr_commit = if opts.dry_run {
@@ -689,6 +1098,20 @@ async fn diff_impl(
             .arg(&config.remote_name)
             .arg(format!("{}:{}", pr_commit, pull_request_branch.on_github()));
 
+        // Where this run prepared a new commit for a base branch, that goes in
+        // the same push. Case 0 builds no such commit — the base is the branch
+        // below, which its own push moved — so the branch here is either one
+        // generated for this pull request or one jj-spr did not make at all,
+        // which it writes to as it did before there were base strategies. See
+        // [`may_push_base_commit_to`], which draws that line.
+        if let (Some(base_branch), Some(base_branch_commit)) = (&base_branch, base_branch_commit) {
+            cmd.arg(format!(
+                "{}:{}",
+                base_branch_commit,
+                base_branch.on_github()
+            ));
+        }
+
         if let Some(pull_request) = pull_request {
             // We are updating an existing Pull Request
 
@@ -717,36 +1140,94 @@ async fn diff_impl(
                 pull_request_updates.update_message(&pull_request, message);
             }
 
+            // Push the new commit onto the Pull Request branch (and also the new
+            // base commit, if we added that to cmd above). It comes before both
+            // of the branches below because either may ask GitHub to diff the
+            // pull request against a different base, and the head branch — with
+            // any base branch this run built for it — has to be on the remote in
+            // the state that base assumes before that is asked for.
+            run_command(&mut cmd)
+                .await
+                .reword("git push failed".to_string())?;
+
+            // GitHub refuses to change the base of a pull request that is in a
+            // stack, so any stack holding this one has to go first. Every path
+            // below that sends a base does so only when `retargeted`, so asking
+            // here rather than at each of them is what stops the condition
+            // drifting from the calls it has to precede; see where `retargeted`
+            // is worked out for why one predicate covers all of them.
+            if retargeted {
+                dissolve_any_stack_holding(
+                    stacks,
+                    gh,
+                    pull_request.number,
+                    DissolveReason::ToMoveABase,
+                )
+                .await?;
+            }
+
             if let Some(base_branch) = base_branch {
                 // We are using a base branch.
 
-                if let Some(base_branch_commit) = pr_base_parent {
-                    // ...and we prepared a new commit for it, so we need to push an
-                    // update of the base branch.
-                    cmd.arg(format!(
-                        "{}:{}",
-                        base_branch_commit,
-                        base_branch.on_github()
-                    ));
-                }
+                // A base branch of ours that the Pull Request is moving off —
+                // which is what a stack migrating to `spr.baseStrategy =
+                // linear` does — is nobody's once it has moved, so it goes.
+                // Retargeting and deleting have to happen in that order and the
+                // retarget has to be confirmed first, which is why this does not
+                // go through `pull_request_updates` with everything else.
+                let obsolete_base = old_base.as_ref().filter(|old| {
+                    old.branch_name() != base_branch.branch_name()
+                        && config.is_synthetic_base_branch(old.branch_name())
+                });
 
-                // Push the new commit onto the Pull Request branch (and also the
-                // new base commit, if we added that to cmd above).
-                run_command(&mut cmd)
-                    .await
-                    .reword("git push failed".to_string())?;
+                if let Some(obsolete_base) = obsolete_base {
+                    let deleted = gh
+                        .retarget_pull_request(pull_request.number, &base_branch, obsolete_base)
+                        .await?;
 
-                // If the Pull Request's base is not set to the base branch yet,
-                // change that now.
-                if pull_request.base.branch_name() != base_branch.branch_name() {
+                    output(
+                        "🎯",
+                        &format!(
+                            "Retargeted Pull Request #{} to {}",
+                            pull_request.number,
+                            base_branch.branch_name()
+                        ),
+                    )?;
+
+                    if deleted {
+                        output("🗑️", &format!("Deleted {}", obsolete_base.branch_name()))?;
+                    }
+                } else if pull_request.base.branch_name() != base_branch.branch_name() {
+                    // If the Pull Request's base is not set to the base branch
+                    // yet, change that now.
                     pull_request_updates.base = Some(base_branch.branch_name().to_string());
                 }
             } else {
-                // The Pull Request is against the master branch. In that case we
-                // only need to push the update to the Pull Request branch.
-                run_command(&mut cmd)
-                    .await
-                    .reword("git push failed".to_string())?;
+                // The Pull Request is against the master branch (or we are
+                // retargeting it to master), so there was no base branch of
+                // ours in the push above. There may still be one it is moving
+                // off: retarget it to master and, where that branch was ours,
+                // take it away — in that order, because a base branch deleted
+                // while the pull request still points at it closes the pull
+                // request.
+                if let Some(ref old_base) = old_base {
+                    let deleted = gh
+                        .retarget_to_master_branch(pull_request.number, old_base)
+                        .await?;
+
+                    output(
+                        "🎯",
+                        &format!(
+                            "Retargeted Pull Request #{} to {}",
+                            pull_request.number,
+                            config.master_ref.branch_name()
+                        ),
+                    )?;
+
+                    if deleted {
+                        output("🗑️", &format!("Deleted {}", old_base.branch_name()))?;
+                    }
+                }
             }
 
             if !pull_request_updates.is_empty() {
@@ -756,21 +1237,20 @@ async fn diff_impl(
         } else {
             // We are creating a new Pull Request.
 
-            // If there's a base branch, add it to the push
-            if let (Some(base_branch), Some(base_branch_commit)) = (&base_branch, pr_base_parent) {
-                cmd.arg(format!(
-                    "{}:{}",
-                    base_branch_commit,
-                    base_branch.on_github()
-                ));
-            }
-            // Push the pull request branch and the base branch if present
+            // Push the pull request branch and the base branch if present.
+            //
+            // Deliberately a second copy of the push rather than one hoisted
+            // above `if let Some(pull_request)`: hoisting it would put the push
+            // ahead of the "updating Pull Request #N" line the other branch
+            // prints first. Nothing else holds it here — a pull request that
+            // does not exist yet is in no stack, so the unstacking the other
+            // branch does after its push has nothing to do on this side.
             run_command(&mut cmd)
                 .await
                 .reword("git push failed".to_string())?;
 
             // Then call GitHub to create the Pull Request.
-            let pull_request_number = gh
+            let created = gh
                 .create_pull_request(
                     message,
                     base_branch
@@ -783,22 +1263,21 @@ async fn diff_impl(
                 )
                 .await?;
 
-            let pull_request_url = config.pull_request_url(pull_request_number);
+            pull_request_number = Some(created);
+            let pull_request_url = config.pull_request_url(created);
 
             output(
                 "✨",
                 &format!(
                     "Created new Pull Request #{}: {}",
-                    pull_request_number, &pull_request_url,
+                    created, &pull_request_url
                 ),
             )?;
 
             message.insert(MessageSection::PullRequest, pull_request_url);
             local_commit.message_changed = true;
 
-            let result = gh
-                .request_reviewers(pull_request_number, requested_reviewers)
-                .await;
+            let result = gh.request_reviewers(created, requested_reviewers).await;
             match result {
                 Ok(()) => (),
                 Err(error) => {
@@ -811,7 +1290,18 @@ async fn diff_impl(
         }
     }
 
-    Ok(())
+    // `pr_commit` is where the pull request branch now points — or would, on a
+    // dry run, where it still points, which is enough for the change above to
+    // report the branch it would be based on.
+    Ok(PushedChange {
+        local_oid: local_commit.oid,
+        head_oid: pr_commit,
+        branch: pull_request_branch,
+        pushed_as_cherry_pick,
+        pull_request_number,
+        based_on,
+        retargeted,
+    })
 }
 
 #[cfg(test)]
@@ -1137,14 +1627,416 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
-    // Integration tests would require more complex setup with actual Git repositories
-    // and proper mocking of GitHub API calls. The tests above focus on:
-    // 1. Option parsing and validation
-    // 2. Data structure correctness
-    // 3. Basic logic flow verification
-    //
-    // For full integration testing, consider:
-    // - Mocking GitHub API responses
-    // - Creating test repositories with specific commit structures
-    // - Testing the interaction between revision specification and commit preparation
+    fn make_test_pr(base_branch_name: &str) -> PullRequest {
+        PullRequest {
+            number: 42,
+            node_id: "PR_test".to_string(),
+            state: PullRequestState::Open,
+            title: "test".to_string(),
+            body: None,
+            sections: Default::default(),
+            base: crate::github::GitHubBranch::new_from_branch_name(
+                base_branch_name,
+                "origin",
+                "main",
+            ),
+            head: crate::github::GitHubBranch::new_from_branch_name(
+                "spr/test/my-feature",
+                "origin",
+                "main",
+            ),
+            base_oid: git2::Oid::zero(),
+            head_oid: git2::Oid::zero(),
+            merge_commit: None,
+            reviewers: Default::default(),
+            review_status: None,
+        }
+    }
+
+    /// A change below that a linear base can be taken from: it is the parent of
+    /// the change under test, and was pushed as itself rather than
+    /// cherry-picked.
+    fn make_change_below(branch_name: &str) -> PushedChange {
+        PushedChange {
+            local_oid: parent_oid(),
+            head_oid: git2::Oid::from_str("2222222222222222222222222222222222222222").unwrap(),
+            branch: crate::github::GitHubBranch::new_from_branch_name(
+                branch_name,
+                "origin",
+                "main",
+            ),
+            pushed_as_cherry_pick: false,
+            pull_request_number: Some(41),
+            based_on: None,
+            retargeted: false,
+        }
+    }
+
+    /// The commit the change under test is stacked on.
+    fn parent_oid() -> Oid {
+        git2::Oid::from_str("1111111111111111111111111111111111111111").unwrap()
+    }
+
+    #[test]
+    fn test_determine_base_branch_no_pr_returns_none() {
+        let (base, old) = determine_base_branch(None, None, true, false);
+        assert!(base.is_none());
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_determine_base_branch_pr_on_master_returns_none() {
+        let pr = make_test_pr("main");
+        let (base, old) = determine_base_branch(Some(&pr), None, true, false);
+        assert!(base.is_none());
+        assert!(old.is_none());
+    }
+
+    #[test]
+    fn test_determine_base_branch_stacked_pr_not_on_master_keeps_the_base_it_has() {
+        let pr = make_test_pr("spr/test/main.parent-feature");
+        let (base, old) = determine_base_branch(Some(&pr), None, false, false);
+        assert_eq!(base.unwrap().branch_name(), "spr/test/main.parent-feature");
+        assert_eq!(old.unwrap().branch_name(), "spr/test/main.parent-feature");
+    }
+
+    #[test]
+    fn test_determine_base_branch_drops_synthetic_when_directly_on_master() {
+        let pr = make_test_pr("spr/test/main.parent-feature");
+        let (base, old) = determine_base_branch(Some(&pr), None, true, false);
+        assert!(
+            base.is_none(),
+            "should drop synthetic base when directly on master"
+        );
+        assert_eq!(
+            old.unwrap().branch_name(),
+            "spr/test/main.parent-feature",
+            "should report the base it is leaving"
+        );
+    }
+
+    #[test]
+    fn test_determine_base_branch_drops_synthetic_when_cherry_pick() {
+        let pr = make_test_pr("spr/test/main.parent-feature");
+        let (base, old) = determine_base_branch(Some(&pr), None, false, true);
+        assert!(base.is_none(), "should drop synthetic base on cherry-pick");
+        assert!(old.is_some(), "should report the base it is leaving");
+    }
+
+    #[test]
+    fn test_determine_base_branch_pr_on_master_not_directly_on_master() {
+        let pr = make_test_pr("main");
+        let (base, old) = determine_base_branch(Some(&pr), None, false, false);
+        assert!(base.is_none(), "PR already on master stays on master");
+        assert!(old.is_none(), "no synthetic base to clean up");
+    }
+    /// The whole point of the linear strategy: the pull request is based on the
+    /// branch of the change below rather than on a branch of its own.
+    #[test]
+    fn a_linear_base_is_the_branch_of_the_change_below() {
+        let below = make_change_below("spr/test/parent-feature");
+        let (base, _) =
+            determine_base_branch(Some(&make_test_pr("main")), Some(&below), false, false);
+
+        assert_eq!(base.unwrap().branch_name(), "spr/test/parent-feature");
+    }
+
+    /// A change that has no pull request yet is based on the change below just
+    /// the same, so that the first push of a stack is already linear.
+    #[test]
+    fn a_new_pull_request_takes_the_linear_base_too() {
+        let below = make_change_below("spr/test/parent-feature");
+        let (base, old) = determine_base_branch(None, Some(&below), false, false);
+
+        assert_eq!(base.unwrap().branch_name(), "spr/test/parent-feature");
+        assert!(old.is_none());
+    }
+
+    /// Moving a pull request off its synthetic base branch has to report that
+    /// branch as the one it is leaving, or the branch would be left on the
+    /// remote with nothing pointing at it.
+    #[test]
+    fn a_linear_base_replaces_a_synthetic_one() {
+        let below = make_change_below("spr/test/parent-feature");
+        let (base, old) = determine_base_branch(
+            Some(&make_test_pr("spr/test/main.parent-feature")),
+            Some(&below),
+            false,
+            false,
+        );
+
+        assert_eq!(base.unwrap().branch_name(), "spr/test/parent-feature");
+        assert_eq!(old.unwrap().branch_name(), "spr/test/main.parent-feature");
+    }
+
+    /// A run that does not contain the change below — which the default
+    /// `jj spr diff` never does, since it is given one revision — must leave a
+    /// pull request based on the branch below where it is. It is still the
+    /// right base; only writing to it is out of the question.
+    #[test]
+    fn a_run_without_the_change_below_keeps_the_base_it_has() {
+        let (base, old) = determine_base_branch(
+            Some(&make_test_pr("spr/test/parent-feature")),
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(base.unwrap().branch_name(), "spr/test/parent-feature");
+        assert_eq!(old.unwrap().branch_name(), "spr/test/parent-feature");
+    }
+
+    /// A branch jj-spr did not make is left alone: the pull request keeps it,
+    /// as it did before there was more than one base strategy.
+    #[test]
+    fn a_base_branch_that_is_not_ours_is_kept() {
+        let (base, old) = determine_base_branch(
+            Some(&make_test_pr("someones-release-branch")),
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(base.unwrap().branch_name(), "someones-release-branch");
+        assert_eq!(old.unwrap().branch_name(), "someones-release-branch");
+    }
+
+    /// The head branch of the pull request below is what a stacked pull request
+    /// is based on under the linear strategy. A base commit pushed there would
+    /// turn up in that pull request, so the change gets a base branch of its
+    /// own instead — this is what keeps turning the strategy back off from
+    /// writing into somebody else's review.
+    #[test]
+    fn no_base_commit_is_pushed_to_a_pull_request_head_branch() {
+        let config = create_test_config();
+        let head_branch = config.new_github_branch("spr/test/parent-feature");
+
+        assert!(!may_push_base_commit_to(&config, &head_branch));
+    }
+
+    /// The branch jj-spr generates for a stacked pull request to be based on
+    /// is what the base commit is built for in the first place.
+    #[test]
+    fn a_base_commit_is_pushed_to_a_base_branch_of_ours() {
+        let config = create_test_config();
+        let base_branch = config.new_github_branch("spr/test/main.parent-feature");
+
+        assert!(may_push_base_commit_to(&config, &base_branch));
+    }
+
+    /// A branch outside jj-spr's namespace is somebody's deliberate choice of
+    /// base, and is treated as it always has been.
+    #[test]
+    fn a_base_commit_is_pushed_to_a_branch_that_is_not_ours() {
+        let config = create_test_config();
+        let branch = config.new_github_branch("someones-release-branch");
+
+        assert!(may_push_base_commit_to(&config, &branch));
+    }
+
+    /// The default strategy builds each pull request a base branch of its own,
+    /// so what was pushed below is nothing to it.
+    #[test]
+    fn the_synthetic_strategy_ignores_the_change_below() {
+        let below = make_change_below("spr/test/parent-feature");
+
+        assert!(
+            linear_base(
+                BaseStrategy::Synthetic,
+                Some(&below),
+                parent_oid(),
+                false, // directly_based_on_master
+                false, // cherry_pick
+            )
+            .is_none()
+        );
+    }
+
+    /// The whole of the linear strategy in one assertion: the change below is
+    /// what the pull request above is based on.
+    #[test]
+    fn the_linear_strategy_takes_the_change_below() {
+        let below = make_change_below("spr/test/parent-feature");
+        let taken = linear_base(
+            BaseStrategy::Linear,
+            Some(&below),
+            parent_oid(),
+            false, // directly_based_on_master
+            false, // cherry_pick
+        )
+        .expect("the change below should serve as the base");
+
+        assert_eq!(taken.branch.branch_name(), "spr/test/parent-feature");
+    }
+
+    /// The bottom of a run has nothing below it, and so nothing to be based on.
+    #[test]
+    fn there_is_no_linear_base_without_a_change_below() {
+        assert!(
+            linear_base(
+                BaseStrategy::Linear,
+                None,
+                parent_oid(),
+                false, // directly_based_on_master
+                false, // cherry_pick
+            )
+            .is_none()
+        );
+    }
+
+    /// A run given revisions that do not form one chain would otherwise base a
+    /// change on a branch that does not carry the tree it is built on.
+    #[test]
+    fn a_change_below_that_is_not_the_parent_is_not_a_base() {
+        let mut below = make_change_below("spr/test/parent-feature");
+        below.local_oid = git2::Oid::from_str("3333333333333333333333333333333333333333").unwrap();
+
+        assert!(
+            linear_base(
+                BaseStrategy::Linear,
+                Some(&below),
+                parent_oid(),
+                false, // directly_based_on_master
+                false, // cherry_pick
+            )
+            .is_none()
+        );
+    }
+
+    /// A cherry-picked change below was pushed as it would look on master, so
+    /// its branch is the wrong tree to diff the change above against.
+    #[test]
+    fn a_cherry_picked_change_below_is_not_a_base() {
+        let mut below = make_change_below("spr/test/parent-feature");
+        below.pushed_as_cherry_pick = true;
+
+        assert!(
+            linear_base(
+                BaseStrategy::Linear,
+                Some(&below),
+                parent_oid(),
+                false, // directly_based_on_master
+                false, // cherry_pick
+            )
+            .is_none()
+        );
+    }
+
+    /// A change being cherry-picked belongs on master, whatever it is stacked
+    /// on locally.
+    #[test]
+    fn a_cherry_picked_change_takes_no_linear_base() {
+        let below = make_change_below("spr/test/parent-feature");
+
+        assert!(
+            linear_base(
+                BaseStrategy::Linear,
+                Some(&below),
+                parent_oid(),
+                false, // directly_based_on_master
+                true,  // cherry_pick
+            )
+            .is_none()
+        );
+    }
+
+    /// A change on master is against master, whatever was pushed below it.
+    #[test]
+    fn a_change_on_master_takes_no_linear_base() {
+        let below = make_change_below("spr/test/parent-feature");
+
+        assert!(
+            linear_base(
+                BaseStrategy::Linear,
+                Some(&below),
+                parent_oid(),
+                true,  // directly_based_on_master
+                false, // cherry_pick
+            )
+            .is_none()
+        );
+    }
+
+    /// The link GitHub's stacks are made of: this pull request's base ref is
+    /// the head ref of the pull request below.
+    #[test]
+    fn a_pull_request_based_on_the_one_below_is_chained_to_it() {
+        let below = make_change_below("spr/test/parent-feature");
+        let base = below.branch.clone();
+
+        assert_eq!(chain_link(Some(&below), Some(&base)), Some(41));
+    }
+
+    /// The case `linear_base` alone gets wrong. A change whose trees are
+    /// already right needs no push, so the run never moves it off the synthetic
+    /// base branch it has — while the change below still offers itself as a
+    /// base. Registering that as a stack would be refused for not forming one.
+    #[test]
+    fn a_pull_request_left_on_its_synthetic_base_is_not_chained() {
+        let below = make_change_below("spr/test/parent-feature");
+        let base = crate::github::GitHubBranch::new_from_branch_name(
+            "spr/test/main.parent-feature",
+            "origin",
+            "main",
+        );
+
+        assert_eq!(chain_link(Some(&below), Some(&base)), None);
+    }
+
+    /// A pull request against the master branch has no base branch at all, and
+    /// so is the bottom of whatever stack it is in.
+    #[test]
+    fn a_pull_request_on_master_is_chained_to_nothing() {
+        let below = make_change_below("spr/test/parent-feature");
+
+        assert_eq!(chain_link(Some(&below), None), None);
+    }
+
+    /// Nothing below means nothing to be chained to, whatever the base says.
+    #[test]
+    fn a_pull_request_with_nothing_below_is_chained_to_nothing() {
+        let base = crate::github::GitHubBranch::new_from_branch_name(
+            "spr/test/parent-feature",
+            "origin",
+            "main",
+        );
+
+        assert_eq!(chain_link(None, Some(&base)), None);
+    }
+
+    /// A change below whose pull request this run is opening has no number
+    /// until GitHub answers with one, and a dry run never asks. There is
+    /// nothing to name it by, so the chain stops.
+    #[test]
+    fn a_pull_request_that_does_not_exist_yet_chains_nothing_to_it() {
+        let mut below = make_change_below("spr/test/parent-feature");
+        below.pull_request_number = None;
+        let base = below.branch.clone();
+
+        assert_eq!(chain_link(Some(&below), Some(&base)), None);
+    }
+
+    /// jj-spr never force-pushes: every commit it puts on a pull request branch
+    /// descends from what was there before, whatever else it merges in. Were
+    /// this to stop holding, pushing would need `--force` and GitHub would drop
+    /// the review comments on the commits that went missing.
+    #[test]
+    fn a_pull_request_branch_only_ever_moves_forward() {
+        let head = git2::Oid::from_str("4444444444444444444444444444444444444444").unwrap();
+        let base = git2::Oid::from_str("5555555555555555555555555555555555555555").unwrap();
+
+        for merged in [None, Some(base), Some(head)] {
+            let parents = pr_head_parents(head, merged);
+            assert_eq!(
+                parents.first(),
+                Some(&head),
+                "the branch tip must stay the first parent, merging {merged:?}"
+            );
+        }
+
+        // ...and a merge of the commit that is already there is not a merge.
+        assert_eq!(pr_head_parents(head, Some(head)), vec![head]);
+        assert_eq!(pr_head_parents(head, Some(base)), vec![head, base]);
+        assert_eq!(pr_head_parents(head, None), vec![head]);
+    }
 }

@@ -96,6 +96,42 @@ jj spr land -r <change-id>
 jj spr land --cherry-pick -r <change-id>
 ```
 
+**Stacks:** Landing a pull request retargets the pull requests stacked on top of
+it at the default branch, so the rest of the stack is ready to land without
+another `jj spr diff`. The base branches they pointed at are deleted, except
+under [`spr.baseStrategy = linear`](configuration.md#basestrategy), where what
+they pointed at is the landed pull request's own branch and taking it away
+would close them. Until you rebase and run `jj spr diff` again, though, a
+retargeted pull request's diff on GitHub still includes the changes that just
+landed.
+
+**GitHub stacks:** With
+[`spr.stackDisplay = github`](configuration.md#stackdisplay), landing takes the
+GitHub stack holding the pull request apart before it merges anything, and then
+merges that pull request on its own. It has to: GitHub refuses to merge a pull
+request a stack holds, and offers its own stack merge instead. Run `jj spr diff`
+afterwards to register what is left as a stack again; it gets a new number and a
+new URL, and any pull request that was in the dissolved stack but is not in the
+run you push is left unstacked — jj-spr says which.
+
+Taking a stack apart cannot be undone, so landing asks GitHub whether it will
+merge before it dissolves anything, wherever it can. Landing the bottom pull
+request of a stack moves no base branch, so that answer is the same before the
+stack comes apart as after it, and a land GitHub turns down — a required check
+still running, a conflict, an unmet requirement — leaves the stack standing.
+Higher up the stack the base has to move onto the default branch first, and
+moving it is what needs the stack gone, so there a refusal still costs the
+stack.
+
+Landing deliberately does *not* take GitHub up on that stack merge
+(`PUT /pulls/{n}/merge-async`), which closes every pull request below the one
+you asked for as merged. More seriously, GitHub follows that merge by rebasing
+the head branch of the pull request *above* onto its new base, and the branches
+jj-spr pushes are merge commits that a rebase discards: the branch collapses
+onto its base and GitHub closes the pull request as having no changes, review
+and all. For the same reason, do not merge a stacked pull request from GitHub's
+own interface.
+
 **Important:** After landing, you must manually rebase your working copy:
 ```bash
 jj git fetch
@@ -166,16 +202,68 @@ jj spr close [OPTIONS]
 ```
 
 **Options:**
-- `-r, --revision <REV>` - Revision whose PR to close (default: `@`)
+- `-r, --revision <REV>` - Revision, or revision range, whose PRs to close
+  (default: `@-`)
+- `-a, --all` - Close the PRs of every commit from the base to the revision
+- `--base <REV>` - Base revision for `--all` (default: trunk)
 
 **Examples:**
 ```bash
-# Close PR for current working copy
+# Close PR for the parent of the working copy
 jj spr close
 
 # Close PR for specific change
 jj spr close -r <change-id>
 ```
+
+**Stacks:** Closing a pull request retargets the pull requests based on it at
+*its* base, not at the default branch — closing puts nothing on the default
+branch, so sending them there would pull in the changes of every pull request
+below, which are still under review. Each retargeted pull request's diff does
+grow to include the closed pull request's changes, which is reported when it
+happens: those changes are no longer under review anywhere else.
+
+The closed pull request's branch is only deleted once every pull request based
+on it has been moved, because GitHub closes a pull request whose base branch
+disappears. If one of them cannot be moved, the branch is kept and said so.
+Its base branch is deleted only where jj-spr generated that branch for this
+pull request alone, and only while nothing has been pointed at it. So a base
+branch you set yourself is never deleted, and neither is the one a stacked pull
+request has under [`spr.baseStrategy =
+linear`](configuration.md#basestrategy), which is the branch of the pull
+request below. Where `linear` fell back to generating a base branch after all,
+that branch *is* deleted — unless some open pull request still targets it,
+which the pull requests just retargeted onto it are the usual reason for.
+
+**GitHub stacks:** With
+[`spr.stackDisplay = github`](configuration.md#stackdisplay), the close itself
+needs nothing special: GitHub allows a stacked pull request to be closed, and
+keeps it in the stack in place with the stack still open. What a stack refuses
+is the retargeting that follows, because a stack owns its members' base refs.
+So closing takes apart whatever stack holds each pull request it has to move —
+usually the single stack they were all in, but a pull request based on the
+closed one's branch that jj-spr never pushed drags its stack in too. Run
+`jj spr diff` afterwards to register what is left as a stack again; it gets a
+new number and a new URL, and any pull request that was in the dissolved stack
+but is not in the run you push is left unstacked — jj-spr says which, not
+counting the one it just closed.
+
+Take the closed change out of the local chain before that `jj spr diff` —
+abandon it, or fold it into a neighbour. Closing takes the pull request number
+off the change but leaves the change where it was, so a run that pushes it
+opens a *new* pull request rather than putting the old one back. Merely
+skipping it in the revset does not work either: jj-spr does not step over a
+change, it builds around it. It chains a change onto the one below only when
+that one is its local parent, so whatever sat on the closed change gets a base
+branch of its own carrying that change's work — the chain breaks across the
+gap, and the changes you closed drop back out of the diffs above, which is the
+opposite of what the retargeting just reported.
+
+Closing a pull request with nothing stacked on it moves no base, so it takes
+no stack apart and the stack keeps its number. The closed pull request stays in
+it, which is what GitHub does with a closed member; there is no way to remove
+one pull request from a stack short of destroying the stack for every other
+member.
 
 ---
 

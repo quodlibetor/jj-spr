@@ -32,6 +32,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, `auto`, asks GitHub which of the two that branch allows, so a
   repository that requires a merge queue needs no configuration at all.
   `jj spr init` asks for it.
+- `jj spr diff` retargets a pull request at the default branch once its commit
+  sits directly on that branch, and deletes the synthetic base branch the pull
+  request used to point at. The branch is only deleted after GitHub confirms
+  the retarget, because GitHub closes a pull request whose base branch
+  disappears, and only branches under `spr.branchPrefix` are deleted.
+- `jj spr land` retargets the pull requests stacked on the one it lands at the
+  default branch, and deletes the base branches they pointed at, instead of
+  leaving that until the next `jj spr diff`.
+- `jj spr land` refuses to land a pull request that GitHub reports as blocked
+  by its base branch: a required check failing or not yet started, a missing
+  review, an unsatisfied rule. It previously asked only whether the branches
+  conflicted, so a caller able to bypass a protected branch could land a pull
+  request whose CI had not started. `--force`, or the
+  `spr.landWithUnmetRequirements` setting, lands anyway.
+- `spr.baseStrategy` chooses what a stacked pull request is based on. The
+  default, `synthetic`, keeps giving each one a generated base branch carrying
+  the parent change's tree. `linear` bases it on the pull request branch of the
+  change below instead, so the stack on GitHub is a chain of branches and no
+  base branches are generated. Both push the whole stack forward only: jj-spr
+  still never force-pushes. A change whose parent is not in the same run keeps
+  the base its pull request has, and falls back to a synthetic base branch only
+  where that run has to build a base commit for it — as a change pushed as a
+  cherry-pick, or stacked on one, always does.
+
+- `spr.stackDisplay` chooses how a pull request says which stack it belongs to.
+  There are two ways of saying it and they are alternatives, not layers — two
+  descriptions of the same stack can disagree — so it is one setting with three
+  values rather than two that can both be on. `section`, the default, writes a
+  `Stack` list into each pull request's body; `github` registers the pull
+  requests with GitHub's stacked pull requests and lets GitHub draw the stack;
+  `none` says nothing. Turning the description off is a thing you say, not a
+  thing you get by omission.
+
+  `github` needs `spr.baseStrategy = linear` — GitHub requires each pull
+  request in a stack to be based on the branch of the one below — and supplies
+  it where the strategy was not set, rather than overriding one that was.
+  GitHub refuses to change the base branch of a pull request that is in a
+  stack, so a run that has to retarget one takes the whole stack apart and
+  registers the pull requests it pushed as a new one, under a new number.
+  `--dry-run` reports what the run would register. `jj spr init` asks for the
+  setting right after the base strategy, offering `github` only where the
+  strategy picked can carry a stack.
+
+- `jj spr land` works under `spr.stackDisplay = github`. It takes the GitHub stack
+  holding the pull request apart before it merges anything, and then merges
+  that pull request on its own — which is what it does without the setting, and
+  what leaves the pull requests above it untouched. It has no choice about the
+  first part: GitHub refuses to merge a pull request a stack holds, and points
+  at its own stack merge instead. It says which stack it dissolved and which
+  pull requests are left unstacked; `jj spr diff` afterwards registers what is
+  left, under a new number.
+
+  Taking a stack apart cannot be undone, so a land that GitHub is going to
+  refuse asks first where it can. Landing the bottom pull request of a stack
+  moves no base branch, so GitHub's answer is the same before the stack comes
+  apart as after it — and a land it turns down for the ordinary reasons, a
+  required check still running or a conflict, leaves the stack standing. Higher
+  up the stack the base has to move onto the default branch before GitHub will
+  answer about the merge at all, and moving it means dissolving the stack, so
+  there the refusal still costs the stack.
+
+  It deliberately does not take that offer up. The stack merge closes every
+  pull request below the one asked for as merged and — worse — follows the
+  merge by rebasing the head branch of the pull request *above* onto its new
+  base. The branches jj-spr pushes are merge commits that a rebase discards, so
+  that branch collapses onto its base and GitHub closes the pull request as
+  having no changes, review and all. For the same reason, do not merge a
+  stacked pull request from GitHub's own interface while GitHub is drawing the
+  stack.
+
+- `jj spr close` works under `spr.stackDisplay = github`. Closing itself needs nothing:
+  GitHub allows it while a stack holds the pull request, and keeps the closed
+  one in the stack. Pointing the pull requests above at the closed one's base
+  is what a stack refuses, so closing takes apart whatever stack holds each of
+  them first — usually the one stack they were all in. It says which stacks it
+  dissolved and which pull requests are left unstacked, not counting the one it
+  just closed. To get a stack again, take the closed change out of the local
+  chain — abandon it, or fold it into a neighbour — and run `jj spr diff` over
+  what is left; the new stack has a new number. Closing a pull request with
+  nothing stacked on it moves no base, so it takes nothing apart at all and the
+  stack it is in keeps its number.
+
+### Fixed
+
+- `jj spr close` no longer closes the pull requests around the one it is asked
+  to close. It asks GitHub which open pull requests are based on the closed
+  one's head branch, points them at the closed pull request's own base — so
+  each picks up the closed changes, but not those of the pull requests below it
+  that are still under review — and only then deletes the head branch, keeping
+  it when one of them could not be moved. It also no longer deletes a base
+  branch jj-spr did not generate: under `spr.baseStrategy = linear` that branch
+  is the head branch of the pull request below, so deleting it closed that pull
+  request, and a base branch set by hand went the same way. A generated base
+  branch is kept too while any open pull request still targets it, which the
+  ones just retargeted onto it are the usual reason for.
 
 ## [0.1.0] - 2025-11-15
 

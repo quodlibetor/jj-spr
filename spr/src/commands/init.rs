@@ -10,7 +10,8 @@ use lazy_regex::regex;
 
 use crate::{
     config::{
-        AuthTokenSource, LandStrategy, get_auth_token_with_source, get_config_value, set_jj_config,
+        AuthTokenSource, BaseStrategy, LandStrategy, StackDisplay, get_auth_token_with_source,
+        get_config_value, set_jj_config,
     },
     error::{Error, Result, ResultExt},
     output::output,
@@ -199,6 +200,96 @@ pub async fn init() -> Result<()> {
         .interact_text()?;
 
     set_jj_config("spr.branchPrefix", &branch_prefix, &path)?;
+
+    // What a stacked pull request is based on
+
+    console::Term::stdout().write_line("")?;
+
+    output(
+        "❓",
+        &formatdoc!(
+            "What should a stacked pull request be based on? This only comes \
+             up once you stack: a change sitting directly on the main branch \
+             gets a pull request against the main branch either way.
+             'synthetic' gives every stacked pull request a base branch of its \
+             own, carrying the tree of the change below it. Each pull request \
+             then stands alone, so you can push one change without the ones \
+             below it being up to date on GitHub.
+             'linear' bases each pull request on the pull request branch of \
+             the change below it, so the stack on GitHub is a chain of \
+             branches. It wants the whole stack pushed in one run, since a \
+             stale branch below would leak its changes into the diff above."
+        ),
+    )?;
+
+    let base_strategy = select_one(
+        "Base strategy",
+        &BaseStrategy::ALL,
+        BaseStrategy::as_str,
+        get_config_value("spr.baseStrategy", &config)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    )?;
+
+    set_jj_config("spr.baseStrategy", base_strategy.as_str(), &path)?;
+
+    // How a pull request says which stack it belongs to
+
+    console::Term::stdout().write_line("")?;
+
+    output(
+        "❓",
+        &formatdoc!(
+            "How should a pull request say which stack it belongs to? Only one \
+             of these, because two descriptions of the same stack can disagree.
+             'section' writes a `Stack` list into each pull request's body, \
+             marking the one you are reading. It asks nothing of the \
+             repository, so it works everywhere.
+             'none' says nothing, and leaves the stack visible only in the \
+             branches."
+        ),
+    )?;
+
+    // GitHub's stacks are offered only where the base strategy can carry one:
+    // they require each pull request to be based on the branch of the one
+    // below, which the synthetic strategy never does, and the pair is the
+    // combination the configuration refuses. Leaving the value off the list is
+    // also how `init` heals a repository that already holds it.
+    let github_offered = base_strategy == BaseStrategy::Linear;
+
+    if github_offered {
+        output(
+            "  ",
+            &formatdoc!(
+                "'github' registers the pull requests with GitHub's Stacked \
+                 Pull Requests API instead, so GitHub draws the stack itself — \
+                 on each pull request and in the repository's list of stacks. \
+                 Better where you can have it, but it is in public preview and \
+                 not every repository has it yet."
+            ),
+        )?;
+    } else {
+        output(
+            "ℹ️ ",
+            "GitHub-native stacks need a linear base strategy, so they are not offered here.",
+        )?;
+    }
+
+    let displays = StackDisplay::ALL
+        .into_iter()
+        .filter(|display| github_offered || !display.draws_the_stack())
+        .collect::<Vec<_>>();
+
+    let stack_display = select_one(
+        "Stack display",
+        &displays,
+        StackDisplay::as_str,
+        get_config_value("spr.stackDisplay", &config)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+    )?;
+
+    set_jj_config("spr.stackDisplay", stack_display.as_str(), &path)?;
 
     // How a pull request is landed
 

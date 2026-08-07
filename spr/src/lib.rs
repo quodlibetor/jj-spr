@@ -12,6 +12,8 @@ pub mod git;
 pub mod github;
 pub mod jj;
 pub mod message;
+pub mod native_stacks;
 pub mod output;
 pub mod revision_utils;
+pub mod stacked;
 pub mod utils;

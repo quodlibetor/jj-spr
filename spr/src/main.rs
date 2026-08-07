@@ -134,12 +134,30 @@ pub async fn spr() -> Result<()> {
     let branch_prefix = get_config_value("spr.branchPrefix", &git_config)
         .ok_or_else(|| Error::new("spr.branchPrefix must be configured".to_string()))?;
     let require_approval = get_config_bool("spr.requireApproval", &git_config).unwrap_or(false);
+    let land_with_unmet_requirements =
+        get_config_bool("spr.landWithUnmetRequirements", &git_config).unwrap_or(false);
+    let stack_display = get_config_value("spr.stackDisplay", &git_config)
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or_default();
+    // The two settings are not independent — see `resolve_base_strategy`, which
+    // is where that is said, so that nothing downstream has to ask about the
+    // combination.
+    let base_strategy = jj_spr::config::resolve_base_strategy(
+        stack_display,
+        get_config_value("spr.baseStrategy", &git_config)
+            .map(|value| value.parse())
+            .transpose()?,
+    )?;
     let land_strategy = get_config_value("spr.landStrategy", &git_config)
         .map(|value| value.parse())
         .transpose()?
         .unwrap_or_default();
 
     let config = jj_spr::config::Config {
+        land_with_unmet_requirements,
+        base_strategy,
+        stack_display,
         land_strategy,
         ..jj_spr::config::Config::new(
             github_owner,
@@ -182,19 +200,19 @@ pub async fn spr() -> Result<()> {
         .default_headers(headers)
         .build()?;
 
-    let mut gh = jj_spr::github::GitHub::new(
+    let gh = jj_spr::github::GitHub::new(
         config.clone(),
         jj.git_repo.path().to_owned(),
         graphql_client.clone(),
     );
 
     match cli.command {
-        Commands::Diff(opts) => commands::diff::diff(opts, &jj, &mut gh, &config).await?,
-        Commands::Land(opts) => commands::land::land(opts, &jj, &mut gh, &config).await?,
-        Commands::Amend(opts) => commands::amend::amend(opts, &jj, &mut gh, &config).await?,
+        Commands::Diff(opts) => commands::diff::diff(opts, &jj, &gh, &config).await?,
+        Commands::Land(opts) => commands::land::land(opts, &jj, &gh, &config).await?,
+        Commands::Amend(opts) => commands::amend::amend(opts, &jj, &gh, &config).await?,
         Commands::List => commands::list::list(graphql_client, &config).await?,
-        Commands::Patch(opts) => commands::patch::patch(opts, &jj, &mut gh, &config).await?,
-        Commands::Close(opts) => commands::close::close(opts, &jj, &mut gh, &config).await?,
+        Commands::Patch(opts) => commands::patch::patch(opts, &jj, &gh, &config).await?,
+        Commands::Close(opts) => commands::close::close(opts, &jj, &gh, &config).await?,
         Commands::Cleanup(opts) => commands::cleanup::cleanup(opts, &jj, &gh, &config).await?,
         // The following commands are executed above and return from this
         // function before it reaches this match.

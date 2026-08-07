@@ -13,6 +13,183 @@ use crate::{
     utils::slugify,
 };
 
+/// Which branch a stacked pull request asks to be merged into.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BaseStrategy {
+    /// Give every stacked pull request a base branch of its own, carrying the
+    /// tree of the local parent change.
+    ///
+    /// Each pull request is then self-contained: the base branch is built from
+    /// the local parent, so a change can be pushed without its parent being up
+    /// to date on GitHub.
+    #[default]
+    Synthetic,
+    /// Base a stacked pull request on the pull request branch of the change
+    /// below it, so that the stack on GitHub is a chain of branches.
+    ///
+    /// The pull requests below have to be pushed first — which `diff` does
+    /// anyway when it is given the whole stack — because a stale parent branch
+    /// would leak the parent's changes into this pull request's diff.
+    Linear,
+}
+
+impl std::str::FromStr for BaseStrategy {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "synthetic" => Ok(Self::Synthetic),
+            "linear" => Ok(Self::Linear),
+            other => Err(Error::new(format!(
+                "spr.baseStrategy must be 'synthetic' or 'linear', but is '{other}'"
+            ))),
+        }
+    }
+}
+
+impl BaseStrategy {
+    /// Every strategy, in the order `jj spr init` offers them: the default
+    /// first, then in increasing order of what a stack asks of GitHub.
+    ///
+    /// Kept next to the enum rather than in `init`, so that a strategy added
+    /// here is offered rather than quietly left out of the one place that asks
+    /// about it.
+    pub const ALL: [Self; 2] = [Self::Synthetic, Self::Linear];
+
+    /// The value `spr.baseStrategy` takes for this strategy.
+    ///
+    /// The inverse of the [`FromStr`](std::str::FromStr) above, and here rather
+    /// than spelled out wherever a strategy is written: `jj spr init` offers
+    /// these names and then stores the one that was picked, so the two
+    /// directions have to agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+            Self::Linear => "linear",
+        }
+    }
+}
+
+/// How a pull request says which stack it belongs to.
+///
+/// The two ways of saying it are alternatives, not layers: GitHub draws the
+/// stack itself from its stacked pull requests, and the section is a list
+/// written into the pull request body for repositories where it does not. Both
+/// at once would describe the same stack twice, in two places that can disagree,
+/// so this is one setting with three values rather than two settings that can
+/// both be on — the disjointness is the shape of the type, and there is no
+/// combination left to refuse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StackDisplay {
+    /// Say nothing. A pull request stands on its own, and the stack is visible
+    /// only in the branches.
+    None,
+    /// Write a `Stack` section into each pull request's body, listing the stack
+    /// bottom-up with a marker on the pull request being read.
+    ///
+    /// The default, because it is the one that works everywhere: it asks nothing
+    /// of the repository, and a stack described this way is described on any
+    /// host. Turning it off is an explicit [`Self::None`].
+    #[default]
+    Section,
+    /// Register the pull requests as a stack with GitHub's Stacked Pull Requests
+    /// API and let GitHub draw it.
+    ///
+    /// Better where it is available — GitHub shows the stack on each pull
+    /// request and in the repository's list of stacks, and offers to merge it —
+    /// but it is not available everywhere. It is in public preview, and its
+    /// merge-queue support was still rolling out separately as of August 2026,
+    /// so a repository with a required merge queue may answer that it has no
+    /// stacks at all.
+    Github,
+}
+
+impl std::str::FromStr for StackDisplay {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "section" => Ok(Self::Section),
+            "github" => Ok(Self::Github),
+            other => Err(Error::new(format!(
+                "spr.stackDisplay must be 'none', 'section' or 'github', but is '{other}'"
+            ))),
+        }
+    }
+}
+
+impl StackDisplay {
+    /// Every value, in the order `jj spr init` offers them: the one that asks
+    /// most of the repository first, then the fallback, then off.
+    ///
+    /// Kept next to the enum rather than in `init`, so that a value added here
+    /// is offered rather than quietly left out of the one place that asks about
+    /// it.
+    pub const ALL: [Self; 3] = [Self::Github, Self::Section, Self::None];
+
+    /// The value `spr.stackDisplay` takes.
+    ///
+    /// The inverse of the [`FromStr`](std::str::FromStr) above: `jj spr init`
+    /// offers these names and then stores the one that was picked, so the two
+    /// directions have to agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Section => "section",
+            Self::Github => "github",
+        }
+    }
+
+    /// Whether GitHub is asked to draw the stack, which is what needs each pull
+    /// request based on the branch of the one below.
+    pub fn draws_the_stack(self) -> bool {
+        matches!(self, Self::Github)
+    }
+
+    /// Whether a `Stack` section is written into each pull request body.
+    ///
+    /// Nothing reads this yet; the section arrives with the change that writes
+    /// it. It is named here so that the setting is whole from the start rather
+    /// than growing a value later.
+    pub fn writes_a_section(self) -> bool {
+        matches!(self, Self::Section)
+    }
+}
+
+/// The base strategy to run under, given `spr.stackDisplay` and whatever
+/// `spr.baseStrategy` was set to — `None` where it was not set at all.
+///
+/// GitHub's stacks require each pull request's base ref to be the head ref of
+/// the one below, which is what [`BaseStrategy::Linear`] builds and
+/// [`BaseStrategy::Synthetic`] never does. So the two settings are not
+/// independent, and this is the one place that says so: resolving it here, as
+/// the configuration is built, keeps every decision downstream a question about
+/// the base strategy alone rather than about a combination of settings.
+///
+/// Asking for both [`StackDisplay::Github`] and the synthetic strategy is a
+/// contradiction worth surfacing rather than resolving, because either half
+/// could be the mistake. Leaving the strategy unset is not: it means no
+/// preference, so the stack display supplies one. The section asks nothing of
+/// the base strategy — it is a list in a body, and any shape of stack can be
+/// listed — so it leaves the choice alone.
+pub fn resolve_base_strategy(
+    stack_display: StackDisplay,
+    configured: Option<BaseStrategy>,
+) -> Result<BaseStrategy> {
+    match (stack_display.draws_the_stack(), configured) {
+        (true, Some(BaseStrategy::Synthetic)) => Err(Error::new(
+            "spr.stackDisplay = github needs spr.baseStrategy = linear: GitHub's stacked pull \
+             requests require each pull request to be based on the branch of the one below it, \
+             which is what the synthetic strategy does not do. Set spr.baseStrategy to 'linear', \
+             or set spr.stackDisplay to 'section'."
+                .to_string(),
+        )),
+        (true, _) => Ok(BaseStrategy::Linear),
+        (false, configured) => Ok(configured.unwrap_or_default()),
+    }
+}
+
 /// How `jj spr land` asks GitHub to land a pull request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LandStrategy {
@@ -79,6 +256,32 @@ pub struct Config {
     pub master_ref: GitHubBranch,
     pub branch_prefix: String,
     pub require_approval: bool,
+    /// Land a pull request even when GitHub reports the requirements its base
+    /// branch sets as unmet.
+    ///
+    /// Not a parameter of [`Config::new`]: it sits next to `require_approval`,
+    /// and a second bool in that position is one transposed argument away from
+    /// silently disabling the check it guards. Set it with struct update
+    /// syntax instead, which names the field at the call site.
+    pub land_with_unmet_requirements: bool,
+    /// What a stacked pull request is based on.
+    ///
+    /// Not a parameter of [`Config::new`] either: it has a default worth
+    /// having, and every caller that does not care about it would otherwise
+    /// have to name it in a positional list that is already long enough to be
+    /// hard to read. Set it with struct update syntax.
+    pub base_strategy: BaseStrategy,
+    /// How a pull request says which stack it belongs to. See [`StackDisplay`].
+    ///
+    /// Neither value changes what `diff` pushes; each adds a step around the
+    /// run. [`StackDisplay::Github`] does want [`BaseStrategy::Linear`], which
+    /// `main.rs` sees to by resolving the two together through
+    /// [`resolve_base_strategy`] — the one place that enforces it. A `Config`
+    /// built by hand can hold any combination, and under
+    /// [`BaseStrategy::Synthetic`] no pull request is ever chained to the one
+    /// below, so no chain forms and nothing is registered. Set it with struct
+    /// update syntax, for the reasons above.
+    pub stack_display: StackDisplay,
     /// How a land asks GitHub to land a pull request. See [`LandStrategy`].
     pub land_strategy: LandStrategy,
 }
@@ -101,8 +304,22 @@ impl Config {
             master_ref,
             branch_prefix,
             require_approval,
+            land_with_unmet_requirements: false,
+            base_strategy: BaseStrategy::default(),
+            stack_display: StackDisplay::default(),
             land_strategy: LandStrategy::default(),
         }
+    }
+
+    /// Whether GitHub's verdict on the base branch's requirements should stand
+    /// in the way of a land that was passed `force`.
+    ///
+    /// The flag and [`Config::land_with_unmet_requirements`] are alternatives
+    /// rather than an override pair: each says "land anyway", and neither has
+    /// occasion to countermand the other, since nothing asks to *enforce* the
+    /// requirements for a single land.
+    pub fn enforce_merge_requirements(&self, force: bool) -> bool {
+        !force && !self.land_with_unmet_requirements
     }
 
     pub fn pull_request_url(&self, number: u64) -> String {
@@ -151,6 +368,43 @@ impl Config {
             existing_ref_names,
             &format!("{}.{}", self.master_ref.branch_name(), &slugify(title)),
         )
+    }
+
+    /// Whether `branch_name` is in the namespace jj-spr generates branches in,
+    /// and is not the master branch.
+    ///
+    /// This is not the test for whether a branch may be deleted — see
+    /// [`Self::is_synthetic_base_branch`], which is narrower. A pull request
+    /// head branch answers `true` here and must never be taken away while the
+    /// pull request is open, all the more so under [`BaseStrategy::Linear`],
+    /// where it is also what the pull request above is based on.
+    pub fn is_spr_branch(&self, branch_name: &str) -> bool {
+        branch_name.starts_with(&self.branch_prefix) && branch_name != self.master_ref.branch_name()
+    }
+
+    /// Whether `branch_name` names a base branch jj-spr generated to carry a
+    /// stacked pull request's parent tree, as [`Self::get_base_branch_name`]
+    /// names one.
+    ///
+    /// Such a branch belongs to the one pull request based on it, which is why
+    /// only such a branch may be given a derived base commit or deleted when a
+    /// pull request stops pointing at it. Under [`BaseStrategy::Linear`] a
+    /// stacked pull request's base is instead the head branch of the pull
+    /// request below, which is not ours to write to or take away: doing either
+    /// would disturb that pull request, and deleting it would close it.
+    pub fn is_synthetic_base_branch(&self, branch_name: &str) -> bool {
+        // What tells the two apart is the `.` that
+        // [`Self::get_base_branch_name`] puts between the master branch name
+        // and the slug: `slugify` drops every `.`, so the slug a head branch is
+        // named after can never contain one. The master branch name itself is
+        // deliberately not matched on — a repository that has renamed its
+        // default branch still owns the base branches it made under the old
+        // name, and they still have to be cleaned up.
+        let Some(name) = branch_name.strip_prefix(&self.branch_prefix) else {
+            return false;
+        };
+
+        self.is_spr_branch(branch_name) && name.contains('.')
     }
 
     fn find_unused_branch_name(&self, existing_ref_names: &HashSet<String>, slug: &str) -> String {
@@ -295,6 +549,39 @@ mod tests {
             "spr/foo/".into(),
             false,
         )
+    }
+
+    /// The check is on unless something asks for it to be off. Nothing about
+    /// the default configuration should be able to turn it off by itself,
+    /// because a caller with permission to bypass the base branch's
+    /// requirements gets no other warning that they are doing so.
+    #[test]
+    fn merge_requirements_are_enforced_by_default() {
+        assert!(config_factory().enforce_merge_requirements(false));
+    }
+
+    #[test]
+    fn force_stops_enforcing_merge_requirements() {
+        assert!(!config_factory().enforce_merge_requirements(true));
+    }
+
+    #[test]
+    fn config_stops_enforcing_merge_requirements() {
+        let config = Config {
+            land_with_unmet_requirements: true,
+            ..config_factory()
+        };
+        assert!(!config.enforce_merge_requirements(false));
+    }
+
+    /// Asking for the same thing twice asks for it once.
+    #[test]
+    fn force_and_config_together_stop_enforcing_merge_requirements() {
+        let config = Config {
+            land_with_unmet_requirements: true,
+            ..config_factory()
+        };
+        assert!(!config.enforce_merge_requirements(true));
     }
 
     #[test]
@@ -491,6 +778,229 @@ mod tests {
         assert_eq!(gh.parse_pull_request_field("   123 "), Some(123));
         assert_eq!(gh.parse_pull_request_field("#123"), Some(123));
         assert_eq!(gh.parse_pull_request_field(" # 123"), Some(123));
+    }
+
+    #[test]
+    fn test_is_spr_branch() {
+        let gh = config_factory();
+
+        assert!(gh.is_spr_branch("spr/foo/my-feature"));
+        assert!(gh.is_spr_branch("spr/foo/master.my-feature"));
+        assert!(!gh.is_spr_branch("master"));
+        assert!(!gh.is_spr_branch("spr/bar/my-feature"));
+        assert!(!gh.is_spr_branch("release-1.0"));
+    }
+
+    /// The name a base branch is generated under has to read back as one, or
+    /// the branches jj-spr owns and the branches it must leave alone cannot be
+    /// told apart.
+    #[test]
+    fn a_generated_base_branch_name_reads_as_one() {
+        let gh = config_factory();
+        let name = gh.get_base_branch_name(&HashSet::new(), "My Feature");
+
+        assert!(gh.is_synthetic_base_branch(&name), "{name}");
+    }
+
+    /// A pull request head branch must not: under the linear base strategy it
+    /// is what a stacked pull request is based on, and jj-spr deletes the base
+    /// branches it owns.
+    #[test]
+    fn a_head_branch_does_not_read_as_a_base_branch() {
+        let gh = config_factory();
+
+        for title in ["My Feature", "master.my-feature", "master then more"] {
+            let name = gh.get_new_branch_name(&HashSet::new(), title);
+            assert!(!gh.is_synthetic_base_branch(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_is_synthetic_base_branch() {
+        let gh = config_factory();
+
+        assert!(gh.is_synthetic_base_branch("spr/foo/master.my-feature"));
+        assert!(!gh.is_synthetic_base_branch("spr/foo/my-feature"));
+        assert!(!gh.is_synthetic_base_branch("master"));
+        // Someone else's prefix, so someone else's branch.
+        assert!(!gh.is_synthetic_base_branch("spr/bar/master.my-feature"));
+        assert!(!gh.is_synthetic_base_branch("master.my-feature"));
+    }
+
+    /// A repository that renames its default branch still has base branches
+    /// named after the old one, and they are still jj-spr's to clean up.
+    #[test]
+    fn a_base_branch_from_before_a_default_branch_rename_still_reads_as_one() {
+        let gh = config_factory();
+
+        assert!(gh.is_synthetic_base_branch("spr/foo/main.my-feature"));
+    }
+
+    #[test]
+    fn base_strategy_is_synthetic_by_default() {
+        assert_eq!(config_factory().base_strategy, BaseStrategy::Synthetic);
+        assert_eq!(BaseStrategy::default(), BaseStrategy::Synthetic);
+    }
+
+    #[test]
+    fn base_strategy_parses_its_two_values() {
+        assert_eq!(
+            "synthetic".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::Synthetic
+        );
+        assert_eq!(
+            "linear".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::Linear
+        );
+        // git config hands values over as they were written.
+        assert_eq!(
+            " Linear\n".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::Linear
+        );
+    }
+
+    /// What `jj spr init` offers is what it writes into the configuration, so
+    /// every name it can store has to be one the setting reads back — and the
+    /// list it offers has to hold every strategy, or a strategy exists that
+    /// nothing asks about.
+    #[test]
+    fn every_base_strategy_is_offered_under_a_name_that_parses_back() {
+        for strategy in BaseStrategy::ALL {
+            assert_eq!(strategy.as_str().parse::<BaseStrategy>().unwrap(), strategy);
+        }
+
+        for strategy in [BaseStrategy::Synthetic, BaseStrategy::Linear] {
+            assert!(
+                BaseStrategy::ALL.contains(&strategy),
+                "{strategy:?} is not offered by `jj spr init`"
+            );
+        }
+    }
+
+    /// The section is the default because it works everywhere; turning the
+    /// description off is a thing you say, not a thing you get by omission.
+    #[test]
+    fn the_stack_display_is_the_section_by_default() {
+        assert_eq!(config_factory().stack_display, StackDisplay::Section);
+        assert_eq!(StackDisplay::default(), StackDisplay::Section);
+    }
+
+    #[test]
+    fn every_stack_display_is_offered_under_a_name_that_parses_back() {
+        for display in StackDisplay::ALL {
+            assert_eq!(display.as_str().parse::<StackDisplay>().unwrap(), display);
+        }
+
+        for display in [
+            StackDisplay::None,
+            StackDisplay::Section,
+            StackDisplay::Github,
+        ] {
+            assert!(
+                StackDisplay::ALL.contains(&display),
+                "{display:?} is not offered by `jj spr init`"
+            );
+        }
+    }
+
+    /// Only one of them describes the stack in each place, and the type is what
+    /// says so: there is no value that does both, and none that is asked to.
+    #[test]
+    fn the_two_ways_of_describing_a_stack_are_disjoint() {
+        for display in StackDisplay::ALL {
+            assert!(
+                !(display.draws_the_stack() && display.writes_a_section()),
+                "{display:?} describes the stack twice"
+            );
+        }
+
+        assert!(StackDisplay::Github.draws_the_stack());
+        assert!(StackDisplay::Section.writes_a_section());
+        assert!(!StackDisplay::None.draws_the_stack());
+        assert!(!StackDisplay::None.writes_a_section());
+    }
+
+    /// A misspelt value must not quietly mean the default: it would look like
+    /// the setting had no effect.
+    #[test]
+    fn the_stack_display_rejects_anything_else() {
+        let error = "gh".parse::<StackDisplay>().unwrap_err();
+
+        assert!(
+            error.messages().iter().any(|m| m.contains("gh")),
+            "the error should name the value it rejected: {error:?}"
+        );
+    }
+
+    /// Unless GitHub is drawing the stack, the strategy is whatever was
+    /// configured, and the default when nothing was. The section asks nothing
+    /// of the base strategy, so it is in this group rather than the next.
+    #[test]
+    fn the_base_strategy_stands_on_its_own_unless_github_draws_the_stack() {
+        for display in [StackDisplay::None, StackDisplay::Section] {
+            assert_eq!(
+                resolve_base_strategy(display, None).unwrap(),
+                BaseStrategy::Synthetic
+            );
+            assert_eq!(
+                resolve_base_strategy(display, Some(BaseStrategy::Synthetic)).unwrap(),
+                BaseStrategy::Synthetic
+            );
+            assert_eq!(
+                resolve_base_strategy(display, Some(BaseStrategy::Linear)).unwrap(),
+                BaseStrategy::Linear
+            );
+        }
+    }
+
+    /// An unset strategy is no preference, so drawing the stack supplies the one
+    /// it needs rather than failing over a setting nobody wrote.
+    #[test]
+    fn drawing_the_stack_supplies_the_linear_strategy_when_none_was_chosen() {
+        assert_eq!(
+            resolve_base_strategy(StackDisplay::Github, None).unwrap(),
+            BaseStrategy::Linear
+        );
+    }
+
+    /// Asking for both is the same request twice, not a conflict.
+    #[test]
+    fn drawing_the_stack_agrees_with_the_linear_strategy() {
+        assert_eq!(
+            resolve_base_strategy(StackDisplay::Github, Some(BaseStrategy::Linear)).unwrap(),
+            BaseStrategy::Linear
+        );
+    }
+
+    /// The one combination that cannot be honoured: it must be reported rather
+    /// than resolved, because either half of it could be the mistake, and a
+    /// silently overridden strategy would build branches the user did not ask
+    /// for.
+    #[test]
+    fn drawing_the_stack_refuses_the_synthetic_strategy() {
+        let error =
+            resolve_base_strategy(StackDisplay::Github, Some(BaseStrategy::Synthetic)).unwrap_err();
+
+        assert!(
+            error
+                .messages()
+                .iter()
+                .any(|m| m.contains("spr.stackDisplay") && m.contains("spr.baseStrategy")),
+            "the error should name both settings: {error:?}"
+        );
+    }
+
+    /// A misspelt strategy must not quietly mean the default: the two
+    /// strategies build different branches, and a typo would look like the
+    /// setting had no effect.
+    #[test]
+    fn base_strategy_rejects_anything_else() {
+        let error = "lienar".parse::<BaseStrategy>().unwrap_err();
+
+        assert!(
+            error.messages().iter().any(|m| m.contains("lienar")),
+            "the error should name the value it rejected: {error:?}"
+        );
     }
 
     #[test]

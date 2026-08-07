@@ -1,0 +1,14 @@
+query PullRequestsWithBaseQuery($owner: String!, $name: String!, $baseRefName: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: [OPEN], baseRefName: $baseRefName, first: $first, after: $after) {
+      nodes {
+        number
+        baseRefName
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
