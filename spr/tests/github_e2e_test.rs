@@ -31,7 +31,10 @@
 
 use std::process::Command;
 
-use jj_spr::message::{MessageSection, parse_message};
+use jj_spr::{
+    github::GitHubRule,
+    message::{MessageSection, parse_message},
+};
 
 /// The repository under test, from `E2E_TEST_REPO`.
 struct Target {
@@ -271,6 +274,36 @@ impl Scratch {
         );
 
         numbers
+    }
+
+    /// Run a `gh api` call that is expected to fail, and hand back what GitHub
+    /// said.
+    ///
+    /// The contract tests below are about refusals, so the failure is the result
+    /// rather than a problem — and a call that *succeeds* is the interesting
+    /// failure, so it panics.
+    fn api_fails(&self, args: &[&str]) -> String {
+        let mut argv = vec!["api"];
+        argv.extend_from_slice(args);
+
+        let out = Command::new("gh")
+            .args(&argv)
+            .current_dir(self.path())
+            .output()
+            .expect("failed to run gh");
+
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "GitHub was expected to refuse `gh {}`, and did not:\n{said}",
+            argv.join(" ")
+        );
+
+        said
     }
 
     /// One field of a pull request, as `jq` selects it.
@@ -1073,59 +1106,6 @@ fn closing_below_a_linear_pull_request_retargets_it_and_leaves_it_open() {
     );
 }
 
-/// Under `spr.baseStrategy = synthetic` the closed pull request's base branch
-/// is one jj-spr generated for it alone, so closing does take that one away.
-///
-/// The counterpart to the linear case above: the rule is ownership, not the
-/// strategy, and a repository holds pull requests made under both at once.
-#[test]
-fn closing_a_synthetic_pull_request_takes_away_its_generated_base_branch() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "closesynth");
-    // Set even though it is the default: this is the test whose whole point is
-    // the contrast with the linear case above, so it should fail about the
-    // strategy rather than about a branch if the default ever changes.
-    scratch.set_config("spr.baseStrategy", "synthetic");
-
-    let tag = run_tag();
-    let titles = [
-        format!("e2e closesynth bottom {tag}"),
-        format!("e2e closesynth top {tag}"),
-    ];
-    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
-    let (bottom, top) = (prs[0], prs[1]);
-
-    let base = scratch.pr_base_branch(top);
-    let head = scratch.pr_head_branch(top);
-    assert!(
-        base.starts_with(&scratch.prefix),
-        "the top PR should be stacked on a base branch jj-spr made, got {base:?}"
-    );
-
-    // `push_stack` leaves the working copy on the top of the stack.
-    jj_spr(&["close", "-r", "@"], scratch.path());
-
-    assert_eq!(
-        scratch.pr_state(top),
-        "closed",
-        "PR #{top} should have been closed"
-    );
-    assert_eq!(
-        scratch.pr_state(bottom),
-        "open",
-        "closing PR #{top} closed PR #{bottom} below it"
-    );
-    for branch in [&base, &head] {
-        assert!(
-            !scratch.remote_has_branch(branch),
-            "a branch the closed PR owned is still on the remote: {branch}"
-        );
-    }
-}
-
 /// Adopting `spr.baseStrategy = linear` moves a stacked pull request off the
 /// base branch jj-spr generated for it and onto the head branch of the pull
 /// request below, and takes the branch it left away.
@@ -1401,47 +1381,6 @@ fn landing_through_the_stack_merge_lands_the_chain_and_rebases_the_rest() {
         scratch.open_stack_for(top).map(|s| s.number),
         Some(stack.number),
         "the stack merge should have left the stack standing, still holding PR #{top}"
-    );
-}
-
-/// `jj spr land --stack` is refused under `spr.baseStrategy = linear`, where the
-/// branches GitHub would rebase are merge commits that do not survive it.
-///
-/// The refusal is the whole feature working: this is the land that would destroy
-/// the pull request above. Nothing is merged, so the assertion is that both pull
-/// requests are still open and the default branch has not moved.
-#[test]
-fn the_stack_merge_is_refused_where_the_branches_would_not_survive_it() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "stackmergerefused");
-    scratch.set_config("spr.stackDisplay", "github");
-    scratch.set_config("spr.baseStrategy", "linear");
-
-    let prs = scratch.push_stack(&["e2e refused bottom", "e2e refused top"]);
-    let (bottom, top) = (prs[0], prs[1]);
-    let before = scratch.default_branch_sha();
-
-    let refusal = try_jj_spr(&["land", "--stack", "-r", "@-"], scratch.path())
-        .expect_err("--stack should be refused under spr.baseStrategy = linear");
-
-    assert!(
-        refusal.contains("linear-rebase"),
-        "the refusal should name the strategy that makes the stack merge safe: {refusal}"
-    );
-    for number in [bottom, top] {
-        assert_eq!(
-            scratch.pr_state(number),
-            "open",
-            "a refused land should have merged nothing, but PR #{number} is not open"
-        );
-    }
-    assert_eq!(
-        scratch.default_branch_sha(),
-        before,
-        "a refused land should have put nothing on the default branch"
     );
 }
 
@@ -1758,153 +1697,6 @@ fn squash_landing_a_github_stack_lands_one_commit_per_pull_request() {
     }
 }
 
-/// Landing the top of a stack lands everything under it, one commit each.
-///
-/// The behaviour this pins is the whole of why `land` walks a chain rather than
-/// merging the one pull request it was pointed at. A pull request branch
-/// carries the local stack below it, so merging the top one alone would put all
-/// three changes on the default branch inside a single squash under the top
-/// one's title, and leave the two pull requests below open with nothing left to
-/// show. Only GitHub can tell the two apart: what is being read back is the
-/// shape of the default branch after the merges, and which pull requests GitHub
-/// itself closed as merged.
-///
-/// A stack of three, landing the top in one command, is the smallest shape
-/// where a cascade is more than one merge and the order of the merges matters.
-/// It runs without `spr.stackDisplay = github`, because nothing here is about GitHub's
-/// stacks — a stack of jj-spr's own is enough to have unlanded parents.
-#[test]
-fn landing_the_top_of_a_stack_lands_the_pull_requests_below_it_first() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "cascadeland");
-
-    // The tag keeps this run's commits off every earlier run's: what this test
-    // merges stays on the default branch, and a change that adds a file that is
-    // already there with the same content is empty.
-    let tag = run_tag();
-    let titles = [
-        format!("e2e cascadeland bottom {tag}"),
-        format!("e2e cascadeland middle {tag}"),
-        format!("e2e cascadeland top {tag}"),
-    ];
-    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
-
-    let before = scratch.default_branch_sha();
-
-    // `push_stack` leaves `@` on the top of the stack, so this is the one land
-    // in question: the pull request named is the only one asked for, and the
-    // two below it are landed because `land` works out that it has to.
-    let landed = jj_spr(&["land", "-r", "@"], scratch.path());
-    assert!(
-        landed.contains(&format!(
-            "Landing 3 Pull Requests, bottom first: #{}, #{}, #{}",
-            prs[0], prs[1], prs[2]
-        )),
-        "landing PR #{} had to say it was landing the two below it first:\n{landed}",
-        prs[2]
-    );
-
-    for number in &prs {
-        assert_eq!(
-            scratch.pr_field(*number, ".merged"),
-            "true",
-            "PR #{number} should have been merged by a land asked only for #{}",
-            prs[2]
-        );
-    }
-
-    let landed_commits = scratch.commits_landed_since(&before);
-    assert_eq!(
-        landed_commits.len(),
-        titles.len(),
-        "landing the top of a stack of {} should put one commit on the default branch per pull \
-         request, not one squash carrying all of them, got {landed_commits:?}",
-        titles.len()
-    );
-
-    // Oldest first, which is the order they were landed in: bottom to top.
-    for (sha, title) in landed_commits.iter().zip(&titles) {
-        assert_eq!(
-            scratch.commit_files(sha),
-            vec![slug(title)],
-            "the commit {sha} that landed for {title:?} should carry that change and no other"
-        );
-    }
-}
-
-/// A change with no pull request below the one being landed refuses the land.
-///
-/// The refusal is not fussiness about tidy state: the unpushed change's commits
-/// are in the branch of the pull request above it, so a land that passed over it
-/// would put it on the default branch anyway, with no pull request to record
-/// that it went. Refusing is the only outcome that does not land something
-/// silently.
-///
-/// Pinned end to end rather than in a unit test because the fact being checked
-/// is about the local chain jj-spr reads back from Jujutsu, and the same shape
-/// is what a half-pushed stack looks like in practice.
-#[test]
-fn landing_over_a_change_with_no_pull_request_is_refused() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "cascadegap");
-
-    let tag = run_tag();
-    let titles = [
-        format!("e2e cascadegap bottom {tag}"),
-        format!("e2e cascadegap top {tag}"),
-    ];
-    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
-
-    // Slide an unpushed change in between the two, which is what a stack looks
-    // like when only part of it has been through `jj spr diff`. `@` stays on
-    // the top change, which is the one being landed.
-    let gap = format!("e2e cascadegap unpushed {tag}");
-    run(
-        "jj",
-        &["new", "-A", "@-", "-m", &describe(&gap)],
-        scratch.path(),
-    );
-    std::fs::write(scratch.path().join(slug(&gap)), &gap).unwrap();
-    run("jj", &["edit", "@+"], scratch.path());
-
-    let before = scratch.default_branch_sha();
-
-    let said = try_jj_spr(&["land", "-r", "@"], scratch.path()).expect_err(
-        "landing over a change with no pull request should be refused, not land the change",
-    );
-    // jj-spr wraps what it says to the terminal, so the sentence is matched
-    // with its own line breaks taken out rather than in fragments short enough
-    // to survive them.
-    let unwrapped = said.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        unwrapped.contains("is below the one being landed and has no Pull Request"),
-        "the refusal had to name the missing pull request as the reason:\n{said}"
-    );
-    assert!(
-        unwrapped.contains(&gap),
-        "the refusal had to name which change is missing a pull request:\n{said}"
-    );
-
-    assert_eq!(
-        scratch.commits_landed_since(&before),
-        Vec::<String>::new(),
-        "a refused land must not have put anything on the default branch"
-    );
-    for number in &prs {
-        assert_eq!(
-            scratch.pr_state(*number),
-            "open",
-            "PR #{number} should still be open after a refused land"
-        );
-    }
-}
-
 /// Landing the bottom of a GitHub native stack needs no `--force`.
 ///
 /// Only GitHub can show this, and it is the one land whose verdict is taken
@@ -1984,5 +1776,201 @@ fn landing_the_bottom_of_a_github_stack_needs_no_force() {
         scratch.pr_state(middle),
         "open",
         "landing below PR #{middle} closed it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The contract with the fake GitHub
+//
+// `fake_github_test.rs` runs `diff`, `land` and `close` against a fake, which is
+// only worth anything while the fake still behaves like GitHub. Each rule it
+// leans on is a `GitHubRule`, and the mapping below names the test that pins it —
+// a total `match`, so a rule added to the library does not compile until a test
+// is named here, and `every_github_rule_has_a_contract_test` checks the names
+// against this file so a rename cannot quietly orphan one.
+//
+// Most of the rules are pinned by the scenario tests above, which is what those
+// tests are *for* now that jj-spr's own decisions are tested elsewhere. The three
+// below had no test of their own: they are the refusals everything else is built
+// on, and nothing observable happens when they are honoured, so nothing failed
+// when they were only written down.
+
+/// The live test that pins `rule`.
+///
+/// Total on purpose — see the note above.
+fn contract_test_for(rule: GitHubRule) -> &'static str {
+    match rule {
+        GitHubRule::StackLocksBaseRefs => "a_stack_refuses_to_let_a_members_base_move",
+        GitHubRule::MergingAStackedPullRequestNeedsTheAsyncEndpoint => {
+            "the_ordinary_merge_endpoint_refuses_a_stacked_pull_request"
+        }
+        GitHubRule::MergeIsLeasedToTheHead => "a_merge_is_refused_when_the_head_has_moved",
+        GitHubRule::DeletingABaseBranchClosesItsPullRequests => {
+            "landing_below_a_pull_request_retargets_it_and_leaves_it_open"
+        }
+        GitHubRule::StackMembersMustChain => "a_stack_pushed_by_jj_spr_becomes_a_github_stack",
+        GitHubRule::UnstackReleasesUnmergedMembers => {
+            "retargeting_a_pull_request_in_a_github_stack_takes_it_out_of_the_stack"
+        }
+        GitHubRule::AsyncMergeMergesDownwards => {
+            "landing_through_the_stack_merge_lands_the_chain_and_rebases_the_rest"
+        }
+        GitHubRule::AsyncMergeRebasesTheSurvivors => {
+            "landing_through_the_stack_merge_lands_the_chain_and_rebases_the_rest"
+        }
+        GitHubRule::AForcePushKeepsThePullRequestOpen => {
+            "amending_below_a_linear_rebase_pull_request_replays_its_commits"
+        }
+        GitHubRule::SquashMergeLandsOneCommit => {
+            "squash_landing_a_github_stack_lands_one_commit_per_pull_request"
+        }
+    }
+}
+
+/// Every rule the fake reproduces is pinned by a test that exists.
+///
+/// The `match` above is total, so the compiler catches a rule with no test named.
+/// What it cannot catch is a name that no longer matches a function, which is what
+/// this reads the file for. Needs no GitHub, so it runs in every `cargo test`.
+#[test]
+fn every_github_rule_has_a_contract_test() {
+    let source = include_str!("github_e2e_test.rs");
+
+    for rule in GitHubRule::ALL {
+        let name = contract_test_for(rule);
+
+        assert!(
+            source.contains(&format!("\nfn {name}(")),
+            "{rule:?} names `{name}` as the test that pins it, and this file has no such test"
+        );
+    }
+}
+
+/// A stack owns its members' base refs: GitHub refuses to move one while the
+/// stack holds it.
+///
+/// Asked of GitHub directly rather than through jj-spr, which is the point — this
+/// is the rule jj-spr's whole dissolve-then-retarget order exists for, and the
+/// fake enforces it. Nothing else establishes it: a test that watched jj-spr
+/// dissolve first would pass just as well if GitHub had allowed the move.
+#[test]
+fn a_stack_refuses_to_let_a_members_base_move() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "contractbase");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    let prs = scratch.push_stack(&["contract base bottom", "contract base top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+    scratch
+        .open_stack_for(bottom)
+        .unwrap_or_else(|| panic!("PR #{bottom} should be in a stack"));
+
+    // The value it already has, so that nothing about this asks for a change GitHub
+    // could refuse for another reason.
+    let base = scratch.pr_base_branch(top);
+    let refusal = scratch.api_fails(&[
+        "--method",
+        "PATCH",
+        &format!("repos/{}/pulls/{top}", scratch.repo_arg()),
+        "-f",
+        &format!("base={base}"),
+    ]);
+
+    assert!(
+        refusal.contains("stack") || refusal.contains("403"),
+        "GitHub should refuse a base change while a stack holds the pull request: {refusal}"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        base,
+        "the base should not have moved"
+    );
+}
+
+/// The ordinary merge endpoint refuses a pull request a stack holds, and points at
+/// the asynchronous one.
+///
+/// This is why `land` dissolves the stack even when it moves no base at all —
+/// landing the bottom of a stack has nothing to retarget and still cannot merge.
+#[test]
+fn the_ordinary_merge_endpoint_refuses_a_stacked_pull_request() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "contractmerge");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    let tag = run_tag();
+    let titles = [
+        format!("contract merge bottom {tag}"),
+        format!("contract merge top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let bottom = prs[0];
+    scratch
+        .open_stack_for(bottom)
+        .unwrap_or_else(|| panic!("PR #{bottom} should be in a stack"));
+
+    let refusal = scratch.api_fails(&[
+        "--method",
+        "PUT",
+        &format!("repos/{}/pulls/{bottom}/merge", scratch.repo_arg()),
+        "-f",
+        "merge_method=squash",
+    ]);
+
+    assert!(
+        refusal.contains("asynchronous") || refusal.contains("stacked"),
+        "GitHub should refuse to merge a stacked pull request here: {refusal}"
+    );
+    assert_eq!(
+        scratch.pr_field(bottom, ".merged"),
+        "false",
+        "nothing should have been merged"
+    );
+}
+
+/// A merge is leased to the head commit it names: GitHub refuses one for a commit
+/// the pull request has moved off.
+///
+/// `land` passes the head it checked, so this is what stops it merging work it
+/// never looked at — and what the fake refuses in its place.
+#[test]
+fn a_merge_is_refused_when_the_head_has_moved() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "contractlease");
+
+    let tag = run_tag();
+    let title = format!("contract lease {tag}");
+    let prs = scratch.push_stack(&[&title]);
+    let number = prs[0];
+
+    // A sha that is not this pull request's head: the default branch's, which is
+    // certainly a commit GitHub has and certainly not the head.
+    let refusal = scratch.api_fails(&[
+        "--method",
+        "PUT",
+        &format!("repos/{}/pulls/{number}/merge", scratch.repo_arg()),
+        "-f",
+        &format!("sha={}", scratch.default_branch_sha()),
+        "-f",
+        "merge_method=squash",
+    ]);
+
+    assert!(
+        !refusal.is_empty(),
+        "GitHub should refuse a merge whose sha is not the head"
+    );
+    assert_eq!(
+        scratch.pr_field(number, ".merged"),
+        "false",
+        "nothing should have been merged"
     );
 }

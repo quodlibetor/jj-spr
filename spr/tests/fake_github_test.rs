@@ -1,5 +1,6 @@
 /*
- * What `jj spr diff` decides for itself, tested without a network.
+ * What `jj spr diff`, `jj spr land` and `jj spr close` decide for themselves,
+ * tested without a network.
  *
  * Two stand-ins make that possible, and they are stand-ins of different kinds:
  *
@@ -14,22 +15,33 @@
  * The division of labour with `github_e2e_test.rs` is the thing to keep straight,
  * and it is not "fast tests here, slow tests there". A test against a fake can
  * only assert what jj-spr does; what GitHub does about it is what the end-to-end
- * suite is for, and that suite is also where the fake's rules are checked. Every
- * rule the fake reproduces is marked below with the live test that pins it — if
- * one of those rules is ever wrong, the fake will be confidently wrong with it,
- * and the live test is what says so.
+ * suite is for, and that suite is also where the fake's rules are checked. If one
+ * of those rules is ever wrong, the fake will be confidently wrong with it, and
+ * only a live test says so.
+ *
+ * So the rules are not prose here: each one the fake applies is a `GitHubRule`,
+ * named at the point it is applied, and the contract suite in
+ * `github_e2e_test.rs` cannot compile unless every variant names the live test
+ * that pins it. `cargo test --test github_e2e_test` with `E2E_TEST_REPO` set is
+ * therefore the answer to "is this fake still telling the truth?".
  */
 
 use std::{cell::RefCell, path::Path, path::PathBuf, process::Command};
 
 use jj_spr::{
-    commands::diff::{DiffOptions, diff},
-    config::{BaseStrategy, Config, StackDisplay},
+    commands::{
+        close::{CloseOptions, close},
+        diff::{DiffOptions, diff},
+        land::{LandOptions, land},
+    },
+    config::{BaseStrategy, Config, LandStrategy, StackDisplay},
     error::{Error, Result},
     github::{
-        GitHubApi, GitHubBranch, PullRequest, PullRequestRequestReviewers, PullRequestState,
-        PullRequestUpdate, Stack, StackApiError, StackBase, StackGitRef, StackPullRequest,
-        StackPullRequestState, StackResult, UnstackOutcome, base_branch_to_take_away,
+        AsyncMerge, GitHubApi, GitHubBranch, GitHubRule, MergeQueue, MergeQueueEntry,
+        MergeRequirements, PullRequest, PullRequestMergeability, PullRequestRequestReviewers,
+        PullRequestState, PullRequestUpdate, QueuedPullRequest, Stack, StackApiError, StackBase,
+        StackGitRef, StackPullRequest, StackPullRequestState, StackResult, StackedPullRequest,
+        UnstackOutcome, base_branch_to_take_away,
     },
     jj::Jujutsu,
     message::MessageSectionsMap,
@@ -51,6 +63,8 @@ struct FakePullRequest {
     sections: MessageSectionsMap,
     state: PullRequestState,
     draft: bool,
+    /// The commit a merge landed this pull request as, where it has been merged.
+    merged: Option<git2::Oid>,
 }
 
 /// One stack, as the fake holds it. Members are bottom first, and a merged one
@@ -92,6 +106,15 @@ enum Call {
     Unstacked {
         stack: u64,
     },
+    Merged {
+        number: u64,
+    },
+    AsyncMerged {
+        number: u64,
+    },
+    Enqueued {
+        number: u64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +124,13 @@ struct FakeState {
     calls: Vec<Call>,
     next_number: u64,
     next_stack_number: u64,
+    /// What GitHub says about the requirements the default branch sets. `None`
+    /// means the fake answers `Met`; a test that wants a land refused sets it.
+    /// Not a `MergeRequirements` with a default, because the library gives that
+    /// type no default on purpose — there is no safe verdict to assume.
+    merge_requirements: Option<MergeRequirements>,
+    /// The merge queue the default branch keeps, where a test gives it one.
+    merge_queue: Option<MergeQueue>,
 }
 
 /// A GitHub that keeps its pull requests and stacks in memory and its branches in
@@ -231,26 +261,22 @@ impl FakeGitHub {
         }
     }
 
-    /// GitHub's rule: a stack owns its members' base refs, so any update
-    /// carrying a base is refused while a stack holds the pull request — whether
-    /// or not the value differs.
+    /// GitHubRule::StackLocksBaseRefs — a stack owns its members' base refs, so
+    /// any update carrying a base is refused while a stack holds the pull request,
+    /// whether or not the value differs.
     ///
-    /// Pinned live by `retargeting_a_pull_request_in_a_github_stack_takes_it_out_of_the_stack`,
-    /// which is the test that would fail if GitHub ever allowed it. jj-spr's
-    /// whole `unlock_base` dance exists for this rule, so a fake that let a base
-    /// move while stacked would test a jj-spr that does not need to exist.
+    /// jj-spr's whole dissolve-then-retarget order exists for this rule, so a fake
+    /// that let a base move while stacked would be testing a jj-spr that does not
+    /// need to exist.
     fn refuse_a_stacked_base_change(&self, number: u64) -> Result<()> {
-        if self
-            .state
-            .borrow()
-            .stacks
-            .iter()
-            .any(|stack| stack.open && stack.members.contains(&number))
-        {
-            return Err(Error::new(format!(
-                "fake GitHub: Pull Request #{number} is in a stack, so its base ref cannot be \
-                 changed (this is GitHub's 403)"
-            )));
+        if self.stack_holding(number).is_some() {
+            return Err(self.refusal(
+                GitHubRule::StackLocksBaseRefs,
+                format!(
+                    "Pull Request #{number} is in a stack, so its base ref cannot be changed \
+                     (this is GitHub's 403)"
+                ),
+            ));
         }
 
         Ok(())
@@ -271,17 +297,131 @@ impl FakeGitHub {
         Ok(())
     }
 
-    /// Delete a branch from the remote, reporting whether it was there.
+    /// Delete a branch from the remote, reporting whether it was there — and close
+    /// every open pull request based on it.
+    ///
+    /// GitHubRule::DeletingABaseBranchClosesItsPullRequests. Reproduced rather
+    /// than merely noted, because it is the rule every "retarget first, delete
+    /// after" order in jj-spr exists for: without it here, a test would watch the
+    /// branch go away and see nothing wrong with it going first.
     fn delete_branch(&self, branch: &GitHubBranch) -> bool {
         let repo = git2::Repository::open(&self.remote).expect("the remote repository");
 
-        match repo.find_reference(&format!("refs/heads/{}", branch.branch_name())) {
+        let existed = match repo.find_reference(&format!("refs/heads/{}", branch.branch_name())) {
             Ok(mut reference) => {
                 reference.delete().expect("deleting a branch");
                 true
             }
             Err(_) => false,
+        };
+
+        let mut state = self.state.borrow_mut();
+        for pull_request in state.pull_requests.iter_mut() {
+            if pull_request.state == PullRequestState::Open
+                && pull_request.base == branch.branch_name()
+            {
+                pull_request.state = PullRequestState::Closed;
+            }
         }
+
+        existed
+    }
+
+    /// A refusal, naming the rule of GitHub's it stands for.
+    ///
+    /// Naming it is the point: a test that asserts a refusal can assert *which*
+    /// rule refused, and the rule is a value the contract suite has to account
+    /// for. A message alone would be a claim about GitHub with nothing keeping it
+    /// true.
+    fn refusal(&self, rule: GitHubRule, why: String) -> Error {
+        Error::new(format!("fake GitHub ({rule:?}): {why}"))
+    }
+
+    /// Make GitHub report the requirements the default branch sets as unmet, which
+    /// is what a failing required check or a missing review looks like to `land`.
+    fn set_merge_requirements(&self, requirements: MergeRequirements) {
+        self.state.borrow_mut().merge_requirements = Some(requirements);
+    }
+
+    /// Give the default branch a merge queue.
+    fn set_merge_queue(&self, queue: Option<MergeQueue>) {
+        self.state.borrow_mut().merge_queue = queue;
+    }
+
+    fn title_of(&self, number: u64) -> String {
+        self.state
+            .borrow()
+            .pull_requests
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+            .map(|pull_request| pull_request.title.clone())
+            .unwrap_or_default()
+    }
+
+    /// Squash-merge a pull request: one commit on its base branch carrying the
+    /// whole of it, and the pull request closed as merged.
+    ///
+    /// GitHubRule::SquashMergeLandsOneCommit. Really performed against the bare
+    /// repository rather than recorded, so that what a test reads off the default
+    /// branch afterwards — how many commits landed, and what each one changed —
+    /// is git's answer. The tree is the pull request head's, which is what a
+    /// squash of an up-to-date pull request produces; nothing here merges
+    /// divergent branches, and a test that needed that would need GitHub.
+    ///
+    /// `base` is given rather than read off the pull request because the two merge
+    /// endpoints differ on it. The ordinary one merges into the pull request's own
+    /// base, which `land` has already moved onto the default branch by the time it
+    /// merges. The stack merge puts *every* member onto the stack's base, which is
+    /// why a stack of three lands three commits on the default branch rather than
+    /// one commit and two branch updates.
+    fn squash_merge(
+        &self,
+        number: u64,
+        base: &str,
+        title: &str,
+        message: &str,
+    ) -> Result<git2::Oid> {
+        let (base, head) = (base.to_string(), self.head_of(number));
+        let repo = git2::Repository::open(&self.remote).expect("the remote repository");
+
+        let base_reference = format!("refs/heads/{base}");
+        let base_commit = repo
+            .find_reference(&base_reference)
+            .and_then(|reference| reference.peel_to_commit())
+            .map_err(|error| Error::new(format!("fake GitHub: no base branch {base}: {error}")))?;
+        let head_commit = repo
+            .find_reference(&format!("refs/heads/{head}"))
+            .and_then(|reference| reference.peel_to_commit())
+            .map_err(|error| Error::new(format!("fake GitHub: no head branch {head}: {error}")))?;
+
+        let signature = git2::Signature::new(
+            "fake GitHub",
+            "github@example.com",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .expect("a signature");
+        let squashed = repo
+            .commit(
+                Some(&base_reference),
+                &signature,
+                &signature,
+                &format!("{title} (#{number})\n\n{message}"),
+                &head_commit.tree().expect("the head tree"),
+                &[&base_commit],
+            )
+            .expect("the squash commit");
+
+        let mut state = self.state.borrow_mut();
+        if let Some(pull_request) = state
+            .pull_requests
+            .iter_mut()
+            .find(|pull_request| pull_request.number == number)
+        {
+            pull_request.merged = Some(squashed);
+            pull_request.state = PullRequestState::Closed;
+        }
+
+        Ok(squashed)
     }
 
     /// Whether the pull requests chain base-to-head, bottom first, which is what
@@ -361,6 +501,7 @@ impl GitHubApi for FakeGitHub {
             sections: message.clone(),
             state: PullRequestState::Open,
             draft,
+            merged: None,
         });
         state.calls.push(Call::Created {
             number,
@@ -514,6 +655,210 @@ impl GitHubApi for FakeGitHub {
         });
 
         Ok(self.as_stack(&state, &stack))
+    }
+
+    async fn get_stack(&self, stack_number: u64) -> StackResult<Stack> {
+        let state = self.state.borrow();
+        let stack = state
+            .stacks
+            .iter()
+            .find(|stack| stack.number == stack_number)
+            .ok_or(StackApiError::StackNotFound { stack_number })?;
+
+        Ok(self.as_stack(&state, stack))
+    }
+
+    async fn get_pull_requests_with_base(
+        &self,
+        base: &GitHubBranch,
+    ) -> Result<Vec<StackedPullRequest>> {
+        Ok(self
+            .state
+            .borrow()
+            .pull_requests
+            .iter()
+            .filter(|pull_request| {
+                pull_request.state == PullRequestState::Open
+                    && pull_request.base == base.branch_name()
+            })
+            .map(|pull_request| StackedPullRequest {
+                number: pull_request.number,
+                base: self.branch(&pull_request.base),
+            })
+            .collect())
+    }
+
+    async fn get_pull_request_mergeability(&self, number: u64) -> Result<PullRequestMergeability> {
+        let state = self.state.borrow();
+        let pull_request = state
+            .pull_requests
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+            .ok_or_else(|| Error::new(format!("fake GitHub: no Pull Request #{number}")))?;
+
+        Ok(PullRequestMergeability {
+            base: self.branch(&pull_request.base),
+            head_oid: self.tip(&pull_request.head),
+            mergeable: Some(true),
+            merge_requirements: state.merge_requirements.unwrap_or(MergeRequirements::Met),
+            merge_commit: pull_request.merged,
+        })
+    }
+
+    async fn get_merge_queue(&self, _branch_name: &str) -> Result<Option<MergeQueue>> {
+        Ok(self.state.borrow().merge_queue.clone())
+    }
+
+    async fn enqueue_pull_request(
+        &self,
+        node_id: &str,
+        _head_oid: git2::Oid,
+    ) -> Result<MergeQueueEntry> {
+        // The node id is how the real client addresses a pull request over
+        // GraphQL; the fake mints them as `PR_fake<number>`, so this is the one
+        // place that has to read one back.
+        let number = node_id
+            .strip_prefix("PR_fake")
+            .and_then(|number| number.parse().ok())
+            .ok_or_else(|| {
+                Error::new(format!("fake GitHub: not one of its node ids: {node_id}"))
+            })?;
+
+        self.state
+            .borrow_mut()
+            .calls
+            .push(Call::Enqueued { number });
+
+        Ok(MergeQueueEntry {
+            position: 1,
+            estimated_time_to_merge: None,
+        })
+    }
+
+    async fn get_queued_pull_request(&self, number: u64) -> Result<QueuedPullRequest> {
+        let state = self.state.borrow();
+        let pull_request = state
+            .pull_requests
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+            .ok_or_else(|| Error::new(format!("fake GitHub: no Pull Request #{number}")))?;
+
+        Ok(QueuedPullRequest {
+            state: pull_request.state.clone(),
+            merge_commit: pull_request.merged,
+            entry: pull_request.merged.is_none().then_some(MergeQueueEntry {
+                position: 1,
+                estimated_time_to_merge: None,
+            }),
+        })
+    }
+
+    async fn merge_pull_request(
+        &self,
+        number: u64,
+        title: String,
+        message: String,
+        head_oid: git2::Oid,
+    ) -> Result<Option<git2::Oid>> {
+        // GitHubRule::MergingAStackedPullRequestNeedsTheAsyncEndpoint — the
+        // ordinary endpoint refuses a member of a stack, which is why `land`
+        // dissolves the stack even when it moves no base.
+        if self.stack_holding(number).is_some() {
+            return Err(self.refusal(
+                GitHubRule::MergingAStackedPullRequestNeedsTheAsyncEndpoint,
+                format!(
+                    "Pull Request #{number} is in a stack, so this endpoint will not merge it \
+                     (this is GitHub's 403)"
+                ),
+            ));
+        }
+
+        // GitHubRule::MergeIsLeasedToTheHead — the merge is for the commit it was
+        // given, so a pull request pushed to since is refused.
+        let head = self.head_of(number);
+        if self.tip(&head) != head_oid {
+            return Err(self.refusal(
+                GitHubRule::MergeIsLeasedToTheHead,
+                format!(
+                    "Pull Request #{number} has moved on: the merge was asked for {head_oid}, and \
+                     {head} is at {}",
+                    self.tip(&head)
+                ),
+            ));
+        }
+
+        let base = self.base_of(number);
+        let sha = self.squash_merge(number, &base, &title, &message)?;
+        self.state.borrow_mut().calls.push(Call::Merged { number });
+
+        Ok(Some(sha))
+    }
+
+    async fn merge_pull_request_async(&self, number: u64) -> StackResult<AsyncMerge> {
+        self.state
+            .borrow_mut()
+            .calls
+            .push(Call::AsyncMerged { number });
+
+        // GitHubRule::AsyncMergeMergesDownwards — everything below the pull
+        // request it is given goes too, bottom first, one commit each.
+        let members: Vec<u64> = match self.stack_holding(number) {
+            Some(stack) => {
+                let position = stack
+                    .pull_requests
+                    .iter()
+                    .position(|member| member.number == number)
+                    .expect("the stack holding it holds it");
+
+                stack.pull_requests[..=position]
+                    .iter()
+                    .filter(|member| !member.is_merged())
+                    .map(|member| member.number)
+                    .collect()
+            }
+            None => vec![number],
+        };
+
+        // Onto the stack's base, which is where GitHub was observed to put every
+        // member of the chain it merges.
+        let stack_base = self.config.master_ref.branch_name().to_string();
+        for member in &members {
+            let title = self.title_of(*member);
+            self.squash_merge(*member, &stack_base, &title, "")
+                .map_err(|error| StackApiError::Rejected {
+                    status: 405,
+                    message: format!("{error}"),
+                })?;
+        }
+
+        // GitHubRule::AsyncMergeRebasesTheSurvivors — GitHub then puts the
+        // members above onto the stack's base and force-pushes their branches
+        // onto it, keeping the stack. The retarget is reproduced here because
+        // `land` reads it back; the *rebase* is not, so no test here may assert a
+        // survivor's branch shape — that is what the live test is for.
+        let master = self.config.master_ref.branch_name().to_string();
+        {
+            let mut state = self.state.borrow_mut();
+            let above: Vec<u64> = state
+                .stacks
+                .iter()
+                .filter(|stack| stack.open && stack.members.iter().any(|m| members.contains(m)))
+                .flat_map(|stack| stack.members.clone())
+                .filter(|member| !members.contains(member))
+                .collect();
+
+            for member in above {
+                if let Some(pull_request) = state
+                    .pull_requests
+                    .iter_mut()
+                    .find(|pull_request| pull_request.number == member)
+                {
+                    pull_request.base = master.clone();
+                }
+            }
+        }
+
+        Ok(AsyncMerge::Enqueued)
     }
 
     async fn unstack(&self, stack_number: u64) -> StackResult<UnstackOutcome> {
@@ -682,6 +1027,90 @@ impl Local {
         let opts = diff_options(args);
 
         diff(opts, &self.jj(), gh, config).await
+    }
+
+    /// Run `jj spr land` on a revision.
+    async fn land(&self, gh: &FakeGitHub, config: &Config, args: &[&str]) -> Result<()> {
+        use clap::Parser;
+
+        let mut argv = vec!["land"];
+        argv.extend_from_slice(args);
+
+        land(
+            LandOptions::try_parse_from(argv).expect("the options should parse"),
+            &self.jj(),
+            gh,
+            config,
+        )
+        .await
+    }
+
+    /// Run `jj spr close` on a revision.
+    async fn close(&self, gh: &FakeGitHub, config: &Config, args: &[&str]) -> Result<()> {
+        use clap::Parser;
+
+        let mut argv = vec!["close"];
+        argv.extend_from_slice(args);
+
+        close(
+            CloseOptions::try_parse_from(argv).expect("the options should parse"),
+            &self.jj(),
+            gh,
+            config,
+        )
+        .await
+    }
+
+    /// The commits the default branch has gained since `before`, oldest first,
+    /// each as `<first line> :: <files it changed>`.
+    ///
+    /// What a land is for, read off the remote: one commit per pull request, each
+    /// carrying that change and no other.
+    fn landed_since(&self, before: git2::Oid) -> Vec<String> {
+        let repo = git2::Repository::open(&self.remote).expect("the remote repository");
+        let head = repo
+            .find_reference(&format!("refs/heads/{MASTER}"))
+            .expect("the default branch")
+            .target()
+            .expect("its target");
+
+        let mut walk = repo.revwalk().expect("a revwalk");
+        walk.push(head).expect("pushing the head");
+        walk.hide(before).expect("hiding the starting point");
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+            .expect("sorting");
+
+        walk.map(|oid| {
+            let commit = repo
+                .find_commit(oid.expect("a commit id"))
+                .expect("a commit");
+            let tree = commit.tree().expect("its tree");
+            let parent = commit
+                .parent(0)
+                .expect("its parent")
+                .tree()
+                .expect("the parent tree");
+            let diff = repo
+                .diff_tree_to_tree(Some(&parent), Some(&tree), None)
+                .expect("a diff");
+            let mut files: Vec<String> = diff
+                .deltas()
+                .filter_map(|delta| {
+                    delta
+                        .new_file()
+                        .path()
+                        .map(|path| path.to_string_lossy().to_string())
+                })
+                .collect();
+            files.sort();
+
+            format!(
+                "{} :: {}",
+                commit.summary().unwrap_or_default(),
+                files.join(", ")
+            )
+        })
+        .collect()
     }
 
     /// The commits `head` carries on top of `base` on the remote, oldest first,
@@ -1348,5 +1777,487 @@ async fn a_dry_run_pushes_nothing_and_opens_nothing() {
         gh.calls().is_empty(),
         "a dry run should change nothing on GitHub: {:?}",
         gh.calls()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Landing
+
+/// Landing a pull request squash-merges it and takes its branch away.
+///
+/// The commit on the default branch is the whole of what a land is for, so it is
+/// read off the remote rather than taken on trust: one commit, carrying that
+/// change.
+#[tokio::test]
+async fn landing_a_pull_request_merges_it_and_removes_its_branch() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["land alone"]);
+    local.diff(&gh, &config).await.expect("the push");
+    let branch = gh.head_of(1);
+    let before = local.tip(MASTER);
+
+    local
+        .land(&gh, &config, &["-r", "@"])
+        .await
+        .expect("the land");
+
+    assert_eq!(
+        local.landed_since(before),
+        vec![format!("land alone (#1) :: {}", slug("land alone"))]
+    );
+    assert!(
+        !local.has_branch(&branch),
+        "the merged pull request's branch should have been taken away: {branch}"
+    );
+}
+
+/// Landing the top of a stack lands every pull request below it first, bottom
+/// first, each as its own commit carrying its own change.
+///
+/// The alternative — merging the one asked for on its own — would put every
+/// change below it on the default branch inside that one squash, and leave their
+/// pull requests open with nothing to show. That is the reason `land` walks the
+/// chain, and this is the test of it.
+#[tokio::test]
+async fn landing_the_top_of_a_stack_lands_the_ones_below_it_first() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["chain bottom", "chain middle", "chain top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    let before = local.tip(MASTER);
+
+    local
+        .land(&gh, &config, &["-r", "@"])
+        .await
+        .expect("the land");
+
+    assert_eq!(
+        local.landed_since(before),
+        vec![
+            format!("chain bottom (#1) :: {}", slug("chain bottom")),
+            format!("chain middle (#2) :: {}", slug("chain middle")),
+            format!("chain top (#3) :: {}", slug("chain top")),
+        ],
+        "one commit per pull request, bottom first, each carrying its own change"
+    );
+    assert_eq!(
+        gh.calls()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Merged { number } => Some(*number),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the merges should have gone bottom first"
+    );
+}
+
+/// A change below the one being landed that has no pull request refuses the land,
+/// and nothing is merged.
+///
+/// Passing over it would not leave it unlanded — the branch above carries it — it
+/// would land it with nothing on GitHub to say so.
+#[tokio::test]
+async fn landing_over_a_change_with_no_pull_request_is_refused() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["pushed bottom"]);
+    local.diff(&gh, &config).await.expect("the push");
+
+    // A change on top that was never pushed.
+    local.stack(&["never pushed"]);
+    let before = local.tip(MASTER);
+
+    let refusal = local
+        .land(&gh, &config, &["-r", "@"])
+        .await
+        .expect_err("landing over a change with no pull request should be refused");
+
+    assert!(
+        refusal
+            .messages()
+            .iter()
+            .any(|message| message.contains("does not refer to a Pull Request")),
+        "the refusal should say why: {refusal:?}"
+    );
+    assert_eq!(
+        local.tip(MASTER),
+        before,
+        "a refused land should have merged nothing"
+    );
+}
+
+/// Landing under `spr.stackDisplay = github` takes the stack apart before it merges
+/// anything, because GitHub's ordinary merge endpoint refuses a pull request a
+/// stack holds.
+///
+/// The fake refuses it too — `GitHubRule::MergingAStackedPullRequestNeedsTheAsyncEndpoint`
+/// — so a land that skipped the dissolve fails here rather than looking merely
+/// untidy.
+#[tokio::test]
+async fn landing_a_stacked_pull_request_dissolves_the_stack_first() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["dissolve bottom", "dissolve top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    assert_eq!(
+        gh.open_stacks().len(),
+        1,
+        "there should be a stack to take apart"
+    );
+
+    local
+        .land(&gh, &config, &["-r", "@-"])
+        .await
+        .expect("the land");
+
+    let calls = gh.calls();
+    let unstacked = calls
+        .iter()
+        .position(|call| matches!(call, Call::Unstacked { .. }))
+        .expect("the stack should have been dissolved");
+    let merged = calls
+        .iter()
+        .position(|call| matches!(call, Call::Merged { .. }))
+        .expect("the pull request should have been merged");
+    assert!(
+        unstacked < merged,
+        "the stack has to be dissolved before the merge: {calls:?}"
+    );
+}
+
+/// `--stack` hands the chain to GitHub's stacked pull requests: one request, no
+/// dissolve, and the stack left standing.
+///
+/// What GitHub then does with the pull requests above is its own business and the
+/// live suite's — `GitHubRule::AsyncMergeRebasesTheSurvivors`. What this asserts
+/// is jj-spr's side: one asynchronous merge asked for, no ordinary merge, nothing
+/// unstacked, and the merged branches taken away afterwards.
+#[tokio::test]
+async fn landing_with_the_stack_merge_asks_github_once_and_keeps_the_stack() {
+    let local = Local::new();
+    let config = Config {
+        land_strategy: LandStrategy::Stack,
+        ..local.config(BaseStrategy::LinearRebase, StackDisplay::Github)
+    };
+    let gh = local.github(&config);
+
+    local.stack(&["stackland bottom", "stackland middle", "stackland top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    let branches = [gh.head_of(1), gh.head_of(2), gh.head_of(3)];
+    let before = local.tip(MASTER);
+
+    local
+        .land(&gh, &config, &["-r", "@-"])
+        .await
+        .expect("the land");
+
+    assert_eq!(
+        gh.calls()
+            .iter()
+            .filter(|call| matches!(call, Call::AsyncMerged { .. }))
+            .count(),
+        1,
+        "the whole chain should have been one request: {:?}",
+        gh.calls()
+    );
+    assert!(
+        !gh.calls()
+            .iter()
+            .any(|call| matches!(call, Call::Merged { .. } | Call::Unstacked { .. })),
+        "the stack merge neither merges one at a time nor dissolves anything: {:?}",
+        gh.calls()
+    );
+    assert_eq!(
+        local.landed_since(before).len(),
+        2,
+        "the pull request and the one below it should have landed, and nothing else"
+    );
+    assert_eq!(
+        gh.open_stacks().len(),
+        1,
+        "the stack should have been left standing"
+    );
+    for branch in &branches[..2] {
+        assert!(
+            !local.has_branch(branch),
+            "a merged pull request's branch should have been taken away: {branch}"
+        );
+    }
+    assert!(
+        local.has_branch(&branches[2]),
+        "the branch of the pull request above must not be taken away: {}",
+        branches[2]
+    );
+}
+
+/// `--stack` is refused where the branches would not survive the rebase GitHub
+/// gives them, which is every strategy but `linear-rebase`.
+///
+/// The refusal is the feature: this is the land that would close the pull requests
+/// above. Nothing may be merged, and nothing may be dissolved.
+#[tokio::test]
+async fn the_stack_merge_is_refused_where_the_branches_would_not_survive_it() {
+    let local = Local::new();
+    let config = Config {
+        land_strategy: LandStrategy::Stack,
+        ..local.config(BaseStrategy::Linear, StackDisplay::Github)
+    };
+    let gh = local.github(&config);
+
+    local.stack(&["unsafe bottom", "unsafe top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    let before = local.tip(MASTER);
+
+    let refusal = local
+        .land(&gh, &config, &["-r", "@-"])
+        .await
+        .expect_err("--stack under spr.baseStrategy = linear should be refused");
+
+    assert!(
+        refusal
+            .messages()
+            .iter()
+            .any(|message| message.contains("linear-rebase")),
+        "the refusal should name the strategy that makes it safe: {refusal:?}"
+    );
+    assert_eq!(local.tip(MASTER), before, "nothing should have landed");
+    assert_eq!(
+        gh.open_stacks().len(),
+        1,
+        "a refused land must not cost the stack"
+    );
+}
+
+/// A stack merge is refused when GitHub would merge more than the land is for: a
+/// stack holding an open pull request below the bottom of the local chain.
+///
+/// There is no asking a stack merge for less, so the alternative to refusing is
+/// landing somebody's change without being asked. Abandoning the bottom change
+/// locally is what makes the two disagree.
+#[tokio::test]
+async fn the_stack_merge_is_refused_when_it_would_land_more_than_asked() {
+    let local = Local::new();
+    let config = Config {
+        land_strategy: LandStrategy::Stack,
+        ..local.config(BaseStrategy::LinearRebase, StackDisplay::Github)
+    };
+    let gh = local.github(&config);
+
+    local.stack(&["extra bottom", "extra top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    let before = local.tip(MASTER);
+
+    // The bottom change is gone locally, so the local chain is one change while
+    // the stack still holds two.
+    run("jj", &["abandon", "@-"], &local.repo);
+
+    let refusal = local
+        .land(&gh, &config, &["-r", "@"])
+        .await
+        .expect_err("a stack merge that would land an unasked-for pull request is refused");
+
+    assert!(
+        refusal
+            .messages()
+            .iter()
+            .any(|message| message.contains("#1") && message.contains("#2")),
+        "the refusal should name both chains: {refusal:?}"
+    );
+    assert_eq!(local.tip(MASTER), before, "nothing should have landed");
+}
+
+/// A land is refused where GitHub reports the requirements the base branch sets
+/// as unmet, and `--force` lands anyway.
+#[tokio::test]
+async fn a_land_is_refused_while_a_requirement_is_unmet_unless_forced() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["blocked change"]);
+    local.diff(&gh, &config).await.expect("the push");
+    gh.set_merge_requirements(MergeRequirements::Unmet);
+    let before = local.tip(MASTER);
+
+    local
+        .land(&gh, &config, &["-r", "@"])
+        .await
+        .expect_err("a blocked pull request should not land");
+    assert_eq!(local.tip(MASTER), before, "nothing should have landed");
+
+    local
+        .land(&gh, &config, &["-r", "@", "--force"])
+        .await
+        .expect("--force should land it anyway");
+    assert_eq!(local.landed_since(before).len(), 1);
+}
+
+/// Landing a chain through a merge queue needs `--wait`, and is refused without
+/// it before anything is queued.
+///
+/// Each pull request has to be merged before the next can be queued, so a land
+/// that will not wait cannot reach the second one — better refused up front than
+/// part way up the stack.
+#[tokio::test]
+async fn landing_a_chain_through_a_queue_without_waiting_is_refused() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    let gh = local.github(&config);
+    gh.set_merge_queue(Some(MergeQueue {
+        url: "https://github.com/acme/widgets/queue/main".to_string(),
+        next_entry_estimated_time_to_merge: None,
+    }));
+
+    local.stack(&["queued bottom", "queued top"]);
+    local.diff(&gh, &config).await.expect("the push");
+
+    let refusal = local
+        .land(&gh, &config, &["-r", "@"])
+        .await
+        .expect_err("landing a chain through a queue without --wait should be refused");
+
+    assert!(
+        refusal
+            .messages()
+            .iter()
+            .any(|message| message.contains("--wait")),
+        "the refusal should point at the flag: {refusal:?}"
+    );
+    assert!(
+        !gh.calls()
+            .iter()
+            .any(|call| matches!(call, Call::Enqueued { .. })),
+        "nothing should have been queued: {:?}",
+        gh.calls()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Closing
+
+/// Closing a pull request points the ones above it at its own base and only then
+/// takes its branch away.
+///
+/// The order is what matters and what the call log shows: a branch deleted while a
+/// pull request still points at it closes that pull request
+/// (`GitHubRule::DeletingABaseBranchClosesItsPullRequests`). The new base is the
+/// closed pull request's own, not the default branch — closing puts nothing on the
+/// default branch, so sending the one above there would swallow everything below
+/// it.
+#[tokio::test]
+async fn closing_a_pull_request_retargets_the_ones_above_it_first() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["close bottom", "close middle", "close top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    let (bottom, middle) = (gh.head_of(1), gh.head_of(2));
+
+    local
+        .close(&gh, &config, &["-r", "@-"])
+        .await
+        .expect("the close");
+
+    assert_eq!(
+        gh.base_of(3),
+        bottom,
+        "the pull request above should have been moved onto the closed one's own base"
+    );
+    assert!(
+        !local.has_branch(&middle),
+        "the closed pull request's branch should have been taken away: {middle}"
+    );
+    assert!(
+        local.has_branch(&bottom),
+        "the branch below is not this one's to take away: {bottom}"
+    );
+
+    let calls = gh.calls();
+    let retargeted = calls
+        .iter()
+        .position(|call| matches!(call, Call::Retargeted { number: 3, .. }))
+        .expect("the pull request above should have been retargeted");
+    let closed = calls
+        .iter()
+        .position(|call| matches!(call, Call::Updated { number: 2, .. }))
+        .expect("the pull request should have been closed");
+    assert!(
+        closed < retargeted,
+        "the close comes first, and the retarget of the one above after it: {calls:?}"
+    );
+}
+
+/// Closing a pull request that has a generated base branch takes that branch away
+/// too, since nothing else was ever based on it.
+#[tokio::test]
+async fn closing_a_synthetic_pull_request_takes_away_its_base_branch() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Synthetic, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["synthclose bottom", "synthclose top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    let (generated, head) = (gh.base_of(2), gh.head_of(2));
+    assert!(local.has_branch(&generated));
+
+    local
+        .close(&gh, &config, &["-r", "@"])
+        .await
+        .expect("the close");
+
+    assert!(
+        !local.has_branch(&generated),
+        "the generated base branch should have gone with it: {generated}"
+    );
+    assert!(
+        !local.has_branch(&head),
+        "and so should the head branch: {head}"
+    );
+}
+
+/// Closing a pull request a GitHub stack holds dissolves the stack, because the
+/// pull requests above it have to be retargeted and a stack owns their bases.
+///
+/// `GitHubRule::StackLocksBaseRefs` again, from the other side: the fake refuses
+/// the retarget while stacked, so a close that skipped the dissolve fails here.
+#[tokio::test]
+async fn closing_in_a_stack_dissolves_it_before_retargeting() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["stackclose bottom", "stackclose middle", "stackclose top"]);
+    local.diff(&gh, &config).await.expect("the push");
+    assert_eq!(gh.open_stacks().len(), 1);
+
+    local
+        .close(&gh, &config, &["-r", "@-"])
+        .await
+        .expect("the close");
+
+    let calls = gh.calls();
+    let unstacked = calls
+        .iter()
+        .position(|call| matches!(call, Call::Unstacked { .. }))
+        .expect("the stack should have been dissolved");
+    let retargeted = calls
+        .iter()
+        .position(|call| matches!(call, Call::Retargeted { .. }))
+        .expect("the pull request above should have been retargeted");
+    assert!(
+        unstacked < retargeted,
+        "the stack has to go before a base moves: {calls:?}"
     );
 }

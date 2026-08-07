@@ -41,7 +41,7 @@ pub struct CloseOptions {
 pub async fn close(
     opts: CloseOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
 ) -> Result<()> {
     let mut result = Ok(());
@@ -114,7 +114,7 @@ pub async fn close(
 
 async fn close_impl(
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     prepared_commit: &mut PreparedCommit,
     mut stacks: Option<&mut StackSession>,

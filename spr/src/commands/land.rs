@@ -88,7 +88,7 @@ fn resolve_land_strategy(
 /// branch, which is where the problem is, rather than through the mutation
 /// failing further down.
 async fn decide_landing(
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     strategy: LandStrategy,
 ) -> Result<Landing> {
@@ -168,7 +168,7 @@ async fn decide_landing(
 /// unlanded parents, and it is unlanded parents this is about.
 async fn changes_to_land(
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     commit: crate::jj::PreparedCommit,
 ) -> Result<Vec<crate::jj::PreparedCommit>> {
@@ -270,7 +270,7 @@ const MERGE_QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// no longer wants to wait can stop waiting — the Pull Request stays in the
 /// queue either way, which is the whole point of the flag being optional.
 async fn wait_for_the_merge_queue(
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     number: u64,
     mut reported: Option<i64>,
 ) -> Result<git2::Oid> {
@@ -347,7 +347,7 @@ fn describe_wait(seconds: i64) -> String {
 /// children of the commit being landed.
 async fn find_stacked_pull_requests(
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     landing_oid: git2::Oid,
 ) -> Result<Vec<StackedPullRequest>> {
@@ -395,7 +395,7 @@ async fn find_stacked_pull_requests(
 /// regardless has no reason to spend those ten seconds on an answer it will
 /// discard.
 async fn wait_for_mergeability(
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     number: u64,
     head_oid: git2::Oid,
     enforce_requirements: bool,
@@ -481,7 +481,7 @@ async fn wait_for_mergeability(
 /// which is why the base-already-master path takes GitHub's verdict on the
 /// merge before it dissolves anything.
 async fn abandon_land(
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     number: u64,
     headline: &str,
     retargeted_from: Option<&crate::github::GitHubBranch>,
@@ -521,7 +521,7 @@ async fn abandon_land(
 /// that is waiting arrives here only when the queue has finished.
 async fn clean_up_after_merging(
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     stacks: &mut Option<StackSession>,
     pull_request: &crate::github::PullRequest,
@@ -660,7 +660,7 @@ fn resolve_cherry_pick(
 pub async fn land(
     opts: LandOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
 ) -> Result<()> {
     // GitHub's own stacks, held as an `Option` exactly as `diff` holds them:
@@ -716,7 +716,7 @@ pub async fn land(
 async fn land_the_stack(
     opts: LandOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     stacks: &mut Option<StackSession>,
 ) -> Result<()> {
@@ -871,7 +871,7 @@ const STACK_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
 /// and nothing has been taken apart when they do.
 async fn land_through_the_stack_merge(
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     changes: Vec<crate::jj::PreparedCommit>,
 ) -> Result<()> {
@@ -1135,7 +1135,7 @@ fn numbers(pull_requests: &[u64]) -> String {
 /// later — so the message says where things stood rather than claiming the land
 /// failed.
 async fn wait_for_the_stack_merge(
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     landing: &[u64],
 ) -> Result<Option<String>> {
     let Some(&target) = landing.last() else {
@@ -1270,7 +1270,7 @@ async fn fetch_what_landed(
 async fn land_pull_request(
     opts: &LandOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     stacks: &mut Option<StackSession>,
     landing: &Landing,
@@ -1624,33 +1624,17 @@ async fn land_pull_request(
     // single commit, so the failure is specific to the branch shape rather than
     // general. That is not a reason to offer them: it would be a setting whose
     // useful case is the one where it changes nothing.
-    let merged = octocrab::instance()
-        .pulls(&config.owner, &config.repo)
-        .merge(pull_request_number)
-        .method(octocrab::params::pulls::MergeMethod::Squash)
-        .title(pull_request.title.clone())
-        .message(build_github_body_for_merging(&pull_request.sections))
-        .sha(format!("{}", pr_head_oid))
-        .send()
-        .await
-        .convert()
-        .context(format!(
-            "squash-merging PR #{} (head {})",
-            pull_request_number, pr_head_oid
-        ))
-        .and_then(|merge| {
-            if merge.merged {
-                Ok(merge)
-            } else {
-                Err(Error::new(formatdoc!(
-                    "GitHub Pull Request merge failed: {}",
-                    merge.message.unwrap_or_default()
-                )))
-            }
-        });
+    let merged = gh
+        .merge_pull_request(
+            pull_request_number,
+            pull_request.title.clone(),
+            build_github_body_for_merging(&pull_request.sections),
+            pr_head_oid,
+        )
+        .await;
 
-    let merge = match merged {
-        Ok(merge) => merge,
+    let merge_commit = match merged {
+        Ok(merge_commit) => merge_commit,
         Err(error) => {
             return abandon_land(
                 gh,
@@ -1670,7 +1654,7 @@ async fn land_pull_request(
         stacks,
         &pull_request,
         &stacked_pull_requests,
-        merge.sha.as_deref(),
+        merge_commit.map(|oid| format!("{oid}")).as_deref(),
     )
     .await
 }

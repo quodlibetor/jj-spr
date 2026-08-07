@@ -38,9 +38,11 @@ use crate::{
 /// Points a pull request at a new base branch, taking the old base branch out
 /// of the way where it was ours to take.
 ///
-/// A trait so that [`retarget_stacked_pull_requests`] can be exercised without
-/// a GitHub to talk to; [`crate::github::GitHub`] is the only implementation
-/// outside tests.
+/// Narrower than [`crate::github::GitHubApi`] on purpose, and kept even though
+/// that trait has the same method: what [`retarget_stacked_pull_requests`] needs
+/// of a client is one call, and a test about retargeting should not have to
+/// implement eighteen. Anything that is a whole GitHub is one of these too, by
+/// the blanket implementation below.
 pub trait Retarget {
     /// See [`crate::github::GitHub::retarget_pull_request`], which is what this
     /// calls. Reports whether the old base branch was deleted from the remote.
@@ -52,14 +54,14 @@ pub trait Retarget {
     ) -> impl std::future::Future<Output = Result<bool>>;
 }
 
-impl Retarget for crate::github::GitHub {
+impl<T: crate::github::GitHubApi> Retarget for T {
     async fn retarget(
         &self,
         number: u64,
         new_base: &GitHubBranch,
         old_base: &GitHubBranch,
     ) -> Result<bool> {
-        self.retarget_pull_request(number, new_base, old_base).await
+        crate::github::GitHubApi::retarget_pull_request(self, number, new_base, old_base).await
     }
 }
 

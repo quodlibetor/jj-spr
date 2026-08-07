@@ -20,7 +20,7 @@ use std::{
 mod api;
 mod stacks;
 
-pub use api::GitHubApi;
+pub use api::{GitHubApi, GitHubRule};
 pub use stacks::{
     AsyncMerge, Stack, StackApiError, StackBase, StackGitRef, StackPullRequest,
     StackPullRequestState, StackResult, UnstackOutcome,
@@ -673,6 +673,52 @@ impl GitHub {
             Some(old_base) => self.delete_remote_branch(old_base).await,
             None => Ok(false),
         }
+    }
+
+    /// Squash-merge pull request `number`, and hand back the commit it landed as.
+    ///
+    /// `head_oid` is a lease: GitHub merges only if that is still the head, so a
+    /// pull request somebody pushed to since this land looked at it is refused
+    /// rather than merged unseen. That is the difference from
+    /// [`Self::merge_pull_request_async`], which accepts the field and ignores it.
+    ///
+    /// Squash, and only squash — the account of why the other two merge methods
+    /// are not offered is at the call site in `commands::land`, next to what they
+    /// did to a stacked pull request when they were tried.
+    ///
+    /// Here rather than at that call site because it was the one place in the
+    /// crate reaching for `octocrab` from outside this module, which is also what
+    /// made it the one call a test could not stand in for.
+    pub async fn merge_pull_request(
+        &self,
+        number: u64,
+        title: String,
+        message: String,
+        head_oid: git2::Oid,
+    ) -> Result<Option<git2::Oid>> {
+        let merge = octocrab::instance()
+            .pulls(&self.config.owner, &self.config.repo)
+            .merge(number)
+            .method(octocrab::params::pulls::MergeMethod::Squash)
+            .title(title)
+            .message(message)
+            .sha(format!("{head_oid}"))
+            .send()
+            .await
+            .convert()
+            .context(format!("squash-merging PR #{number} (head {head_oid})"))?;
+
+        if !merge.merged {
+            return Err(Error::new(format!(
+                "GitHub Pull Request merge failed: {}",
+                merge.message.unwrap_or_default()
+            )));
+        }
+
+        Ok(merge
+            .sha
+            .as_deref()
+            .and_then(|sha| git2::Oid::from_str(sha).ok()))
     }
 
     /// [`Self::retarget_pull_request`] to the master branch.
