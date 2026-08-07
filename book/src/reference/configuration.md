@@ -39,7 +39,7 @@ jj-spr uses the following configuration values:
 | `requireApproval`    |                                   | If true, `jj spr land` will refuse to land a pull request that is not approved      | false             | true                                          |
 | `baseStrategy`       |                                   | What a stacked pull request is based on, and how its branch is built: `synthetic`, `linear` or `linear-rebase`. See below | `synthetic`       | `synthetic`                                   |
 | `stackDisplay`       |                                   | How a pull request says which stack it belongs to: `section`, `github` or `none`. See below | `section`         | `section`; `github` only offered under a linear strategy |
-| `landStrategy`       |                                   | How `jj spr land` lands a pull request: `merge` squash-merges it there and then, `queue` puts it in the merge queue of `githubMasterBranch`, and `auto` asks GitHub which of the two that branch allows | `auto`            | `auto`                                        |
+| `landStrategy`       |                                   | How `jj spr land` lands a pull request: `merge` squash-merges it there and then, `queue` puts it in the merge queue of `githubMasterBranch`, `auto` asks GitHub which of the two that branch allows, and `stack` hands the chain to GitHub's stacked pull requests. See below | `auto`            | `auto`                                        |
 
 Notes:
 - All config keys are in the `spr` section; for example, `spr.githubAuthToken`.
@@ -96,6 +96,27 @@ Things worth knowing before choosing it:
 - **Under `spr.baseStrategy = linear`, do not merge a stacked pull request from GitHub's own interface.** GitHub's stack merge rebases the head branch of the pull request above the one you merged, and a branch built out of merge commits does not survive a rebase: it collapses onto its base and GitHub closes the pull request as empty, review and all. Use `jj spr land`, which takes the stack apart first. Under `linear-rebase` — what this setting selects when you have not chosen — the branches are chains of ordinary commits and survive it, so merging from GitHub is safe.
 - **Closing dissolves the stacks holding the pull requests above the closed one, and only those.** GitHub is happy to close a stacked pull request and keeps it in the stack, closed and in place. What it refuses is pointing the pull requests *above* it at the closed one's base, so `jj spr close` takes apart whatever stack holds each of those — and nothing at all when there are none. To register a stack again afterwards, take the closed change out of the local chain first (abandon it, or fold it into a neighbour) and then `jj spr diff` what is left: skipping it in the revset does not step over it but builds around it — the chain breaks there and the closed work drops back out of the diffs above — and pushing it opens a new pull request.
 - **The repository has to have stacked pull requests enabled.** Where it does not, jj-spr pushes exactly as it otherwise would, so nothing is lost. `jj spr diff` says so on any run that had a pull request to look up.
+
+### `landStrategy = stack`
+
+`jj spr land` merges the pull request you named and every one below it that has not landed, one at a time, each as its own squash commit. With `spr.landStrategy = stack` — or `jj spr land --stack` for a single land — it hands that job to GitHub instead: one request merges the pull request and every member of its [stack](#githubstacks) below it, and GitHub then moves the pull requests *above* onto the default branch and rebases their branches itself.
+
+What you get for it is what a land otherwise leaves behind:
+
+- The stack survives the land, still holding its members, so there is no dissolving and no registering it again under a new number.
+- The pull requests above come out based on the default branch with their branches rebased onto what landed, so they already show only their own changes. Without this, a retargeted pull request's diff includes the changes that just landed until you rebase and run `jj spr diff`.
+
+What it costs is the commit messages. One request merges several pull requests, so there is nowhere to put a message for each, and GitHub words each squash from the repository's own squash settings — where `jj spr land` merging a pull request itself sets the title and body from the local commit's message sections. That is why `auto` never chooses this: it is a visible change to what lands, so it is asked for rather than inferred.
+
+It is refused, before anything is merged, unless three things hold:
+
+- **`spr.baseStrategy = linear-rebase`.** GitHub rebases the branch of the pull request above the one it merges, and the branches the other two strategies push are merge commits that do not survive a rebase: the branch would collapse onto its base and GitHub would close that pull request as empty, review and all.
+- **The pull request is in a stack.** Without one the endpoint merges that pull request alone, with none of the above being true and its commit message from the repository's settings — strictly worse than landing it the ordinary way.
+- **What GitHub would merge is what the land is for.** A stack merge takes everything below the pull request it is given and there is no asking for less, so a stack holding an open pull request below the bottom of your local chain would land that too. jj-spr compares the two and refuses rather than merge something you did not ask for.
+
+`--no-stack` turns it off for one land, leaving the pull requests to be merged one at a time; whether they are queued is then for the default branch to decide, or for `--queue` / `--no-queue` to say.
+
+`jj spr init` offers `stack` among the land strategies only where the answers it already has can carry it — `linear-rebase` and `stackDisplay = github`. Answer either of those the other way and it is not on the list, and a `landStrategy` that was already `stack` is replaced by `auto` rather than left to refuse every land.
 
 ## Setting Configuration
 

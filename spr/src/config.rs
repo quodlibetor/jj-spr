@@ -243,6 +243,22 @@ pub enum LandStrategy {
     /// Put the pull request in the merge queue of the default branch, and leave
     /// the merging to GitHub.
     Queue,
+    /// Hand the whole job to GitHub's stacked pull requests: one request merges
+    /// the pull request and every member of its stack below it, and GitHub
+    /// retargets and rebases the members above.
+    ///
+    /// Never chosen by [`Self::Auto`], and not because it is worse. It lands the
+    /// same changes as [`Self::Merge`] does, one squash commit each, and leaves
+    /// less for the next `jj spr diff` to do — but the commit messages come from
+    /// the repository's squash settings rather than from the local commit's
+    /// message sections, because one request merges several pull requests and
+    /// there is nowhere to put a message for each. That is a visible change to
+    /// what lands, so it is asked for rather than inferred.
+    ///
+    /// Wants what `spr.stackDisplay = github` builds, and refuses the land where it is not
+    /// there: a stack to merge, and pull request branches that survive GitHub
+    /// rebasing them, which is [`BaseStrategy::LinearRebase`] alone.
+    Stack,
 }
 
 impl std::str::FromStr for LandStrategy {
@@ -253,8 +269,9 @@ impl std::str::FromStr for LandStrategy {
             "auto" => Ok(Self::Auto),
             "merge" => Ok(Self::Merge),
             "queue" => Ok(Self::Queue),
+            "stack" => Ok(Self::Stack),
             other => Err(Error::new(format!(
-                "spr.landStrategy must be 'auto', 'merge' or 'queue', but is '{other}'"
+                "spr.landStrategy must be 'auto', 'merge', 'queue' or 'stack', but is '{other}'"
             ))),
         }
     }
@@ -262,12 +279,14 @@ impl std::str::FromStr for LandStrategy {
 
 impl LandStrategy {
     /// Every strategy, in the order `jj spr init` offers them: the default
-    /// first, then the two it chooses between.
+    /// first, then the two it chooses between, then the one it never does.
     ///
     /// Kept next to the enum rather than in `init`, so that a strategy added
     /// here is offered rather than quietly left out of the one place that asks
-    /// about it.
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Merge, Self::Queue];
+    /// about it. `init` offers [`Self::Stack`] only where the rest of the
+    /// configuration can carry it; every entry here is a strategy it may write,
+    /// not one it must.
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Merge, Self::Queue, Self::Stack];
 
     /// The value `spr.landStrategy` takes for this strategy.
     ///
@@ -280,6 +299,7 @@ impl LandStrategy {
             Self::Auto => "auto",
             Self::Merge => "merge",
             Self::Queue => "queue",
+            Self::Stack => "stack",
         }
     }
 }
@@ -794,7 +814,12 @@ mod tests {
             assert_eq!(strategy.as_str().parse::<LandStrategy>().unwrap(), strategy);
         }
 
-        for strategy in [LandStrategy::Auto, LandStrategy::Merge, LandStrategy::Queue] {
+        for strategy in [
+            LandStrategy::Auto,
+            LandStrategy::Merge,
+            LandStrategy::Queue,
+            LandStrategy::Stack,
+        ] {
             assert!(
                 LandStrategy::ALL.contains(&strategy),
                 "{strategy:?} is not offered by `jj spr init`"

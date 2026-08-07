@@ -42,8 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   squash-merges it there and then, which is what jj-spr has always done, and
   `queue` puts it in the merge queue GitHub keeps for the default branch. The
   default, `auto`, asks GitHub which of the two that branch allows, so a
-  repository that requires a merge queue needs no configuration at all.
-  `jj spr init` asks for it.
+  repository that requires a merge queue needs no configuration at all. `stack`
+  hands the whole chain to GitHub's stacked pull requests instead — see
+  `jj spr land --stack` above, which is the same thing for one land.
+  `jj spr init` asks for it, offering `stack` only where the base strategy and
+  `spr.stackDisplay` it has already asked about can carry it.
 - `jj spr diff` retargets a pull request at the default branch once its commit
   sits directly on that branch, and deletes the synthetic base branch the pull
   request used to point at. The branch is only deleted after GitHub confirms
@@ -133,11 +136,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer about the merge at all, and moving it means dissolving the stack, so
   there the refusal still costs the stack.
 
-  It deliberately does not take that offer up, and not because of what the
-  stack merge lands: merging everything below the pull request asked for is
-  right, and `jj spr land` does it too. The reason is what the stack merge does
-  afterwards. It rebases the head branch of the pull request *above* onto its
-  new base, and under `spr.baseStrategy = synthetic` or `linear` the branches
+  It does not take that offer up unless asked to with `--stack` (below), and
+  not because of what the stack merge lands: merging everything below the pull
+  request asked for is right, and `jj spr land` does it too. The reason is what
+  the stack merge does afterwards. It rebases the head branch of the pull
+  request *above* onto its new base, and under `spr.baseStrategy = synthetic` or
+  `linear` the branches
   jj-spr pushes are merge commits that a rebase discards, so that branch
   collapses onto its base and GitHub closes the pull request as having no
   changes, review and all. For the same reason, under those two strategies, do
@@ -145,6 +149,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub is drawing the stack. Under `spr.baseStrategy = linear-rebase` — what
   `spr.stackDisplay = github` selects for itself — the branches are chains of ordinary
   commits, which survive that rebase, so merging from GitHub is safe there.
+
+- `jj spr land --stack`, and `spr.landStrategy = stack`, land a whole chain
+  through GitHub's stacked pull requests: one request merges the pull request
+  and every member of its stack below it, one squash commit each, and GitHub
+  moves the pull requests above onto the default branch and rebases their
+  branches itself. The stack survives, so nothing has to be registered again,
+  and the pull requests above come out already showing only their own changes —
+  which is the one thing a land otherwise leaves for the next `jj spr diff` to
+  put right. `--no-stack` merges one at a time for a single land.
+
+  It needs `spr.baseStrategy = linear-rebase`, and refuses the land without it:
+  the rebase GitHub gives the branch above discards a branch built out of merge
+  commits, and GitHub then closes that pull request as empty. It also refuses a
+  pull request that is in no stack, and one whose stack would merge something
+  the land is not for — a stack merge takes everything below the pull request it
+  is given, and there is no asking for less, so a stack holding an open pull
+  request below the bottom of the local chain would land that too.
+
+  `auto` never chooses it, and not because it is worse: it lands the same
+  changes, and less is left over afterwards. The commit messages are what
+  differ. One request merges several pull requests, so there is nowhere to put a
+  message for each, and GitHub words them from the repository's own squash
+  settings rather than from the local commit's message sections the way
+  `jj spr land` does when it merges a pull request itself. That is a visible
+  change to what lands, so it is asked for rather than inferred.
 
 - `jj spr close` works under `spr.stackDisplay = github`. Closing itself needs nothing:
   GitHub allows it while a stack holds the pull request, and keeps the closed

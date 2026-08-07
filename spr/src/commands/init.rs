@@ -314,9 +314,35 @@ pub async fn init() -> Result<()> {
         ),
     )?;
 
+    // `stack` is offered only where the answers above can carry it: it needs a
+    // stack to merge and the branches `linear-rebase` builds, and refuses the
+    // land without both. Offering it regardless would let `init` write a
+    // configuration under which no land succeeds — and leaving it out where it
+    // was configured before is how `init` heals one that already says so.
+    let stack_offered = stack_display.draws_the_stack() && base_strategy.rebases_branches();
+
+    if stack_offered {
+        output(
+            "  ",
+            &formatdoc!(
+                "'stack' hands the whole chain to GitHub's stacked pull \
+                 requests: one request merges this pull request and every \
+                 member of its stack below it, and GitHub retargets and \
+                 rebases the ones above. 'auto' never picks it, because GitHub \
+                 words each squash commit from the repository's settings \
+                 rather than from your commit message."
+            ),
+        )?;
+    }
+
+    let land_strategies = LandStrategy::ALL
+        .into_iter()
+        .filter(|strategy| stack_offered || *strategy != LandStrategy::Stack)
+        .collect::<Vec<_>>();
+
     let land_strategy = select_one(
         "Land strategy",
-        &LandStrategy::ALL,
+        &land_strategies,
         LandStrategy::as_str,
         get_config_value("spr.landStrategy", &config)
             .and_then(|value| value.parse().ok())

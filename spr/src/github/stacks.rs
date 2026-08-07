@@ -164,6 +164,56 @@ pub enum UnstackOutcome {
     Retained(Stack),
 }
 
+/// Where a request to GitHub's asynchronous merge has got to.
+///
+/// The endpoint answers with a `status` and a bag of `details`, and the same
+/// request can be made again at any time: while a merge is in flight it is
+/// refused as a duplicate, and once the pull request is merged it answers that
+/// it is. So these three are the whole state of a merge as far as a caller can
+/// see it — and only the last is an end state.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncMerge {
+    /// GitHub has taken the request and will merge in its own time. Nothing has
+    /// been merged yet.
+    Enqueued,
+    /// A merge request for this pull request was already in flight, so this one
+    /// changed nothing. Whatever is in flight is still going to happen, which is
+    /// why this is not an error: asking twice for the merge that is already
+    /// coming is the same request, not a conflicting one.
+    AlreadyEnqueued,
+    /// The pull request is merged. `sha` is the commit it landed as, where
+    /// GitHub named one.
+    Merged { sha: Option<String> },
+}
+
+/// What GitHub answers a merge request with, on every status.
+#[derive(Debug, serde::Deserialize)]
+struct AsyncMergeResponse {
+    status: String,
+    #[serde(default)]
+    details: AsyncMergeDetails,
+}
+
+/// The `details` of a merge request's answer.
+///
+/// Only the merge commit is modelled, and optionally, because which fields
+/// GitHub sends depends on the status and none of them is worth failing a
+/// response over. `message`, `uuid`, `merge_method`, `merge_action` and
+/// `expected_head_sha` are all sent and all ignored: nothing acts on them, and
+/// `expected_head_sha` in particular must not be mistaken for a lease — see
+/// [`GitHub::merge_pull_request_async`].
+#[derive(Debug, Default, serde::Deserialize)]
+struct AsyncMergeDetails {
+    #[serde(default)]
+    sha: Option<String>,
+}
+
+/// The body a merge request takes.
+#[derive(serde::Serialize)]
+struct AsyncMergeRequest {
+    merge_method: &'static str,
+}
+
 pub type StackResult<T> = std::result::Result<T, StackApiError>;
 
 /// Classify a stacks endpoint's failures. Every stacks call goes through this,
@@ -231,6 +281,16 @@ pub enum StackApiError {
     )]
     NotAChain,
 
+    /// 404 from the asynchronous merge route: the pull request is not there, or
+    /// the route is not.
+    ///
+    /// The two cannot be told apart, and both are dead ends for a caller, so
+    /// they share a variant rather than pretending to a distinction GitHub does
+    /// not make. Unlike [`StackApiError::NotEnabled`], nothing degrades on this:
+    /// a caller that asked for the stack merge asked for this route.
+    #[error("GitHub has no asynchronous merge for pull request #{number}")]
+    MergeAsyncNotFound { number: u64 },
+
     /// 422: some of the pull requests already belong to a stack.
     ///
     /// `pull_requests` holds the numbers GitHub named, echoed back in the order
@@ -275,6 +335,11 @@ enum StackScope {
 
     /// A route addressing one stack by its number.
     Stack { stack_number: u64 },
+
+    /// The asynchronous merge route of one pull request, which is a route on the
+    /// pull request rather than on any stack — even though merging one member of
+    /// a stack through it merges every member below.
+    PullRequest { number: u64 },
 }
 
 /// Turn an `octocrab` failure from the route `scope` describes into a
@@ -332,6 +397,7 @@ fn classify_stack_api_error(status: u16, message: &str, scope: StackScope) -> St
         404 => match scope {
             StackScope::Repository => StackApiError::NotEnabled,
             StackScope::Stack { stack_number } => StackApiError::StackNotFound { stack_number },
+            StackScope::PullRequest { number } => StackApiError::MergeAsyncNotFound { number },
         },
         422 => classify_stack_validation_error(message).unwrap_or(StackApiError::Rejected {
             status,
@@ -406,6 +472,18 @@ fn stacks_route(config: &crate::config::Config) -> String {
     format!("/repos/{}/{}/stacks", config.owner, config.repo)
 }
 
+/// The route to the asynchronous merge of one pull request.
+///
+/// Not under `/stacks` at all, which is worth knowing before looking for it
+/// there: GitHub hangs its stack merge off the pull request that is to be the
+/// top of what gets merged.
+fn merge_async_route(config: &crate::config::Config, number: u64) -> String {
+    format!(
+        "/repos/{}/{}/pulls/{number}/merge-async",
+        config.owner, config.repo
+    )
+}
+
 /// The route to one stack, or to `action` on it (`add`, `unstack`).
 ///
 /// The stack is addressed by its number, never by [`Stack::id`].
@@ -422,9 +500,10 @@ fn stack_route(config: &crate::config::Config, stack_number: u64, action: Option
 
 impl GitHub {
     // GitHub's Stacked Pull Requests API. `merge-async`, which merges a whole
-    // stack up to a chosen pull request, is not implemented here: under two of
-    // the three base strategies it destroys the pull requests above the one it
-    // merges.
+    // stack up to a chosen pull request, is [`GitHub::merge_pull_request_async`]
+    // below — and under two of the three base strategies it destroys the pull
+    // requests above the one it merges, which is why `land` asks whether the
+    // branches survive a rebase before it calls it.
     //
     // After the merge GitHub repoints the next survivor at the stack's base and
     // force-pushes that survivor's head branch, rebasing it onto the new base.
@@ -444,14 +523,16 @@ impl GitHub {
     // not find it: the hazard is specific to those two strategies' branch shape.
     //
     // `spr.baseStrategy = linear-rebase` exists to build the branches that do
-    // survive it, so the merge from GitHub's interface is safe there. `land`
-    // still does not come here for it: it takes the stack apart and merges the
-    // pull requests one at a time, which lands the same changes as their own
-    // commits under their own titles and needs no strategy to be true.
+    // survive it, so under that strategy the merge is safe — from GitHub's own
+    // interface, and from `jj spr land --stack`, which is what
+    // [`GitHub::merge_pull_request_async`] is for. Without it, `land` takes the
+    // stack apart and merges the pull requests one at a time, which lands the
+    // same changes as their own commits under their own titles and needs no
+    // strategy to be true.
     //
-    // A note for whoever implements the endpoint anyway: it is a `PUT`, and a
-    // `POST` to it gets an ordinary route-not-found 404 that is easy to misread
-    // as this repository not having stacks enabled.
+    // The endpoint is a `PUT`. A `POST` to the same path gets an ordinary
+    // route-not-found 404 that is easy to misread as this repository not having
+    // stacks enabled.
 
     /// Every stack in the repository.
     ///
@@ -619,6 +700,97 @@ impl GitHub {
 
         Ok(UnstackOutcome::Retained(stack))
     }
+
+    /// Ask GitHub to squash-merge pull request `number` and, where a stack holds
+    /// it, every member below it — the merge its own interface offers on a stack.
+    ///
+    /// Asynchronous, hence the name: GitHub takes the request and answers before
+    /// anything is merged, so a caller that needs the result has to watch the
+    /// pull requests. Observed to take a few seconds for a stack of three.
+    ///
+    /// What it does, established against a live repository on 2026-08-07 rather
+    /// than read out of documentation, which describes none of it:
+    ///
+    /// - **It merges downwards, one commit per pull request.** Merging the middle
+    ///   of a stack of three merged the bottom and the middle, bottom first, as
+    ///   one squash commit each, and left the top open. There is no way to ask it
+    ///   for fewer: how far *up* to go is the only choice it offers.
+    /// - **The pull requests above are retargeted and rebased.** The survivor
+    ///   came out based on the master branch with its head branch force-pushed
+    ///   onto the new tip, showing only its own change and mergeable. That is the
+    ///   work `land` otherwise leaves to the next `jj spr diff` — and the reason
+    ///   this endpoint is only usable under `spr.baseStrategy = linear-rebase`:
+    ///   the account of what the rebase does to a branch built out of merge
+    ///   commits is at the top of this `impl`.
+    /// - **The stack survives.** It stays open, still holding every member, the
+    ///   merged ones marked merged. Nothing has to be dissolved to merge this
+    ///   way, and nothing has to be registered again afterwards.
+    /// - **The merged branches stay.** Deleting them is the caller's to do.
+    ///
+    /// Squash and only squash, which is not a parameter for the reason set out
+    /// where `land` merges a pull request on its own: one Jujutsu change lands as
+    /// one commit. Unlike that merge, the commit message cannot be chosen — one
+    /// request merges several pull requests, so GitHub words each of them from
+    /// the repository's own squash settings.
+    ///
+    /// `expected_head_sha` is not sent, and would buy nothing if it were: the
+    /// endpoint accepts the field, echoes the pull request's *real* head back in
+    /// it, and merges regardless. A run of the probe passed forty zeroes and the
+    /// merge went ahead. So this is not a leased merge, unlike the one `land`
+    /// makes itself, which pins the head it merges.
+    ///
+    /// A 409 is not a failure. It says a merge request for this pull request is
+    /// already in flight, which is the merge the caller is asking for; the status
+    /// alone says so, so nothing here reads GitHub's wording for it.
+    pub async fn merge_pull_request_async(&self, number: u64) -> StackResult<AsyncMerge> {
+        let octocrab = octocrab::instance();
+        let scope = StackScope::PullRequest { number };
+
+        // A `PUT`. A `POST` to the same path gets an ordinary route-not-found
+        // 404, which is easy to misread as this repository not having stacks.
+        let response = octocrab
+            ._put(
+                merge_async_route(&self.config, number),
+                Some(&AsyncMergeRequest {
+                    merge_method: "squash",
+                }),
+            )
+            .await
+            .on_stack_scope(scope)?;
+
+        let response = match octocrab::map_github_error(response)
+            .await
+            .on_stack_scope(scope)
+        {
+            Ok(response) => response,
+            Err(StackApiError::Rejected { status: 409, .. }) => {
+                return Ok(AsyncMerge::AlreadyEnqueued);
+            }
+            Err(error) => return Err(error),
+        };
+
+        let answer = <AsyncMergeResponse as octocrab::FromResponse>::from_response(response)
+            .await
+            .on_stack_scope(scope)?;
+
+        Ok(async_merge(&answer.status, answer.details.sha))
+    }
+}
+
+/// Read a merge request's answer, given GitHub's `status` for it.
+///
+/// Only `merged` is an end state, so anything else is taken to mean the merge is
+/// still coming — including a status this build does not know, which is the
+/// reading that costs a caller some waiting rather than a merge it thinks
+/// happened and did not.
+///
+/// Apart so that it can be tested: the statuses are GitHub's, and this is the
+/// one place they are interpreted.
+fn async_merge(status: &str, sha: Option<String>) -> AsyncMerge {
+    match status {
+        "merged" => AsyncMerge::Merged { sha },
+        _ => AsyncMerge::Enqueued,
+    }
 }
 
 /// Tests for the Stacked Pull Requests client.
@@ -645,6 +817,73 @@ mod stack_tests {
             "spr/".into(),
             false,
         )
+    }
+
+    /// The asynchronous merge lives on the pull request, so a 404 there says
+    /// nothing about the repository having stacks — unlike the same status on the
+    /// repository's own stacks route, which is what callers degrade on.
+    #[test]
+    fn a_missing_async_merge_route_is_not_a_repository_without_stacks() {
+        let error =
+            classify_stack_api_error(404, "Not Found", StackScope::PullRequest { number: 42 });
+
+        assert!(
+            matches!(error, StackApiError::MergeAsyncNotFound { number: 42 }),
+            "{error:?}"
+        );
+    }
+
+    /// A merge already in flight comes back as 409, and the status alone says so.
+    /// Kept as a `Rejected` by the classifier — it is
+    /// [`GitHub::merge_pull_request_async`] that reads it as the merge it asked
+    /// for — so what this pins is that the status survives to be read.
+    #[test]
+    fn a_merge_already_in_flight_keeps_its_status() {
+        let error = classify_stack_api_error(
+            409,
+            "A merge request already exists for this pull request.",
+            StackScope::PullRequest { number: 42 },
+        );
+
+        assert!(
+            matches!(error, StackApiError::Rejected { status: 409, .. }),
+            "{error:?}"
+        );
+    }
+
+    /// Only `merged` means the merge has happened. Anything else, including a
+    /// status this build has never seen, leaves the caller waiting — which costs
+    /// time, where the other reading would cost a merge that never happened being
+    /// treated as done.
+    #[test]
+    fn only_a_merged_status_ends_an_async_merge() {
+        assert_eq!(
+            async_merge("merged", Some("abc123".to_string())),
+            AsyncMerge::Merged {
+                sha: Some("abc123".to_string())
+            }
+        );
+        assert_eq!(async_merge("pending", None), AsyncMerge::Enqueued);
+        assert_eq!(
+            async_merge("something-new", None),
+            AsyncMerge::Enqueued,
+            "an unknown status must not read as merged"
+        );
+    }
+
+    /// The body the merge request sends. `merge_method` is the property GitHub
+    /// keys on, and it ignores properties it does not know — so a wrong name
+    /// would silently merge by the repository's default method instead of
+    /// squashing.
+    #[test]
+    fn test_async_merge_request_body_shape() {
+        assert_eq!(
+            serde_json::to_string(&AsyncMergeRequest {
+                merge_method: "squash"
+            })
+            .unwrap(),
+            r#"{"merge_method":"squash"}"#
+        );
     }
 
     #[test]

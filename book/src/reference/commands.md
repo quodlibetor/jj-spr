@@ -82,6 +82,10 @@ jj spr land [OPTIONS]
 - `--cherry-pick` - Land PR independently (for use with stacks)
 - `--queue` - Put the PR in the merge queue, whatever `spr.landStrategy` says
 - `--no-queue` - Squash-merge the PR now, whatever `spr.landStrategy` says
+- `--stack` - Land the PR and every one below it in its GitHub stack in one
+  request, letting GitHub rebase the ones above, whatever `spr.landStrategy` says
+- `--no-stack` - Merge the PRs one at a time rather than through GitHub's stacked
+  pull requests, whatever `spr.landStrategy` says
 - `--wait` - Stay until the merge queue has merged the PR, then clean up after it
 
 **Examples:**
@@ -139,18 +143,27 @@ Higher up the stack the base has to move onto the default branch first, and
 moving it is what needs the stack gone, so there a refusal still costs the
 stack.
 
-Landing deliberately does *not* take GitHub up on that stack merge
-(`PUT /pulls/{n}/merge-async`), and not because of what it lands: merging
-everything below the pull request you asked for is right, and `jj spr land`
-does it too. The reason is what GitHub does afterwards. It rebases the head
-branch of the pull request *above* onto its new base, and under
-[`spr.baseStrategy`](configuration.md#basestrategy) `synthetic` or `linear` the
-branches jj-spr pushes are merge commits that a rebase discards: the branch
-collapses onto its base and GitHub closes the pull request as having no changes,
-review and all. For the same reason, under those two strategies, do not merge a
-stacked pull request from GitHub's own interface. Under `linear-rebase` — what
-`spr.stackDisplay = github` chooses when you have not — the branches are chains of
-ordinary commits and survive that rebase, so merging from GitHub is safe.
+Landing does not take GitHub up on that stack merge
+(`PUT /pulls/{n}/merge-async`) unless you ask it to with `--stack`, and not
+because of what it lands: merging everything below the pull request you asked for
+is right, and `jj spr land` does it too. The reason is what GitHub does
+afterwards. It rebases the head branch of the pull request *above* onto its new
+base, and under [`spr.baseStrategy`](configuration.md#basestrategy) `synthetic` or
+`linear` the branches jj-spr pushes are merge commits that a rebase discards: the
+branch collapses onto its base and GitHub closes the pull request as having no
+changes, review and all. For the same reason, under those two strategies, do not
+merge a stacked pull request from GitHub's own interface.
+
+Under `linear-rebase` — what `spr.stackDisplay = github` chooses when you have not — the
+branches are chains of ordinary commits and survive that rebase. There, merging
+from GitHub's interface is safe, and so is `jj spr land --stack`, which is the
+same merge asked for from here: one request lands the pull request and everything
+below it, GitHub moves the ones above onto the default branch and rebases their
+branches, and the stack stays as it was. What it costs is that GitHub words each
+squash commit from the repository's settings rather than from your commit
+message, which is why it is opt-in — see
+[`landStrategy = stack`](configuration.md#landstrategy--stack) for the whole
+trade and for the three things it refuses to do without.
 
 **Important:** After landing, you must manually rebase your working copy:
 ```bash

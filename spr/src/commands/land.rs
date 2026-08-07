@@ -11,7 +11,10 @@ use std::{io::Write, process::Stdio, time::Duration};
 use crate::{
     config::LandStrategy,
     error::{Error, Result, ResultExt},
-    github::{MergeQueue, PullRequestState, PullRequestUpdate, ReviewStatus, StackedPullRequest},
+    github::{
+        AsyncMerge, MergeQueue, PullRequestState, PullRequestUpdate, ReviewStatus,
+        StackedPullRequest,
+    },
     message::{MessageSection, build_github_body_for_merging},
     native_stacks::{
         DissolveReason, StackSession, dissolve_any_stack_holding, dissolve_stacks_holding,
@@ -25,7 +28,7 @@ use crate::{
     utils::run_command,
 };
 
-/// What this land will ask GitHub for, once it is known which of the two the
+/// What this land will ask GitHub for, once it is known which of them the
 /// default branch takes.
 enum Landing {
     /// Squash-merge the Pull Request now.
@@ -33,6 +36,10 @@ enum Landing {
     /// Put the Pull Request in this merge queue and leave the merging to
     /// GitHub.
     Queue(MergeQueue),
+    /// Ask GitHub's stacked pull requests to merge this Pull Request and every
+    /// member of its stack below it, in one request. See
+    /// [`land_through_the_stack_merge`].
+    Stack,
 }
 
 /// The strategy to land under, given the flags this land was passed and the
@@ -41,14 +48,32 @@ enum Landing {
 /// The flags name a strategy for one land rather than switching something on:
 /// `--no-queue` is how a caller who may bypass the queue says to merge now in a
 /// repository configured to queue, which is the same thing `spr.landStrategy =
-/// merge` says for every land. Neither flag leaves the setting to decide.
+/// merge` says for every land. No flag leaves the setting to decide.
 ///
-/// Passing both is refused by `clap`, so the order the two are read in here
-/// never decides anything.
-fn resolve_land_strategy(queue: bool, no_queue: bool, configured: LandStrategy) -> LandStrategy {
-    match (queue, no_queue) {
-        (true, _) => LandStrategy::Queue,
-        (_, true) => LandStrategy::Merge,
+/// `--no-stack` is the one that is not simply another strategy. The other three
+/// flags each name what to do; this one names what *not* to do, and says nothing
+/// about whether the Pull Requests it leaves to be merged one at a time should
+/// be queued. So it only displaces a configured [`LandStrategy::Stack`], and
+/// with what the default branch decides — pair it with `--queue` or `--no-queue`
+/// to settle that too.
+///
+/// `--queue` with `--no-queue`, `--stack` with `--no-stack`, and `--stack` with
+/// `--queue` are all refused by `clap`, so the order those are read in here
+/// never decides anything. `--stack` with `--no-queue` is allowed and means the
+/// stack merge: both say not to queue, and only one of them says what to do
+/// instead.
+fn resolve_land_strategy(
+    queue: bool,
+    no_queue: bool,
+    stack: bool,
+    no_stack: bool,
+    configured: LandStrategy,
+) -> LandStrategy {
+    match (queue, no_queue, stack, no_stack) {
+        (true, ..) => LandStrategy::Queue,
+        (_, _, true, _) => LandStrategy::Stack,
+        (_, true, ..) => LandStrategy::Merge,
+        (_, _, _, true) if configured == LandStrategy::Stack => LandStrategy::Auto,
         _ => configured,
     }
 }
@@ -74,6 +99,11 @@ async fn decide_landing(
         // queue may merge into a branch that has one, and it is GitHub's answer
         // to the merge itself that says whether this caller is.
         LandStrategy::Merge => Landing::Merge,
+        // Nor here, and for the same reason: the stack merge is a merge, so a
+        // branch with a queue is GitHub's to refuse. Nothing observed says how
+        // it answers, and inventing a refusal for it here would claim more than
+        // has been established.
+        LandStrategy::Stack => Landing::Stack,
         LandStrategy::Queue => match gh.get_merge_queue(branch_name).await? {
             Some(queue) => Landing::Queue(queue),
             None => {
@@ -104,10 +134,12 @@ async fn decide_landing(
 ///
 /// It is also what GitHub does with a stack of its own. `gh stack merge <n>`
 /// merges every member up to and including the one named, and the choice it
-/// offers is how far *up* to go, never how far down. jj-spr merges them one at
-/// a time rather than through GitHub's stack merge, which is a difference of
-/// mechanism only — the account of why that endpoint is not jj-spr's to call is
-/// at the top of `impl GitHub` in `github::stacks`.
+/// offers is how far *up* to go, never how far down. So the chain worked out here
+/// is the same chain either way: whether it is merged one Pull Request at a time
+/// or handed to GitHub's stack merge is
+/// [`LandStrategy::Stack`](crate::config::LandStrategy::Stack), decided after
+/// this and over the same list — see [`land_through_the_stack_merge`], which
+/// reconciles what GitHub would merge against what this returned.
 ///
 /// Which of the changes below the one being landed are still to land is asked
 /// of GitHub, one Pull Request at a time, rather than of the local chain. It
@@ -552,37 +584,7 @@ async fn clean_up_after_merging(
         spawn_head_branch_deletion(jj, config, &pull_request.head, &retargeted)?;
 
     // Rebase us on top of the now-landed commit
-    if let Some(sha) = merge_sha {
-        // Try this up to three times, because fetching the very moment after
-        // the merge might still not find the new commit.
-        for i in 0..3 {
-            // Fetch current master and the merge commit from GitHub.
-            let git_fetch = jj
-                .git_command()
-                .arg("fetch")
-                .arg("--no-write-fetch-head")
-                .arg("--")
-                .arg(&config.remote_name)
-                .arg(config.master_ref.on_github())
-                .arg(sha)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-                .await?;
-            if git_fetch.status.success() {
-                break;
-            } else if i == 2 {
-                console::Term::stderr().write_all(&git_fetch.stderr)?;
-                return Err(Error::new("git fetch failed"));
-            }
-        }
-        // TODO: Implement Jujutsu-native rebase after landing
-        // For now, the user will need to manually rebase after landing
-        output(
-            "⚠️",
-            "Please manually rebase your working copy after landing",
-        )?;
-    }
+    fetch_what_landed(jj, config, merge_sha).await?;
 
     // Wait for the "git push" to delete the old Pull Request branch to finish,
     // but ignore the result. GitHub may be configured to delete the branch
@@ -620,6 +622,18 @@ pub struct LandOptions {
     /// queue of the default branch, whatever spr.landStrategy says
     #[clap(long)]
     no_queue: bool,
+
+    /// Land through GitHub's stacked pull requests: one request merges this Pull
+    /// Request and every member of its stack below it, and GitHub retargets and
+    /// rebases the ones above. Needs spr.stackDisplay = github and
+    /// spr.baseStrategy = linear-rebase. Whatever spr.landStrategy says
+    #[clap(long, conflicts_with_all = ["no_stack", "queue"])]
+    stack: bool,
+
+    /// Merge the Pull Requests one at a time rather than through GitHub's
+    /// stacked pull requests, whatever spr.landStrategy says
+    #[clap(long)]
+    no_stack: bool,
 
     /// Stay until the merge queue has merged the Pull Request, and then delete
     /// the branches it used and fetch what landed. A land that merges the Pull
@@ -733,9 +747,23 @@ async fn land_the_stack(
     let landing = decide_landing(
         gh,
         config,
-        resolve_land_strategy(opts.queue, opts.no_queue, config.land_strategy),
+        resolve_land_strategy(
+            opts.queue,
+            opts.no_queue,
+            opts.stack,
+            opts.no_stack,
+            config.land_strategy,
+        ),
     )
     .await?;
+
+    // GitHub's stack merge is one request for the whole chain, so it replaces
+    // everything below rather than being one more way of merging each Pull
+    // Request. It reports what it is doing itself, hence coming before the line
+    // that names them.
+    if let Landing::Stack = landing {
+        return land_through_the_stack_merge(jj, gh, config, changes).await;
+    }
 
     if changes.len() > 1 {
         // A queued land hands the merging to GitHub and returns, so the next
@@ -786,6 +814,425 @@ async fn land_the_stack(
     }
 
     Ok(())
+}
+
+/// How often a land asks GitHub whether its stack merge has happened yet.
+///
+/// Unlike a merge queue, nothing is waiting on anybody else's checks here:
+/// GitHub takes the request and gets on with it, and a stack of three was
+/// observed merged within four seconds.
+const STACK_MERGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a land waits for GitHub's stack merge before giving up on it.
+///
+/// Giving up is not a rollback — there is nothing to roll back, and the merge may
+/// yet happen — so this only decides how long jj-spr keeps a terminal waiting
+/// before it reports where the merge had got to and lets the user look for
+/// themselves.
+const STACK_MERGE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Land a whole chain through GitHub's stacked pull requests: one request that
+/// merges the Pull Request at the top of `changes` and every member of its stack
+/// below it.
+///
+/// What this does *not* do is the point of it. It dissolves no stack, retargets
+/// nothing, and moves no base: GitHub merges each Pull Request in the chain,
+/// then retargets the ones above onto the default branch and rebases their
+/// branches itself. So the stack survives the land and needs no registering
+/// again, and the Pull Requests above come out already showing only their own
+/// changes — which is the one thing landing otherwise leaves for the next
+/// `jj spr diff` to put right.
+///
+/// Three things have to be true, and each is refused here rather than left to
+/// GitHub:
+///
+/// - **the branches have to survive a rebase**, which is
+///   `spr.baseStrategy = linear-rebase` alone. Under the merging strategies the
+///   rebase GitHub does to the Pull Request above discards its branch and GitHub
+///   closes it as empty; the account of that is at the top of `impl GitHub` in
+///   `github::stacks`. This is the refusal that matters: it protects work that a
+///   land would otherwise destroy.
+/// - **there has to be a stack**, since without one the endpoint merges the one
+///   Pull Request alone, with none of the above being true and a commit message
+///   from the repository's settings rather than from the local commit. That is
+///   strictly worse than what `jj spr land` does by itself, so it is refused
+///   rather than quietly done.
+/// - **GitHub has to be about to merge what this land means to land.** How far
+///   *down* the stack merge goes is not something the request can say: it merges
+///   everything below, whatever the local chain says. See
+///   [`reconcile_stack_merge`].
+///
+/// What jj-spr checks for itself, it checks for every Pull Request in the chain:
+/// each one open, and approved where `spr.requireApproval` says so. GitHub's own
+/// verdict on the merge is not asked for — `wait_for_mergeability` asks whether a
+/// Pull Request can merge into the branch it is *based on*, which for a stacked
+/// one is the branch below rather than the default branch, and the stack merge is
+/// what resolves that chain. So the merge is where GitHub's refusals surface,
+/// and nothing has been taken apart when they do.
+async fn land_through_the_stack_merge(
+    jj: &crate::jj::Jujutsu,
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+    changes: Vec<crate::jj::PreparedCommit>,
+) -> Result<()> {
+    if !config.base_strategy.rebases_branches() {
+        return Err(Error::new(formatdoc!(
+            "GitHub's stack merge rebases the head branch of every Pull Request \
+             above the one it merges, and under spr.baseStrategy = {strategy} \
+             those branches do not survive a rebase: each would collapse onto \
+             its base and GitHub would close the Pull Request as empty, review \
+             and all. Set spr.baseStrategy to 'linear-rebase' and push the stack \
+             again with `jj spr diff`, or land without --stack, which merges the \
+             Pull Requests one at a time.",
+            strategy = if config.base_strategy == crate::config::BaseStrategy::Linear {
+                "linear"
+            } else {
+                "synthetic"
+            },
+        )));
+    }
+
+    // Bottom first, ending with the Pull Request this land was asked for.
+    // `changes_to_land` refuses a change without a Pull Request, and
+    // `land_the_stack` refuses one for the change it was aimed at, so every
+    // number is there — but the chain is what everything below compares against,
+    // so it is worth not assuming that here.
+    let mut landing = Vec::with_capacity(changes.len());
+    for change in &changes {
+        match change.pull_request_number {
+            Some(number) => landing.push(number),
+            None => {
+                write_commit_title(change)?;
+
+                return Err(Error::new("This commit does not refer to a Pull Request."));
+            }
+        }
+    }
+
+    let Some(&target) = landing.last() else {
+        return Err(Error::new("There is nothing to land."));
+    };
+
+    let stack = match gh.get_open_stack_for_pull_request(target).await {
+        Ok(Some(stack)) => stack,
+        Ok(None) => {
+            return Err(Error::new(formatdoc!(
+                "Pull Request #{target} is not in a GitHub stack, so there is no \
+                 stack to merge. Land it without --stack, which merges it and \
+                 the Pull Requests below it one at a time — or push the stack \
+                 with `jj spr diff` under spr.stackDisplay = github first."
+            )));
+        }
+        Err(error) => {
+            return Err(Error::new(format!(
+                "Could not find out which GitHub stack Pull Request #{target} is \
+                 in, so --stack cannot be honoured: {error}"
+            )));
+        }
+    };
+
+    reconcile_stack_merge(&stack, target, &landing)?;
+
+    // Every Pull Request the merge will take, as GitHub has it. Fetched before
+    // anything merges, both for the checks below and for the branches to take
+    // away afterwards.
+    let mut pull_requests = Vec::with_capacity(landing.len());
+    for &number in &landing {
+        let pull_request = gh.clone().get_pull_request(number).await?;
+
+        if pull_request.state != PullRequestState::Open {
+            return Err(Error::new(format!(
+                "Pull Request #{number} is already closed!"
+            )));
+        }
+
+        if config.require_approval && pull_request.review_status != Some(ReviewStatus::Approved) {
+            return Err(Error::new(format!(
+                "Pull Request #{number} has not been approved on GitHub."
+            )));
+        }
+
+        pull_requests.push(pull_request);
+    }
+
+    output(
+        "🪜",
+        &format!(
+            "Landing {} Pull Request{} through GitHub's stack #{}, bottom first: {}",
+            landing.len(),
+            if landing.len() == 1 { "" } else { "s" },
+            stack.number,
+            landing
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    )?;
+
+    match gh.merge_pull_request_async(target).await {
+        Ok(AsyncMerge::Enqueued) => output("🛫", "GitHub is merging the stack...")?,
+        Ok(AsyncMerge::AlreadyEnqueued) => {
+            output("🛫", "GitHub was already merging this Pull Request...")?
+        }
+        Ok(AsyncMerge::Merged { .. }) => output("🛬", "GitHub had already merged it")?,
+        Err(error) => {
+            return Err(Error::new(format!(
+                "GitHub would not merge the stack: {error}"
+            )));
+        }
+    }
+
+    let merge_commit = wait_for_the_stack_merge(gh, &landing).await?;
+
+    output("🛬", "Landed!")?;
+
+    // The head branches of the Pull Requests that merged are jj-spr's to take
+    // away: GitHub leaves them behind, and it has already moved the Pull
+    // Requests above onto the default branch, so nothing is based on them any
+    // more. Nothing else is deleted — under this strategy a stacked Pull Request
+    // has no generated base branch to clean up, since a Pull Request that had
+    // one would not be chained to the one below and so could not be in the stack
+    // at all.
+    let mut deletions = Vec::with_capacity(pull_requests.len());
+    for pull_request in &pull_requests {
+        deletions.push(spawn_branch_deletion(jj, config, &pull_request.head)?);
+    }
+
+    fetch_what_landed(jj, config, merge_commit.as_deref()).await?;
+
+    // What GitHub did with the rest of the stack, read back rather than assumed:
+    // the retarget and the rebase are its work, and this is the only thing that
+    // says they happened.
+    match gh.get_stack(stack.number).await {
+        Ok(stack) => {
+            let above: Vec<String> = stack
+                .pull_requests
+                .iter()
+                .filter(|member| !member.is_merged())
+                .map(|member| format!("#{}", member.number))
+                .collect();
+
+            if !above.is_empty() {
+                output(
+                    "🎯",
+                    &format!(
+                        "GitHub moved {} onto {}, rebased {} branch{}, and kept stack #{}",
+                        above.join(", "),
+                        config.master_ref.branch_name(),
+                        if above.len() == 1 { "its" } else { "their" },
+                        if above.len() == 1 { "" } else { "es" },
+                        stack.number,
+                    ),
+                )?;
+            }
+        }
+        Err(error) => output(
+            "⚠️",
+            &format!(
+                "Could not read GitHub stack #{} back to say what became of the Pull Requests \
+                 above: {error}",
+                stack.number
+            ),
+        )?,
+    }
+
+    // Ignored for the same reason the other branch deletions are: GitHub may be
+    // configured to delete a merged Pull Request's branch itself, in which case
+    // it is already gone and the push fails.
+    for mut deletion in deletions {
+        deletion.wait().await?;
+    }
+
+    Ok(())
+}
+
+/// Check that GitHub's stack merge would merge exactly the Pull Requests this
+/// land means to land, bottom first.
+///
+/// The request names only the Pull Request at the top of what is to be merged;
+/// how far *down* it reaches is the stack's business, not the caller's. So the
+/// two lists have to be reconciled before anything is asked for, because
+/// everything the request could get wrong is unrecoverable: a stack holding an
+/// open Pull Request below the bottom of the local chain — one whose change was
+/// abandoned locally, or that a colleague pushed — would be landed too, and
+/// silently.
+///
+/// Merged members are skipped rather than counted, on both sides: they stay in
+/// their stack for ever as history, and [`changes_to_land`] passes over a change
+/// whose Pull Request GitHub has merged. So a stack landed halfway reconciles
+/// with the chain that is left.
+///
+/// A pure function over what the two lists say, so that the case it exists for
+/// can be tested without a stack to merge.
+fn reconcile_stack_merge(stack: &crate::github::Stack, target: u64, landing: &[u64]) -> Result<()> {
+    let members: Vec<(u64, bool)> = stack
+        .pull_requests
+        .iter()
+        .map(|member| (member.number, member.is_merged()))
+        .collect();
+
+    reconcile_stack_members(stack.number, &members, target, landing)
+}
+
+/// The reconciliation itself, over the two lists alone. See
+/// [`reconcile_stack_merge`], which reads them off a [`crate::github::Stack`].
+fn reconcile_stack_members(
+    stack_number: u64,
+    members: &[(u64, bool)],
+    target: u64,
+    landing: &[u64],
+) -> Result<()> {
+    let Some(position) = members.iter().position(|(number, _)| *number == target) else {
+        return Err(Error::new(formatdoc!(
+            "GitHub stack #{stack_number} does not hold Pull Request #{target}, \
+             so what its merge would land cannot be worked out. Land without \
+             --stack."
+        )));
+    };
+
+    let would_merge: Vec<u64> = members[..=position]
+        .iter()
+        .filter(|(_, merged)| !merged)
+        .map(|(number, _)| *number)
+        .collect();
+
+    if would_merge == landing {
+        return Ok(());
+    }
+
+    Err(Error::new(formatdoc!(
+        "GitHub stack #{stack_number} would not merge what this land is for. \
+         Merging Pull Request #{target} through the stack merges {would_merge}, \
+         and the changes below it that have not landed are {landing}. A stack \
+         merge takes everything below the Pull Request it is given, so this \
+         cannot be narrowed. Push the stack again with `jj spr diff` so that it \
+         matches the local changes, or land without --stack, which merges only \
+         the Pull Requests of those changes.",
+        would_merge = numbers(&would_merge),
+        landing = numbers(landing),
+    )))
+}
+
+/// The Pull Request numbers as a list for a person to read: `#12, #13`.
+fn numbers(pull_requests: &[u64]) -> String {
+    pull_requests
+        .iter()
+        .map(|number| format!("#{number}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Wait until GitHub has merged every Pull Request in `landing`, and hand back
+/// the commit the last of them landed as.
+///
+/// Only the top one is asked about while waiting: GitHub merges the chain from
+/// the bottom, so the one this land named is the last to go and its merge is the
+/// whole of the answer. The others are read once at the end, which is what turns
+/// "the merge did not finish" into a sentence naming where it stopped.
+///
+/// Giving up on time is not giving up on the merge — GitHub may merge a moment
+/// later — so the message says where things stood rather than claiming the land
+/// failed.
+async fn wait_for_the_stack_merge(
+    gh: &crate::github::GitHub,
+    landing: &[u64],
+) -> Result<Option<String>> {
+    let Some(&target) = landing.last() else {
+        return Ok(None);
+    };
+
+    let deadline = tokio::time::Instant::now() + STACK_MERGE_TIMEOUT;
+
+    loop {
+        // Asked after the wait rather than before it: GitHub has only just taken
+        // the request, so there is nothing to learn from asking straight away.
+        tokio::time::sleep(STACK_MERGE_POLL_INTERVAL).await;
+
+        let mergeability = gh.get_pull_request_mergeability(target).await?;
+        if let Some(merge_commit) = mergeability.merge_commit {
+            return Ok(Some(format!("{merge_commit}")));
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    // Where it got to, one Pull Request at a time, so that a merge that stopped
+    // part way names what did land. Reported rather than returned: what has
+    // merged has merged, and nothing here can be put back.
+    let mut merged = Vec::new();
+    let mut unmerged = Vec::new();
+    for &number in landing {
+        match gh.get_pull_request_mergeability(number).await {
+            Ok(mergeability) if mergeability.merge_commit.is_some() => merged.push(number),
+            _ => unmerged.push(number),
+        }
+    }
+
+    Err(Error::new(formatdoc!(
+        "GitHub has not finished merging the stack after {seconds} seconds. It \
+         may yet: the request stands, and nothing here has to be undone. So far \
+         {landed}, and {left}. Look at Pull Request #{target} on GitHub for why, \
+         and run `jj spr land` again once it has settled — a merge that has \
+         already happened is not repeated.",
+        seconds = STACK_MERGE_TIMEOUT.as_secs(),
+        landed = if merged.is_empty() {
+            "nothing has landed".to_string()
+        } else {
+            format!("{} landed", numbers(&merged))
+        },
+        left = if unmerged.is_empty() {
+            "nothing is left".to_string()
+        } else {
+            format!("{} did not", numbers(&unmerged))
+        },
+    )))
+}
+
+/// Fetch the master branch, and the commit `merge_sha` if there is one, so that
+/// the local repository has what just landed.
+///
+/// Tried up to three times: fetching the very moment after a merge might not
+/// find the new commit yet.
+async fn fetch_what_landed(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    merge_sha: Option<&str>,
+) -> Result<()> {
+    let Some(sha) = merge_sha else {
+        return Ok(());
+    };
+
+    for attempt in 0..3 {
+        let git_fetch = jj
+            .git_command()
+            .arg("fetch")
+            .arg("--no-write-fetch-head")
+            .arg("--")
+            .arg(&config.remote_name)
+            .arg(config.master_ref.on_github())
+            .arg(sha)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+
+        if git_fetch.status.success() {
+            break;
+        } else if attempt == 2 {
+            console::Term::stderr().write_all(&git_fetch.stderr)?;
+            return Err(Error::new("git fetch failed"));
+        }
+    }
+
+    // TODO: Implement Jujutsu-native rebase after landing
+    // For now, the user will need to manually rebase after landing
+    output(
+        "⚠️",
+        "Please manually rebase your working copy after landing",
+    )
 }
 
 /// Land one Pull Request, in one of two orders.
@@ -914,7 +1361,12 @@ async fn land_pull_request(
     // stands, and the queue refuses to merge what does not pass it.
     let enforce_requirements = match landing {
         Landing::Queue(_) => false,
-        Landing::Merge => config.enforce_merge_requirements(opts.force),
+        // `Landing::Stack` never reaches this function: `land_the_stack` hands
+        // the whole chain to [`land_through_the_stack_merge`] instead, which asks
+        // GitHub nothing about mergeability and says why. So this arm is about
+        // the merge made below, and the two are alike in the only thing it
+        // decides.
+        Landing::Merge | Landing::Stack => config.enforce_merge_requirements(opts.force),
     };
 
     // Where this Pull Request already sits on the master branch, ask GitHub
@@ -962,11 +1414,14 @@ async fn land_pull_request(
     //   2026-08-01). So even landing the bottom of a stack, which moves no base
     //   at all before merging, cannot proceed with the stack standing.
     //
-    // The asynchronous endpoint it points at is the one jj-spr must not use: it
-    // destroys the Pull Requests above the one it merges. The account of how,
-    // and of how that was established, is at the top of `impl GitHub` in
-    // `github::stacks`, which is where it belongs — repeating the mechanism
-    // here would only give it somewhere to drift out of step.
+    // The asynchronous endpoint it points at is the one this function must not
+    // use: it destroys the Pull Requests above the one it merges wherever their
+    // branches do not survive a rebase, and nothing on this path establishes that
+    // they do. `--stack` is that endpoint, taken up only where they do, and it
+    // does not come through here at all — see [`land_through_the_stack_merge`].
+    // The account of the hazard, and of how it was established, is at the top of
+    // `impl GitHub` in `github::stacks`, which is where it belongs — repeating
+    // the mechanism here would only give it somewhere to drift out of step.
     //
     // As late as it can be, because dissolving is not undoable: everything
     // above is a lookup or a fetch — including, where the base is already the
@@ -1264,25 +1719,151 @@ mod tests {
         }
     }
 
+    /// Every strategy a land can be configured with, for the tests that are
+    /// about a flag rather than about one of them.
+    const STRATEGIES: [LandStrategy; 4] = [
+        LandStrategy::Auto,
+        LandStrategy::Merge,
+        LandStrategy::Queue,
+        LandStrategy::Stack,
+    ];
+
     #[test]
     fn test_land_strategy_falls_back_to_the_configured_one() {
-        for configured in [LandStrategy::Auto, LandStrategy::Merge, LandStrategy::Queue] {
-            assert_eq!(resolve_land_strategy(false, false, configured), configured);
+        for configured in STRATEGIES {
+            assert_eq!(
+                resolve_land_strategy(false, false, false, false, configured),
+                configured
+            );
         }
     }
 
     #[test]
     fn test_land_strategy_flags_beat_the_configured_one() {
-        for configured in [LandStrategy::Auto, LandStrategy::Merge, LandStrategy::Queue] {
+        for configured in STRATEGIES {
             assert_eq!(
-                resolve_land_strategy(true, false, configured),
+                resolve_land_strategy(true, false, false, false, configured),
                 LandStrategy::Queue
             );
             assert_eq!(
-                resolve_land_strategy(false, true, configured),
+                resolve_land_strategy(false, true, false, false, configured),
                 LandStrategy::Merge
             );
+            assert_eq!(
+                resolve_land_strategy(false, false, true, false, configured),
+                LandStrategy::Stack
+            );
         }
+    }
+
+    /// `--stack` says what to do, `--no-queue` only says what not to do, so the
+    /// two together are not a contradiction and the stack merge wins.
+    #[test]
+    fn test_asking_for_the_stack_merge_and_not_the_queue_asks_for_the_stack_merge() {
+        assert_eq!(
+            resolve_land_strategy(false, true, true, false, LandStrategy::Auto),
+            LandStrategy::Stack
+        );
+    }
+
+    /// `--no-stack` displaces a configured stack merge and nothing else: it says
+    /// to merge the Pull Requests one at a time, not whether to queue them, so
+    /// what is left is for the default branch to decide.
+    #[test]
+    fn test_refusing_the_stack_merge_leaves_the_rest_to_the_branch() {
+        assert_eq!(
+            resolve_land_strategy(false, false, false, true, LandStrategy::Stack),
+            LandStrategy::Auto
+        );
+
+        for configured in [LandStrategy::Auto, LandStrategy::Merge, LandStrategy::Queue] {
+            assert_eq!(
+                resolve_land_strategy(false, false, false, true, configured),
+                configured,
+                "--no-stack should leave {configured:?} alone"
+            );
+        }
+    }
+
+    /// The flags `--stack` and `--no-stack` are the shape the resolution above
+    /// assumes: mutually exclusive, and `--stack` exclusive with `--queue`.
+    /// Nothing else enforces that — `clap` does, and only if the attributes say
+    /// so.
+    #[test]
+    fn test_land_options_refuse_contradictory_flags() {
+        use clap::Parser;
+
+        for flags in [
+            ["--stack", "--no-stack"],
+            ["--stack", "--queue"],
+            ["--queue", "--no-queue"],
+        ] {
+            let result = LandOptions::try_parse_from(["land", flags[0], flags[1]]);
+
+            assert!(
+                result.is_err(),
+                "{} with {} should be refused",
+                flags[0],
+                flags[1]
+            );
+        }
+
+        assert!(
+            LandOptions::try_parse_from(["land", "--stack", "--no-queue"]).is_ok(),
+            "--stack with --no-queue is not a contradiction"
+        );
+    }
+
+    /// The chain the local changes name, and the one GitHub would merge, being
+    /// the same thing.
+    #[test]
+    fn a_stack_merge_that_lands_the_chain_is_accepted() {
+        let members = [(11, false), (12, false), (13, false)];
+
+        assert!(reconcile_stack_members(7, &members, 12, &[11, 12]).is_ok());
+        assert!(reconcile_stack_members(7, &members, 13, &[11, 12, 13]).is_ok());
+        assert!(reconcile_stack_members(7, &members, 11, &[11]).is_ok());
+    }
+
+    /// A stack landed halfway still reconciles: its merged members stay in it
+    /// for ever, and `changes_to_land` passes over the changes they belong to.
+    #[test]
+    fn a_stack_with_merged_members_reconciles_with_what_is_left() {
+        let members = [(11, true), (12, false), (13, false)];
+
+        assert!(reconcile_stack_members(7, &members, 13, &[12, 13]).is_ok());
+    }
+
+    /// The case this check exists for: the stack holds an open Pull Request below
+    /// the bottom of the local chain — a change abandoned locally, or somebody
+    /// else's — and a stack merge would land it too, silently. There is no asking
+    /// for less, so the land is refused.
+    #[test]
+    fn a_stack_reaching_below_the_chain_is_refused() {
+        let members = [(11, false), (12, false), (13, false)];
+
+        let error = reconcile_stack_members(7, &members, 13, &[12, 13])
+            .expect_err("a stack that would land #11 as well must be refused");
+
+        let messages = error.messages().join(" ");
+        assert!(
+            messages.contains("#11") && messages.contains("#12, #13"),
+            "the refusal should name both chains: {messages}"
+        );
+    }
+
+    /// A chain the stack does not hold all of — the local changes were pushed
+    /// again as a new stack, say, or one of them was never registered — cannot be
+    /// landed by merging this stack.
+    #[test]
+    fn a_chain_the_stack_does_not_hold_is_refused() {
+        let members = [(12, false), (13, false)];
+
+        assert!(reconcile_stack_members(7, &members, 13, &[11, 12, 13]).is_err());
+        assert!(
+            reconcile_stack_members(7, &members, 99, &[99]).is_err(),
+            "a stack that does not hold the Pull Request at all says so"
+        );
     }
 
     #[test]

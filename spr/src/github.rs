@@ -20,8 +20,8 @@ use std::{
 mod stacks;
 
 pub use stacks::{
-    Stack, StackApiError, StackBase, StackGitRef, StackPullRequest, StackPullRequestState,
-    StackResult, UnstackOutcome,
+    AsyncMerge, Stack, StackApiError, StackBase, StackGitRef, StackPullRequest,
+    StackPullRequestState, StackResult, UnstackOutcome,
 };
 
 #[derive(Clone)]

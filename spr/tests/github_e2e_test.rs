@@ -1505,6 +1505,162 @@ fn retargeting_a_pull_request_in_a_github_stack_takes_it_out_of_the_stack() {
     );
 }
 
+/// `jj spr land --stack` hands the whole chain to GitHub: one request merges the
+/// pull request and the one below it, one squash commit each, and GitHub moves
+/// the pull request above onto the default branch and rebases its branch.
+///
+/// Only GitHub can show any of it — the merge, the retarget and the rebase are
+/// all its work — and this is the test that says the endpoint may be called at
+/// all. Under `spr.baseStrategy = linear-rebase` the branch it rebases survives,
+/// which is asserted here as the pull request above still being open and still
+/// showing only its own change. Under the merging strategies it does not, which
+/// is why the land below this one refuses to ask.
+///
+/// The stack is left standing, holding all three, so nothing has to be
+/// registered again afterwards — the one thing a land through jj-spr's own merge
+/// cannot manage.
+///
+/// A stack of three, landing the middle, is the smallest shape with a pull
+/// request below to be merged along with it and one above to be left standing.
+#[test]
+fn landing_through_the_stack_merge_lands_the_chain_and_rebases_the_rest() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "stackmerge");
+    scratch.set_config("spr.stackDisplay", "github");
+
+    // What this test merges stays on the default branch, so the tag keeps its
+    // changes off every earlier run's.
+    let tag = run_tag();
+    let titles = [
+        format!("e2e stackmerge bottom {tag}"),
+        format!("e2e stackmerge middle {tag}"),
+        format!("e2e stackmerge top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let (bottom, middle, top) = (prs[0], prs[1], prs[2]);
+
+    let stack = scratch
+        .open_stack_for(bottom)
+        .unwrap_or_else(|| panic!("PR #{bottom} should be in an open GitHub stack"));
+    let branches: Vec<String> = prs.iter().map(|n| scratch.pr_head_branch(*n)).collect();
+    let before = scratch.default_branch_sha();
+    let top_head_before = scratch.remote_branch_sha(&branches[2]);
+
+    // `push_stack` leaves `@` on the top of the stack, so the middle change is
+    // its parent.
+    jj_spr(&["land", "--stack", "-r", "@-"], scratch.path());
+
+    for number in [bottom, middle] {
+        assert_eq!(
+            scratch.pr_field(number, ".merged"),
+            "true",
+            "PR #{number} should have been merged by the stack merge"
+        );
+    }
+
+    let landed = scratch.commits_landed_since(&before);
+    assert_eq!(
+        landed.len(),
+        2,
+        "the stack merge should put one commit on the default branch per pull request it \
+         merged, got {landed:?}"
+    );
+    for (sha, title) in landed.iter().zip(&titles) {
+        assert_eq!(
+            scratch.commit_files(sha),
+            vec![slug(title)],
+            "the commit {sha} that landed for {title:?} should carry that change and no other"
+        );
+    }
+
+    // The whole reason this endpoint is usable at all: the pull request above
+    // survives the rebase GitHub gives its branch.
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "the stack merge closed PR #{top} above it"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.default_branch(),
+        "GitHub should have moved PR #{top} onto the default branch"
+    );
+    assert_eq!(
+        scratch.pr_files(top),
+        vec![slug(&titles[2])],
+        "PR #{top} should be reviewing its own change and nothing else"
+    );
+    assert_eq!(
+        scratch.commits_ahead(&scratch.default_branch(), &branches[2]),
+        vec![format!("1 {}", titles[2])],
+        "PR #{top}'s branch should be its own commit on the new default branch"
+    );
+
+    let top_head_after = scratch.remote_branch_sha(&branches[2]);
+    assert_ne!(
+        top_head_before, top_head_after,
+        "GitHub should have rebased PR #{top}'s branch onto what landed"
+    );
+
+    // The branches of what merged are jj-spr's to take away, and the stack is
+    // nobody's to take apart.
+    for (number, branch) in [(bottom, &branches[0]), (middle, &branches[1])] {
+        assert!(
+            !scratch.remote_has_branch(branch),
+            "the branch of merged PR #{number} is still on the remote: {branch}"
+        );
+    }
+    assert_eq!(
+        scratch.open_stack_for(top).map(|s| s.number),
+        Some(stack.number),
+        "the stack merge should have left the stack standing, still holding PR #{top}"
+    );
+}
+
+/// `jj spr land --stack` is refused under `spr.baseStrategy = linear`, where the
+/// branches GitHub would rebase are merge commits that do not survive it.
+///
+/// The refusal is the whole feature working: this is the land that would destroy
+/// the pull request above. Nothing is merged, so the assertion is that both pull
+/// requests are still open and the default branch has not moved.
+#[test]
+fn the_stack_merge_is_refused_where_the_branches_would_not_survive_it() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "stackmergerefused");
+    scratch.set_config("spr.stackDisplay", "github");
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let prs = scratch.push_stack(&["e2e refused bottom", "e2e refused top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+    let before = scratch.default_branch_sha();
+
+    let refusal = try_jj_spr(&["land", "--stack", "-r", "@-"], scratch.path())
+        .expect_err("--stack should be refused under spr.baseStrategy = linear");
+
+    assert!(
+        refusal.contains("linear-rebase"),
+        "the refusal should name the strategy that makes the stack merge safe: {refusal}"
+    );
+    for number in [bottom, top] {
+        assert_eq!(
+            scratch.pr_state(number),
+            "open",
+            "a refused land should have merged nothing, but PR #{number} is not open"
+        );
+    }
+    assert_eq!(
+        scratch.default_branch_sha(),
+        before,
+        "a refused land should have put nothing on the default branch"
+    );
+}
+
 /// Landing a pull request a GitHub stack holds takes the stack apart first,
 /// merges it and the ones below it, and leaves the ones above open, still
 /// carrying their own changes, and pointed at the default branch.
