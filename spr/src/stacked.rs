@@ -9,7 +9,7 @@
 //! deciding which of the branches it leaves behind may go.
 //!
 //! `land` and `close` both take a pull request out of a stack and then want its
-//! head branch gone. Under `spr.baseStrategy = linear` that branch is what the
+//! head branch gone. Under a linear `spr.baseStrategy` that branch is what the
 //! pull requests above are based on, and GitHub closes a pull request whose
 //! base branch is deleted, so they have to be pointed somewhere else first —
 //! and the branch has to stay if any of them could not be.
@@ -253,7 +253,7 @@ pub fn spawn_branch_deletion(
 /// Start deleting `head_branch` from the remote, or say why it is being kept.
 ///
 /// Only once the pull requests above have been retargeted may the head branch
-/// of the one leaving the stack go: under `spr.baseStrategy = linear` it is
+/// of the one leaving the stack go: under a linear `spr.baseStrategy` it is
 /// what they were based on, and GitHub closes a pull request whose base branch
 /// disappears. One that could not be retargeted keeps the branch alive — what
 /// brought us here is done either way, and a branch left behind is worth far
@@ -315,7 +315,7 @@ mod tests {
         ));
     }
 
-    /// Under `spr.baseStrategy = linear` the base branch is the head branch of
+    /// Under a linear `spr.baseStrategy` the base branch is the head branch of
     /// the pull request below. Deleting it would close that pull request.
     #[test]
     fn the_head_branch_below_is_not_deleted() {

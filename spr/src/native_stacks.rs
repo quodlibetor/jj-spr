@@ -11,7 +11,7 @@
 //!
 //! This is a stage a run passes through, not a way of doing what `diff` does.
 //! Nothing here changes what is pushed or what a pull request is based on —
-//! `spr.baseStrategy = linear` already builds the chain of base refs that
+//! a linear `spr.baseStrategy` already builds the chain of base refs that
 //! GitHub's Stacked Pull Requests API requires, and this only tells GitHub that
 //! the chain is one. So it is plain functions over a session value that each
 //! command holds as an [`Option`]: `None` is the whole of "the feature is off",

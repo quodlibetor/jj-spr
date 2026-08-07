@@ -218,7 +218,12 @@ pub async fn init() -> Result<()> {
              'linear' bases each pull request on the pull request branch of \
              the change below it, so the stack on GitHub is a chain of \
              branches. It wants the whole stack pushed in one run, since a \
-             stale branch below would leak its changes into the diff above."
+             stale branch below would leak its changes into the diff above.
+             'linear-rebase' does the same and additionally builds each pull \
+             request branch as a chain of ordinary commits, which is the only \
+             shape that survives GitHub rebasing it. Pick this one if you want \
+             GitHub to draw and merge your stacks. It is also the only \
+             strategy that force-pushes, and only when a base has moved."
         ),
     )?;
 
@@ -255,7 +260,7 @@ pub async fn init() -> Result<()> {
     // below, which the synthetic strategy never does, and the pair is the
     // combination the configuration refuses. Leaving the value off the list is
     // also how `init` heals a repository that already holds it.
-    let github_offered = base_strategy == BaseStrategy::Linear;
+    let github_offered = base_strategy.bases_on_the_change_below();
 
     if github_offered {
         output(

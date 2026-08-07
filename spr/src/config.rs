@@ -13,7 +13,8 @@ use crate::{
     utils::slugify,
 };
 
-/// Which branch a stacked pull request asks to be merged into.
+/// Which branch a stacked pull request asks to be merged into, and how the
+/// branch it asks for is built.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BaseStrategy {
     /// Give every stacked pull request a base branch of its own, carrying the
@@ -31,6 +32,19 @@ pub enum BaseStrategy {
     /// anyway when it is given the whole stack — because a stale parent branch
     /// would leak the parent's changes into this pull request's diff.
     Linear,
+    /// Base a stacked pull request on the pull request branch of the change
+    /// below it, as [`Self::Linear`] does, and build the pull request branch as
+    /// the change's own commits sitting on that branch's tip: one parent each,
+    /// no merge commit anywhere.
+    ///
+    /// The commits a branch already carries cannot stay where they are when its
+    /// base moves, so they are replayed onto the new base and the branch is
+    /// force-pushed. That is what this strategy trades away — under the other
+    /// two, a commit jj-spr has pushed is never rewritten — and what it buys is
+    /// a branch GitHub can rebase: its stacked pull requests rebase the branch
+    /// of the pull request above the one they merge, which discards merge
+    /// commits and closes that pull request as empty. See [`crate::replay`].
+    LinearRebase,
 }
 
 impl std::str::FromStr for BaseStrategy {
@@ -40,8 +54,10 @@ impl std::str::FromStr for BaseStrategy {
         match value.trim().to_ascii_lowercase().as_str() {
             "synthetic" => Ok(Self::Synthetic),
             "linear" => Ok(Self::Linear),
+            "linear-rebase" => Ok(Self::LinearRebase),
             other => Err(Error::new(format!(
-                "spr.baseStrategy must be 'synthetic' or 'linear', but is '{other}'"
+                "spr.baseStrategy must be 'synthetic', 'linear' or 'linear-rebase', \
+                 but is '{other}'"
             ))),
         }
     }
@@ -54,7 +70,7 @@ impl BaseStrategy {
     /// Kept next to the enum rather than in `init`, so that a strategy added
     /// here is offered rather than quietly left out of the one place that asks
     /// about it.
-    pub const ALL: [Self; 2] = [Self::Synthetic, Self::Linear];
+    pub const ALL: [Self; 3] = [Self::Synthetic, Self::Linear, Self::LinearRebase];
 
     /// The value `spr.baseStrategy` takes for this strategy.
     ///
@@ -66,7 +82,25 @@ impl BaseStrategy {
         match self {
             Self::Synthetic => "synthetic",
             Self::Linear => "linear",
+            Self::LinearRebase => "linear-rebase",
         }
+    }
+
+    /// Whether a stacked pull request is based on the pull request branch of the
+    /// change below it, rather than on a base branch of its own.
+    ///
+    /// The two linear strategies differ in how the head branch is built, not in
+    /// what it is based on, so everything about the base asks this rather than
+    /// naming either of them.
+    pub fn bases_on_the_change_below(self) -> bool {
+        matches!(self, Self::Linear | Self::LinearRebase)
+    }
+
+    /// Whether a pull request branch is rebuilt from the change's own commits
+    /// whenever its base moves, instead of merging the new base into what the
+    /// branch already carries.
+    pub fn rebases_branches(self) -> bool {
+        matches!(self, Self::LinearRebase)
     }
 }
 
@@ -161,7 +195,7 @@ impl StackDisplay {
 /// `spr.baseStrategy` was set to — `None` where it was not set at all.
 ///
 /// GitHub's stacks require each pull request's base ref to be the head ref of
-/// the one below, which is what [`BaseStrategy::Linear`] builds and
+/// the one below, which is what the two linear strategies build and
 /// [`BaseStrategy::Synthetic`] never does. So the two settings are not
 /// independent, and this is the one place that says so: resolving it here, as
 /// the configuration is built, keeps every decision downstream a question about
@@ -170,22 +204,24 @@ impl StackDisplay {
 /// Asking for both [`StackDisplay::Github`] and the synthetic strategy is a
 /// contradiction worth surfacing rather than resolving, because either half
 /// could be the mistake. Leaving the strategy unset is not: it means no
-/// preference, so the stack display supplies one. The section asks nothing of
-/// the base strategy — it is a list in a body, and any shape of stack can be
-/// listed — so it leaves the choice alone.
+/// preference, so it supplies one — [`BaseStrategy::LinearRebase`], the only one
+/// whose branches survive GitHub merging a stack from its own interface.
+/// [`BaseStrategy::Linear`] satisfies the stacks API just as well and is
+/// honoured where it was asked for, with the hazard reported by
+/// [`Config::stack_shape_warning`] rather than by refusing to run.
 pub fn resolve_base_strategy(
     stack_display: StackDisplay,
     configured: Option<BaseStrategy>,
 ) -> Result<BaseStrategy> {
     match (stack_display.draws_the_stack(), configured) {
         (true, Some(BaseStrategy::Synthetic)) => Err(Error::new(
-            "spr.stackDisplay = github needs spr.baseStrategy = linear: GitHub's stacked pull \
+            "spr.stackDisplay = github needs a linear spr.baseStrategy: GitHub's stacked pull \
              requests require each pull request to be based on the branch of the one below it, \
-             which is what the synthetic strategy does not do. Set spr.baseStrategy to 'linear', \
-             or set spr.stackDisplay to 'section'."
+             which is what the synthetic strategy does not do. Set spr.baseStrategy to \
+             'linear-rebase', or set spr.stackDisplay to 'section'."
                 .to_string(),
         )),
-        (true, _) => Ok(BaseStrategy::Linear),
+        (true, configured) => Ok(configured.unwrap_or(BaseStrategy::LinearRebase)),
         (false, configured) => Ok(configured.unwrap_or_default()),
     }
 }
@@ -274,8 +310,9 @@ pub struct Config {
     /// How a pull request says which stack it belongs to. See [`StackDisplay`].
     ///
     /// Neither value changes what `diff` pushes; each adds a step around the
-    /// run. [`StackDisplay::Github`] does want [`BaseStrategy::Linear`], which
-    /// `main.rs` sees to by resolving the two together through
+    /// run. [`StackDisplay::Github`] does want a base strategy that
+    /// [bases each pull request on the one below](BaseStrategy::bases_on_the_change_below),
+    /// which `main.rs` sees to by resolving the two together through
     /// [`resolve_base_strategy`] — the one place that enforces it. A `Config`
     /// built by hand can hold any combination, and under
     /// [`BaseStrategy::Synthetic`] no pull request is ever chained to the one
@@ -320,6 +357,33 @@ impl Config {
     /// requirements for a single land.
     pub fn enforce_merge_requirements(&self, force: bool) -> bool {
         !force && !self.land_with_unmet_requirements
+    }
+
+    /// What is worth saying about the shape of the branches this configuration
+    /// registers as a GitHub stack, or `None` where there is nothing to say.
+    ///
+    /// A stack GitHub draws is a stack GitHub offers to merge, and its stack
+    /// merge rebases the head branch of the pull request above the one it
+    /// merges. Under [`BaseStrategy::Linear`] that branch is a merge commit,
+    /// which a rebase discards: the branch collapses onto its base and GitHub
+    /// closes the pull request as empty, review and all. `jj spr land` never
+    /// asks for that merge, but the button in GitHub's interface is right there,
+    /// so a run that registers such a stack says so.
+    ///
+    /// Kept here, next to the settings it is about, rather than in
+    /// [`resolve_base_strategy`]: that function's job is the one combination it
+    /// refuses, and a warning is not a refusal. The combination is honoured —
+    /// somebody may want the immutable branches and be content to land only
+    /// through jj-spr.
+    pub fn stack_shape_warning(&self) -> Option<&'static str> {
+        (self.stack_display.draws_the_stack() && self.base_strategy == BaseStrategy::Linear)
+            .then_some(
+                "spr.baseStrategy = linear builds pull request branches out of merge commits, and \
+             GitHub's stack merge rebases the branch of the pull request above the one it \
+             merges, which discards them and closes that pull request as empty. Do not merge a \
+             stacked pull request from GitHub's own interface; `jj spr land` is safe. \
+             spr.baseStrategy = linear-rebase builds branches that survive it.",
+            )
     }
 
     pub fn pull_request_url(&self, number: u64) -> String {
@@ -376,8 +440,8 @@ impl Config {
     /// This is not the test for whether a branch may be deleted — see
     /// [`Self::is_synthetic_base_branch`], which is narrower. A pull request
     /// head branch answers `true` here and must never be taken away while the
-    /// pull request is open, all the more so under [`BaseStrategy::Linear`],
-    /// where it is also what the pull request above is based on.
+    /// pull request is open, all the more so under a linear strategy, where it
+    /// is also what the pull request above is based on.
     pub fn is_spr_branch(&self, branch_name: &str) -> bool {
         branch_name.starts_with(&self.branch_prefix) && branch_name != self.master_ref.branch_name()
     }
@@ -388,10 +452,10 @@ impl Config {
     ///
     /// Such a branch belongs to the one pull request based on it, which is why
     /// only such a branch may be given a derived base commit or deleted when a
-    /// pull request stops pointing at it. Under [`BaseStrategy::Linear`] a
-    /// stacked pull request's base is instead the head branch of the pull
-    /// request below, which is not ours to write to or take away: doing either
-    /// would disturb that pull request, and deleting it would close it.
+    /// pull request stops pointing at it. Under a linear strategy a stacked pull
+    /// request's base is instead the head branch of the pull request below,
+    /// which is not ours to write to or take away: doing either would disturb
+    /// that pull request, and deleting it would close it.
     pub fn is_synthetic_base_branch(&self, branch_name: &str) -> bool {
         // What tells the two apart is the `.` that
         // [`Self::get_base_branch_name`] puts between the master branch name
@@ -843,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn base_strategy_parses_its_two_values() {
+    fn base_strategy_parses_its_three_values() {
         assert_eq!(
             "synthetic".parse::<BaseStrategy>().unwrap(),
             BaseStrategy::Synthetic
@@ -852,29 +916,30 @@ mod tests {
             "linear".parse::<BaseStrategy>().unwrap(),
             BaseStrategy::Linear
         );
+        assert_eq!(
+            "linear-rebase".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::LinearRebase
+        );
         // git config hands values over as they were written.
         assert_eq!(
-            " Linear\n".parse::<BaseStrategy>().unwrap(),
-            BaseStrategy::Linear
+            " Linear-Rebase\n".parse::<BaseStrategy>().unwrap(),
+            BaseStrategy::LinearRebase
         );
     }
 
-    /// What `jj spr init` offers is what it writes into the configuration, so
-    /// every name it can store has to be one the setting reads back — and the
-    /// list it offers has to hold every strategy, or a strategy exists that
-    /// nothing asks about.
+    /// The two questions the rest of the crate asks a strategy, and the answers
+    /// that place each of them. `linear-rebase` differs from `linear` in how the
+    /// head branch is built, not in what it is based on, so anything about the
+    /// base has to see the two alike.
     #[test]
-    fn every_base_strategy_is_offered_under_a_name_that_parses_back() {
-        for strategy in BaseStrategy::ALL {
-            assert_eq!(strategy.as_str().parse::<BaseStrategy>().unwrap(), strategy);
-        }
+    fn the_strategies_answer_for_the_base_and_for_the_branch_separately() {
+        assert!(!BaseStrategy::Synthetic.bases_on_the_change_below());
+        assert!(BaseStrategy::Linear.bases_on_the_change_below());
+        assert!(BaseStrategy::LinearRebase.bases_on_the_change_below());
 
-        for strategy in [BaseStrategy::Synthetic, BaseStrategy::Linear] {
-            assert!(
-                BaseStrategy::ALL.contains(&strategy),
-                "{strategy:?} is not offered by `jj spr init`"
-            );
-        }
+        assert!(!BaseStrategy::Synthetic.rebases_branches());
+        assert!(!BaseStrategy::Linear.rebases_branches());
+        assert!(BaseStrategy::LinearRebase.rebases_branches());
     }
 
     /// The section is the default because it works everywhere; turning the
@@ -933,8 +998,8 @@ mod tests {
     }
 
     /// Unless GitHub is drawing the stack, the strategy is whatever was
-    /// configured, and the default when nothing was. The section asks nothing
-    /// of the base strategy, so it is in this group rather than the next.
+    /// configured, and the default when nothing was. The section asks nothing of
+    /// the base strategy, so it is in this group rather than the next.
     #[test]
     fn the_base_strategy_stands_on_its_own_unless_github_draws_the_stack() {
         for display in [StackDisplay::None, StackDisplay::Section] {
@@ -950,26 +1015,79 @@ mod tests {
                 resolve_base_strategy(display, Some(BaseStrategy::Linear)).unwrap(),
                 BaseStrategy::Linear
             );
+            assert_eq!(
+                resolve_base_strategy(display, Some(BaseStrategy::LinearRebase)).unwrap(),
+                BaseStrategy::LinearRebase
+            );
         }
     }
 
-    /// An unset strategy is no preference, so drawing the stack supplies the one
-    /// it needs rather than failing over a setting nobody wrote.
+    /// An unset strategy is no preference, so drawing the stack supplies one
+    /// rather than failing over a setting nobody wrote — and supplies the
+    /// strategy whose branches survive GitHub merging the stack itself, since a
+    /// stack GitHub draws is a stack GitHub offers to merge.
     #[test]
-    fn drawing_the_stack_supplies_the_linear_strategy_when_none_was_chosen() {
+    fn drawing_the_stack_supplies_the_rebasing_strategy_when_none_was_chosen() {
         assert_eq!(
             resolve_base_strategy(StackDisplay::Github, None).unwrap(),
-            BaseStrategy::Linear
+            BaseStrategy::LinearRebase
         );
     }
 
-    /// Asking for both is the same request twice, not a conflict.
+    /// Either linear strategy satisfies the stacks API, so a run under one that
+    /// was asked for is not overridden — `linear` only gets the warning below.
     #[test]
-    fn drawing_the_stack_agrees_with_the_linear_strategy() {
+    fn drawing_the_stack_agrees_with_either_linear_strategy() {
         assert_eq!(
             resolve_base_strategy(StackDisplay::Github, Some(BaseStrategy::Linear)).unwrap(),
             BaseStrategy::Linear
         );
+        assert_eq!(
+            resolve_base_strategy(StackDisplay::Github, Some(BaseStrategy::LinearRebase)).unwrap(),
+            BaseStrategy::LinearRebase
+        );
+    }
+
+    /// The hazard `linear` carries into a GitHub stack is reported, not refused:
+    /// jj-spr's own land never asks for the stack merge that would trigger it,
+    /// so the combination is workable as long as its owner knows.
+    #[test]
+    fn a_merge_shaped_stack_is_warned_about() {
+        let config = Config {
+            stack_display: StackDisplay::Github,
+            base_strategy: BaseStrategy::Linear,
+            ..config_factory()
+        };
+
+        let warning = config
+            .stack_shape_warning()
+            .expect("a merge-shaped stack should be warned about");
+        assert!(
+            warning.contains("linear-rebase"),
+            "the warning should name the strategy that avoids it: {warning}"
+        );
+    }
+
+    /// Nothing to warn about where nothing is registered as a stack, or where
+    /// the branches survive a rebase.
+    #[test]
+    fn nothing_else_is_warned_about() {
+        for (stack_display, base_strategy) in [
+            (StackDisplay::Section, BaseStrategy::Linear),
+            (StackDisplay::None, BaseStrategy::Synthetic),
+            (StackDisplay::Github, BaseStrategy::LinearRebase),
+        ] {
+            let config = Config {
+                stack_display,
+                base_strategy,
+                ..config_factory()
+            };
+
+            assert!(
+                config.stack_shape_warning().is_none(),
+                "{stack_display:?} with {base_strategy:?} should say nothing"
+            );
+        }
     }
 
     /// The one combination that cannot be honoured: it must be reported rather
@@ -988,6 +1106,28 @@ mod tests {
                 .any(|m| m.contains("spr.stackDisplay") && m.contains("spr.baseStrategy")),
             "the error should name both settings: {error:?}"
         );
+    }
+
+    /// What `jj spr init` offers is what it writes into the configuration, so
+    /// every name it can store has to be one the setting reads back — and the
+    /// list it offers has to hold every strategy, or a strategy exists that
+    /// nothing asks about.
+    #[test]
+    fn every_base_strategy_is_offered_under_a_name_that_parses_back() {
+        for strategy in BaseStrategy::ALL {
+            assert_eq!(strategy.as_str().parse::<BaseStrategy>().unwrap(), strategy);
+        }
+
+        for strategy in [
+            BaseStrategy::Synthetic,
+            BaseStrategy::Linear,
+            BaseStrategy::LinearRebase,
+        ] {
+            assert!(
+                BaseStrategy::ALL.contains(&strategy),
+                "{strategy:?} is not offered by `jj spr init`"
+            );
+        }
     }
 
     /// A misspelt strategy must not quietly mean the default: the two

@@ -62,11 +62,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, `synthetic`, keeps giving each one a generated base branch carrying
   the parent change's tree. `linear` bases it on the pull request branch of the
   change below instead, so the stack on GitHub is a chain of branches and no
-  base branches are generated. Both push the whole stack forward only: jj-spr
-  still never force-pushes. A change whose parent is not in the same run keeps
+  base branches are generated. Both push the whole stack forward only, never
+  rewriting a commit they have pushed — which is what `linear-rebase`, below,
+  gives up. A change whose parent is not in the same run keeps
   the base its pull request has, and falls back to a synthetic base branch only
   where that run has to build a base commit for it — as a change pushed as a
   cherry-pick, or stacked on one, always does.
+
+- `spr.baseStrategy = linear-rebase` bases a stacked pull request on the pull
+  request branch of the change below it, as `linear` does, and builds that pull
+  request's own branch as a chain of single-parent commits on it: the change's
+  commits replayed onto whatever its base moved to, with no merge commit
+  anywhere. It is the one strategy that force-pushes, and the one whose branches
+  survive being rebased — which is what makes a stack safe to merge from
+  GitHub's own interface, where GitHub rebases the branch of the pull request
+  above the one it merges.
+
+  A branch whose base has not moved is added to and pushed as ever, so an
+  ordinary amend is an ordinary push. A base that has moved — the change below
+  was amended, the change was rebased onto a newer default branch — costs a
+  replay: each commit the branch carried is put on the new base in turn, keeping
+  its message, author and timestamps, and the branch is pushed with
+  `--force-with-lease` against the commit GitHub reported at the start of the
+  run. The review rounds are therefore kept, with new commit ids; GitHub's
+  `Files changed` is unaffected, and its per-commit review comments are not.
+  Where a replay conflicts, or where the branch was pushed under another
+  strategy and so has merge commits with no history to read, the branch is
+  rebuilt as a single commit carrying the change — and `jj spr diff` says which
+  of the two happened.
+
+  `jj spr init` offers it alongside the other two, and names it as the one to
+  pick if you want GitHub to draw and merge your stacks.
 
 - `spr.stackDisplay` chooses how a pull request says which stack it belongs to.
   There are two ways of saying it and they are alternatives, not layers — two
@@ -77,15 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `none` says nothing. Turning the description off is a thing you say, not a
   thing you get by omission.
 
-  `github` needs `spr.baseStrategy = linear` — GitHub requires each pull
+  `github` needs a linear `spr.baseStrategy` — GitHub requires each pull
   request in a stack to be based on the branch of the one below — and supplies
-  it where the strategy was not set, rather than overriding one that was.
-  GitHub refuses to change the base branch of a pull request that is in a
-  stack, so a run that has to retarget one takes the whole stack apart and
-  registers the pull requests it pushed as a new one, under a new number.
-  `--dry-run` reports what the run would register. `jj spr init` asks for the
-  setting right after the base strategy, offering `github` only where the
-  strategy picked can carry a stack.
+  `linear-rebase` where the strategy was not set, rather than overriding one
+  that was. Under `linear` it says once per run what merging the stack from
+  GitHub's interface would do to the pull requests above. GitHub refuses to
+  change the base branch of a pull request that is in a stack, so a run that
+  has to retarget one takes the whole stack apart and registers the pull
+  requests it pushed as a new one, under a new number. `--dry-run` reports what
+  the run would register. `jj spr init` asks for the setting right after the
+  base strategy, offering `github` only where the strategy picked can carry a
+  stack.
 
 - `jj spr land` works under `spr.stackDisplay = github`. It takes the GitHub stack
   holding the pull request apart before it merges anything, and then merges
@@ -109,11 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stack merge lands: merging everything below the pull request asked for is
   right, and `jj spr land` does it too. The reason is what the stack merge does
   afterwards. It rebases the head branch of the pull request *above* onto its
-  new base, and the branches jj-spr pushes are merge commits that a rebase
-  discards, so that branch collapses onto its base and GitHub closes the pull
-  request as having no changes, review and all. For the same reason, do not
-  merge a stacked pull request from GitHub's own interface while
-  GitHub is drawing the stack.
+  new base, and under `spr.baseStrategy = synthetic` or `linear` the branches
+  jj-spr pushes are merge commits that a rebase discards, so that branch
+  collapses onto its base and GitHub closes the pull request as having no
+  changes, review and all. For the same reason, under those two strategies, do
+  not merge a stacked pull request from GitHub's own interface while
+  GitHub is drawing the stack. Under `spr.baseStrategy = linear-rebase` — what
+  `spr.stackDisplay = github` selects for itself — the branches are chains of ordinary
+  commits, which survive that rebase, so merging from GitHub is safe there.
 
 - `jj spr close` works under `spr.stackDisplay = github`. Closing itself needs nothing:
   GitHub allows it while a stack holds the pull request, and keeps the closed

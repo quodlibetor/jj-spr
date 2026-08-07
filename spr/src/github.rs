@@ -54,7 +54,7 @@ pub struct PullRequest {
 /// branch it targets goes.
 ///
 /// Taking the pull request below out of the stack — landing it or closing it —
-/// makes that base branch obsolete, and under `spr.baseStrategy = linear` also
+/// makes that base branch obsolete, and under a linear `spr.baseStrategy` also
 /// doomed, since it is the head branch of the pull request below.
 #[derive(Debug, Clone)]
 pub struct StackedPullRequest {
@@ -377,7 +377,16 @@ impl GitHub {
         let base = config.new_github_branch_from_ref(&pr.base_ref_name)?;
         let head = config.new_github_branch_from_ref(&pr.head_ref_name)?;
 
-        // Fetch refs from remote using git (since we're in a colocated repo)
+        // Fetch refs from remote using git (since we're in a colocated repo).
+        //
+        // Forced, because the head and base commits below are read back out of
+        // the local refs these write: a fetch that declined to move one because
+        // the remote branch no longer descends from it would leave this
+        // reporting a commit the branch has moved off. That happens whenever
+        // something rewrote the branch — jj-spr itself under
+        // `spr.baseStrategy = linear-rebase`, or GitHub when a stack is merged
+        // from its interface — and everything downstream would then be deciding
+        // what to push from history GitHub has already dropped.
         let _fetch_result = tokio::process::Command::new("git")
             .args([
                 "--git-dir",
@@ -385,8 +394,8 @@ impl GitHub {
                 "fetch",
                 "--no-write-fetch-head",
                 &config.remote_name,
-                &format!("{}:{}", head.on_github(), head.local()),
-                &format!("{}:{}", base.on_github(), base.local()),
+                &format!("+{}:{}", head.on_github(), head.local()),
+                &format!("+{}:{}", base.on_github(), base.local()),
             ])
             .output()
             .await;
@@ -614,7 +623,7 @@ impl GitHub {
     /// GitHub closes a pull request whose base branch is deleted, so the branch
     /// only goes away once GitHub has confirmed the retargeting. Only a base
     /// branch jj-spr generated for this purpose is deleted: any other is either
-    /// a branch someone wants to keep, or — under `spr.baseStrategy = linear` —
+    /// a branch someone wants to keep, or — under a linear `spr.baseStrategy` —
     /// the head branch of the pull request below, and deleting that would close
     /// *it*.
     ///

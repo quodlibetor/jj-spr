@@ -19,6 +19,7 @@ use crate::{
         ChainLink, DissolveReason, Reconciliation, StackSession, dissolve_any_stack_holding,
     },
     output::{output, write_commit_title},
+    replay,
     utils::{parse_name_list, remove_all_parens, run_command},
 };
 use git2::Oid;
@@ -156,7 +157,13 @@ pub async fn diff(
         .draws_the_stack()
         .then(StackSession::new);
 
-    #[allow(clippy::needless_collect)]
+    // A stack GitHub draws is a stack GitHub offers to merge, and under one of
+    // the base strategies that offer destroys the pull requests above the one
+    // merged. Said once for the run, before anything is registered.
+    if let Some(warning) = config.stack_shape_warning() {
+        output("⚠️", warning)?;
+    }
+
     let pull_request_tasks: Vec<_> = prepared_commits
         .iter()
         .map(|pc: &crate::jj::PreparedCommit| {
@@ -164,6 +171,23 @@ pub async fn diff(
                 .map(|number| tokio::spawn(gh.clone().get_pull_request(number)))
         })
         .collect();
+
+    // Every pull request is read before the loop pushes anything, rather than
+    // as each change comes up. The lookups still run concurrently — that is
+    // what the spawn above is for — but a run that pushed the change below
+    // while the lookup for the change above it was still in flight could read
+    // that pull request's base as the branch it had just moved, and so measure
+    // the change against its own effects. Under `spr.baseStrategy =
+    // linear-rebase` that is not a stale number but a wrong one: the base is
+    // what says where the change's own commits start, and a branch below that
+    // was rewritten shares no commit with the one the base names.
+    let mut pull_requests = Vec::with_capacity(pull_request_tasks.len());
+    for task in pull_request_tasks {
+        pull_requests.push(match task {
+            Some(task) => Some(task.await??),
+            None => None,
+        });
+    }
 
     let mut message_on_prompt = "".to_string();
 
@@ -178,17 +202,10 @@ pub async fn diff(
     // GitHub already has. Accumulated bottom-up, as the loop walks.
     let mut links: Vec<ChainLink> = Vec::new();
 
-    for (prepared_commit, pull_request_task) in zip(prepared_commits.iter_mut(), pull_request_tasks)
-    {
+    for (prepared_commit, pull_request) in zip(prepared_commits.iter_mut(), pull_requests) {
         if result.is_err() {
             break;
         }
-
-        let pull_request = if let Some(task) = pull_request_task {
-            Some(task.await??)
-        } else {
-            None
-        };
 
         if !opts.dry_run {
             write_commit_title(prepared_commit)?;
@@ -417,7 +434,7 @@ fn report_stack(outcome: &Reconciliation) -> Result<()> {
 /// `linear_base` is not enough on its own to answer this. It says what the
 /// change below *offers* to be, and the run may not take the offer up: a change
 /// that needs no push exits before its base is looked at, so a stack migrating
-/// to `spr.baseStrategy = linear` leaves pull requests whose trees are already
+/// to a linear `spr.baseStrategy` leaves pull requests whose trees are already
 /// right still pointing at the synthetic base branches they had. Registering
 /// those as a stack would be refused for not forming one. So the base branch
 /// the pull request ends the run with is compared as well, which is the very
@@ -440,8 +457,8 @@ fn chain_link(
 ///
 /// `None` means the change gets a synthetic base branch of its own (or master,
 /// where it sits directly on master). That is always the answer under
-/// [`BaseStrategy::Synthetic`], and is the fallback under
-/// [`BaseStrategy::Linear`] when the change below cannot serve as a base:
+/// [`BaseStrategy::Synthetic`], and is the fallback under either linear strategy
+/// when the change below cannot serve as a base:
 ///
 /// - there is no change below in this run, so nothing was pushed that this
 ///   change could point at;
@@ -470,7 +487,7 @@ fn linear_base(
     directly_based_on_master: bool,
     cherry_pick: bool,
 ) -> Option<&PushedChange> {
-    if strategy != BaseStrategy::Linear || cherry_pick || directly_based_on_master {
+    if !strategy.bases_on_the_change_below() || cherry_pick || directly_based_on_master {
         return None;
     }
 
@@ -493,7 +510,7 @@ fn linear_base(
 ///   treating it as one the pull request is leaving. Whether a branch it *is*
 ///   leaving may then be taken away is a separate question again, and one only
 ///   [`crate::config::Config::is_synthetic_base_branch`] answers: the branch a
-///   pull request left under [`BaseStrategy::Linear`] is the head branch of the
+///   pull request left under a linear strategy is the head branch of the
 ///   pull request below, and deleting it would close that one.
 ///
 /// `cherry_pick` is whether this diff is a cherry-pick at all, which the
@@ -517,7 +534,7 @@ fn determine_base_branch(
     } else {
         // Keep the base branch the pull request already has. That includes the
         // head branch of the change below, which is what a pull request pushed
-        // under [`BaseStrategy::Linear`] is based on: this run may not have the
+        // under a linear strategy is based on: this run may not have the
         // change below in it — the default `jj spr diff` is one revision — but
         // that is no reason to move the pull request off a base that is still
         // right. What may not happen is *writing* to such a branch; see
@@ -543,15 +560,19 @@ fn may_push_base_commit_to(config: &crate::config::Config, branch: &GitHubBranch
         || config.is_synthetic_base_branch(branch.branch_name())
 }
 
-/// The parents of the new commit for a pull request branch.
+/// The parents of the new commit for a pull request branch, under the two
+/// strategies that merge rather than replay.
 ///
 /// The branch's previous tip always comes first, which is what makes every
-/// update to a pull request branch a fast-forward: the new commit descends from
-/// the old one, so jj-spr never has to force-push and GitHub never loses the
-/// review history. Whatever the base moved to is merged in as a second parent
-/// — under [`BaseStrategy::Linear`] that is the head commit of the change
+/// update to such a pull request branch a fast-forward: the new commit descends
+/// from the old one, so jj-spr never has to force-push and GitHub never loses
+/// the review history. Whatever the base moved to is merged in as a second
+/// parent — under [`BaseStrategy::Linear`] that is the head commit of the change
 /// below, which is exactly what makes the base's branch an ancestor of this
 /// one and so keeps GitHub's diff to this change alone.
+///
+/// [`BaseStrategy::LinearRebase`] wants the opposite of the merge this makes,
+/// and does not come through here at all: see [`crate::replay`].
 fn pr_head_parents(pr_head_oid: Oid, pr_base_parent: Option<Oid>) -> Vec<Oid> {
     let mut parents = vec![pr_head_oid];
 
@@ -786,11 +807,38 @@ async fn diff_impl(
         };
     let needs_merging_master = pr_master_base != master_base_oid;
 
+    // Whether the branch is the shape and in the place that
+    // [`BaseStrategy::LinearRebase`] wants, which the trees below say nothing
+    // about. Two ways for a branch with perfectly good trees to still need
+    // pushing:
+    //
+    // - the change below was rewritten in this run, so the commit this branch
+    //   sits on is no longer the tip of the branch it is based on. GitHub would
+    //   then diff this pull request from where the two branches last agreed,
+    //   which is below the change below, and its changes would show up here.
+    //   `pr.base_oid` was read before this run pushed anything, so the branch
+    //   below having moved is exactly this comparison coming out unequal;
+    // - the branch carries merge commits, because it was pushed under one of
+    //   the other strategies. Left alone it would stay that way for as long as
+    //   its trees stay right, and a rebase — GitHub's, when a stack is merged
+    //   from its interface — would discard the change along with them.
+    //
+    // Only the early exit below asks this, and only for a pull request that
+    // exists; for one being opened the branch does not exist yet and the answer
+    // means nothing.
+    let branch_is_as_this_strategy_wants = !config.base_strategy.rebases_branches()
+        || (linear_base.is_none_or(|below| below.head_oid == pr_base_oid)
+            && replay::is_a_chain(&jj.git_repo, pr_head_oid, pr_base_oid)?);
+
     // At this point we can check if we can exit early because no update to the
     // existing Pull Request is necessary
     if let Some(ref pull_request) = pull_request {
         // So there is an existing Pull Request...
-        if !needs_merging_master && pr_head_tree == new_head_tree && pr_base_tree == new_base_tree {
+        if !needs_merging_master
+            && pr_head_tree == new_head_tree
+            && pr_base_tree == new_base_tree
+            && branch_is_as_this_strategy_wants
+        {
             // ...and it does not need a rebase, and the trees of both Pull
             // Request branch and base are all the right ones.
             output("✅", "No update necessary")?;
@@ -1017,8 +1065,49 @@ async fn diff_impl(
     // has no number until GitHub answers with one, below.
     let mut pull_request_number = local_commit.pull_request_number;
 
+    // Under [`BaseStrategy::LinearRebase`] the branch is not written past but
+    // rebuilt: the change's own commits are replayed onto whatever the base
+    // moved to, so that the branch stays a chain of single-parent commits. That
+    // is what `pr_base_parent` means to the other strategies too — the commit
+    // the base moved to — and `pr_base_oid` is where the change's own commits
+    // sit now, so a run that finds them already on it replays nothing.
+    //
+    // Done before the message for the new commit is asked for, because a rebuild
+    // that already ends at the change's tree adds no commit and so needs no
+    // message: a pure rebase under this strategy is the replay and nothing else.
+    // A dry run rebuilds nothing at all, since building the commits is the work
+    // it exists to not do.
+    let rebuilt = if config.base_strategy.rebases_branches() && !opts.dry_run {
+        let rebuilt = replay::rebuild(
+            &jj.git_repo,
+            pr_head_oid,
+            pr_base_oid,
+            pr_base_parent.unwrap_or(pr_base_oid),
+        )?;
+
+        if let Some((emoji, message)) = rebuilt.describe(pull_request_branch.branch_name()) {
+            output(emoji, &message)?;
+        }
+
+        Some(rebuilt)
+    } else {
+        None
+    };
+
+    // Whether the change's tree still has to be committed on top of what the
+    // branch carries. Only a rebuild can answer no — the merging strategies
+    // always make a commit, even for a pure rebase, since merging the new base
+    // in *is* that commit.
+    let commits_the_tree = rebuilt
+        .as_ref()
+        .is_none_or(|rebuilt| rebuilt.tip_tree != new_head_tree);
+
     let mut github_commit_message = opts.message.clone();
-    if pull_request.is_some() && github_commit_message.is_none() && !opts.dry_run {
+    if pull_request.is_some()
+        && github_commit_message.is_none()
+        && !opts.dry_run
+        && commits_the_tree
+    {
         let input = {
             let message_on_prompt = message_on_prompt.clone();
 
@@ -1040,25 +1129,33 @@ async fn diff_impl(
         github_commit_message = Some(input);
     }
 
-    // Construct the new commit for the Pull Request branch. First parent is the
-    // current head commit of the Pull Request (we set this to the master base
-    // commit earlier if the Pull Request does not yet exist)
-    let pr_commit_parents = pr_head_parents(pr_head_oid, pr_base_parent);
-
-    // Create the new commit
+    // The commit the Pull Request branch will point at. Where the branch was
+    // rebuilt, the change's tree goes on top of what the replay ended at — and
+    // where the replay already ended at that tree, nothing is added and the
+    // branch is the replay. Otherwise the new commit is written past the branch's
+    // current tip, merging in whatever the base moved to; see
+    // [`pr_head_parents`].
     let pr_commit = if opts.dry_run {
         // Use a placeholder OID — this won't be pushed
         pr_head_oid
     } else {
-        jj.create_derived_commit(
-            local_commit.oid,
-            github_commit_message
-                .as_ref()
-                .map(|s| &s[..])
-                .unwrap_or_else(|| title),
-            new_head_tree,
-            &pr_commit_parents[..],
-        )?
+        let message = github_commit_message
+            .as_ref()
+            .map(|s| &s[..])
+            .unwrap_or_else(|| title);
+
+        match &rebuilt {
+            Some(rebuilt) if !commits_the_tree => rebuilt.tip,
+            Some(rebuilt) => {
+                jj.create_derived_commit(local_commit.oid, message, new_head_tree, &[rebuilt.tip])?
+            }
+            None => jj.create_derived_commit(
+                local_commit.oid,
+                message,
+                new_head_tree,
+                &pr_head_parents(pr_head_oid, pr_base_parent)[..],
+            )?,
+        }
     };
 
     if opts.dry_run {
@@ -1091,12 +1188,28 @@ async fn diff_impl(
         };
     } else {
         let mut cmd = jj.git_command();
-        cmd.arg("push")
-            .arg("--atomic")
-            .arg("--no-verify")
-            .arg("--")
-            .arg(&config.remote_name)
-            .arg(format!("{}:{}", pr_commit, pull_request_branch.on_github()));
+        cmd.arg("push").arg("--atomic").arg("--no-verify");
+
+        // A branch whose commits were replayed no longer descends from what the
+        // remote has, so this push cannot be a fast-forward. The lease names the
+        // commit GitHub reported when this run read the pull request, so a push
+        // that would overwrite anything else — a colleague's commit, a branch
+        // GitHub rebased itself when a stack was merged — is refused rather than
+        // quietly winning. Only the head branch is leased: a base commit goes to
+        // a branch that is written past, never rewritten.
+        if rebuilt.as_ref().is_some_and(|rebuilt| rebuilt.rewritten) {
+            cmd.arg(format!(
+                "--force-with-lease={}:{}",
+                pull_request_branch.on_github(),
+                pr_head_oid
+            ));
+        }
+
+        cmd.arg("--").arg(&config.remote_name).arg(format!(
+            "{}:{}",
+            pr_commit,
+            pull_request_branch.on_github()
+        ));
 
         // Where this run prepared a new commit for a base branch, that goes in
         // the same push. Case 0 builds no such commit — the base is the branch
@@ -1852,21 +1965,26 @@ mod tests {
         );
     }
 
-    /// The whole of the linear strategy in one assertion: the change below is
-    /// what the pull request above is based on.
+    /// The whole of the linear strategies in one assertion: the change below is
+    /// what the pull request above is based on. Both of them, because they
+    /// differ in how the head branch is built and not in what it is based on —
+    /// a `linear-rebase` run that fell back to a base branch of its own would
+    /// build the very merge commits it exists to avoid.
     #[test]
-    fn the_linear_strategy_takes_the_change_below() {
-        let below = make_change_below("spr/test/parent-feature");
-        let taken = linear_base(
-            BaseStrategy::Linear,
-            Some(&below),
-            parent_oid(),
-            false, // directly_based_on_master
-            false, // cherry_pick
-        )
-        .expect("the change below should serve as the base");
+    fn the_linear_strategies_take_the_change_below() {
+        for strategy in [BaseStrategy::Linear, BaseStrategy::LinearRebase] {
+            let below = make_change_below("spr/test/parent-feature");
+            let taken = linear_base(
+                strategy,
+                Some(&below),
+                parent_oid(),
+                false, // directly_based_on_master
+                false, // cherry_pick
+            )
+            .unwrap_or_else(|| panic!("{strategy:?} should base on the change below"));
 
-        assert_eq!(taken.branch.branch_name(), "spr/test/parent-feature");
+            assert_eq!(taken.branch.branch_name(), "spr/test/parent-feature");
+        }
     }
 
     /// The bottom of a run has nothing below it, and so nothing to be based on.
@@ -2016,12 +2134,14 @@ mod tests {
         assert_eq!(chain_link(Some(&below), Some(&base)), None);
     }
 
-    /// jj-spr never force-pushes: every commit it puts on a pull request branch
-    /// descends from what was there before, whatever else it merges in. Were
-    /// this to stop holding, pushing would need `--force` and GitHub would drop
-    /// the review comments on the commits that went missing.
+    /// Under the merging strategies a pull request branch only ever moves
+    /// forward: every commit put on it descends from what was there before,
+    /// whatever else it merges in, so the push needs no `--force` and GitHub
+    /// keeps the review comments on every commit. `linear-rebase` gives this up
+    /// deliberately and does not build its commits here at all — see
+    /// [`crate::replay`] — so this stays a statement about the other two.
     #[test]
-    fn a_pull_request_branch_only_ever_moves_forward() {
+    fn a_merged_pull_request_branch_only_ever_moves_forward() {
         let head = git2::Oid::from_str("4444444444444444444444444444444444444444").unwrap();
         let base = git2::Oid::from_str("5555555555555555555555555555555555555555").unwrap();
 

@@ -245,7 +245,7 @@ async fn close_impl(
     // GitHub is asked rather than that list assumed, because nothing says this
     // Pull Request is the only one that was ever based on the branch, and a
     // second one is what deleting it would close. Only asked where the answer
-    // could change anything: under `spr.baseStrategy = linear` the base is the
+    // could change anything: under a linear `spr.baseStrategy` the base is the
     // head branch of the Pull Request below and stays either way.
     //
     // Asking can fail, and that must not fail the close: by this point the Pull

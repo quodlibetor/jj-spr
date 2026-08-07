@@ -115,7 +115,7 @@ the default branch by itself, so landing one lands nothing below it.
 Landing a pull request also retargets the pull requests stacked on top of
 it at the default branch, so the rest of the stack is ready to land without
 another `jj spr diff`. The base branches they pointed at are deleted, except
-under [`spr.baseStrategy = linear`](configuration.md#basestrategy), where what
+under a linear [`spr.baseStrategy`](configuration.md#basestrategy), where what
 they pointed at is the landed pull request's own branch and taking it away
 would close them. Until you rebase and run `jj spr diff` again, though, a
 retargeted pull request's diff on GitHub still includes the changes that just
@@ -143,11 +143,14 @@ Landing deliberately does *not* take GitHub up on that stack merge
 (`PUT /pulls/{n}/merge-async`), and not because of what it lands: merging
 everything below the pull request you asked for is right, and `jj spr land`
 does it too. The reason is what GitHub does afterwards. It rebases the head
-branch of the pull request *above* onto its new base, and the branches jj-spr
-pushes are merge commits that a rebase discards: the branch collapses onto its
-base and GitHub closes the pull request as having no changes, review and all.
-For the same reason, do not merge a stacked pull request from GitHub's own
-interface.
+branch of the pull request *above* onto its new base, and under
+[`spr.baseStrategy`](configuration.md#basestrategy) `synthetic` or `linear` the
+branches jj-spr pushes are merge commits that a rebase discards: the branch
+collapses onto its base and GitHub closes the pull request as having no changes,
+review and all. For the same reason, under those two strategies, do not merge a
+stacked pull request from GitHub's own interface. Under `linear-rebase` — what
+`spr.stackDisplay = github` chooses when you have not — the branches are chains of
+ordinary commits and survive that rebase, so merging from GitHub is safe.
 
 **Important:** After landing, you must manually rebase your working copy:
 ```bash
@@ -252,9 +255,10 @@ disappears. If one of them cannot be moved, the branch is kept and said so.
 Its base branch is deleted only where jj-spr generated that branch for this
 pull request alone, and only while nothing has been pointed at it. So a base
 branch you set yourself is never deleted, and neither is the one a stacked pull
-request has under [`spr.baseStrategy =
-linear`](configuration.md#basestrategy), which is the branch of the pull
-request below. Where `linear` fell back to generating a base branch after all,
+request has under a linear
+[`spr.baseStrategy`](configuration.md#basestrategy), which is the branch of the
+pull request below. Where a linear strategy fell back to generating a base
+branch after all,
 that branch *is* deleted — unless some open pull request still targets it,
 which the pull requests just retargeted onto it are the usual reason for.
 

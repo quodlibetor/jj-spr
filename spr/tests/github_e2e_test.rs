@@ -311,6 +311,61 @@ impl Scratch {
         run("gh", &["api", &path, "--jq", ".status"], self.path())
     }
 
+    /// The commits `head` carries on top of `base` on the remote, oldest first,
+    /// each as `<number of parents> <first line of the message>`.
+    ///
+    /// Both halves are what the rebasing strategy is about. A `2` is a merge
+    /// commit, which is the shape GitHub's stack merge destroys — so a strategy
+    /// that promises to avoid them can only be checked against the remote,
+    /// because the promise is about what GitHub is given. The messages are how a
+    /// replay is told from a branch that started again from its base: the
+    /// commits come back with new ids either way, and only their messages say
+    /// whether the review history survived.
+    fn commits_ahead(&self, base: &str, head: &str) -> Vec<String> {
+        let path = format!(
+            "repos/{}/{}/compare/{base}...{head}",
+            self.target.owner, self.target.repo
+        );
+
+        run(
+            "gh",
+            &[
+                "api",
+                &path,
+                "--jq",
+                r#".commits[] | "\(.parents | length) \(.commit.message | split("\n")[0])""#,
+            ],
+            self.path(),
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// The files pull request `number` shows as changed, sorted.
+    ///
+    /// GitHub works these out against the merge base of the two branches, which
+    /// is why a stacked pull request whose branch has lost sight of the branch
+    /// below it shows that change's files here as well as its own.
+    fn pr_files(&self, number: u64) -> Vec<String> {
+        let path = format!(
+            "repos/{}/{}/pulls/{number}/files",
+            self.target.owner, self.target.repo
+        );
+
+        let mut files: Vec<String> = run(
+            "gh",
+            &["api", "--paginate", &path, "--jq", ".[].filename"],
+            self.path(),
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+        files.sort();
+        files
+    }
+
     /// Every branch this run has put on the remote, by name, sorted.
     fn remote_branches(&self) -> Vec<String> {
         let listing = run(
@@ -849,19 +904,28 @@ fn a_stack_pushed_by_jj_spr_becomes_a_github_stack() {
         return;
     };
     let scratch = Scratch::new(target, "ghstack");
-    // Deliberately the only setting: `spr.stackDisplay = github` requires the linear
-    // base strategy and supplies it, and this is where that has to be true of
-    // the built binary rather than of a unit test.
+    // Deliberately the only setting: `spr.stackDisplay = github` requires a linear base
+    // strategy and supplies `linear-rebase`, and this is where that has to be
+    // true of the built binary rather than of a unit test.
     scratch.set_config("spr.stackDisplay", "github");
 
     let prs = scratch.push_stack(&["e2e ghstack bottom", "e2e ghstack top"]);
     let (bottom, top) = (prs[0], prs[1]);
 
+    let bottom_branch = scratch.pr_head_branch(bottom);
     assert_eq!(
         scratch.pr_base_branch(top),
-        scratch.pr_head_branch(bottom),
-        "the setting should have brought the linear strategy with it: PR #{top} should be \
+        bottom_branch,
+        "the setting should have brought a linear strategy with it: PR #{top} should be \
          based on the branch of PR #{bottom}"
+    );
+    // Which of the two linear strategies it supplied, asserted where it counts:
+    // GitHub's stack merge rebases the branch above the pull request it merges,
+    // and a merge commit does not survive that.
+    assert_eq!(
+        scratch.commits_ahead(&bottom_branch, &scratch.pr_head_branch(top)),
+        vec!["1 e2e ghstack top".to_string()],
+        "the setting should have supplied the strategy whose branches GitHub can rebase"
     );
 
     let stack = scratch
@@ -939,6 +1003,225 @@ fn amending_below_a_linear_pull_request_only_moves_branches_forward() {
         scratch.pr_state(top),
         "open",
         "pushing below PR #{top} closed it"
+    );
+}
+
+/// Under `spr.baseStrategy = linear-rebase` every pull request branch is a chain
+/// of single-parent commits on the branch below it.
+///
+/// Only GitHub can show this, and it is the whole promise of the strategy: its
+/// stack merge rebases the head branch of the pull request above the one it
+/// merges, a rebase keeps only the non-merge commits of a range, and the
+/// branches the merging strategies push are merge commits — so under those, that
+/// branch collapses onto its base and GitHub closes the pull request as empty.
+#[test]
+fn a_linear_rebase_stack_is_a_chain_of_single_parent_commits() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "rebase");
+    scratch.set_config("spr.baseStrategy", "linear-rebase");
+
+    let prs = scratch.push_stack(&["e2e rebase bottom", "e2e rebase top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+    let (bottom_branch, top_branch) = (scratch.pr_head_branch(bottom), scratch.pr_head_branch(top));
+
+    assert_eq!(
+        scratch.pr_base_branch(bottom),
+        scratch.default_branch(),
+        "the bottom of a stack is on the default branch under any strategy"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        bottom_branch,
+        "PR #{top} should be based on the branch of PR #{bottom}"
+    );
+
+    assert_eq!(
+        scratch.commits_ahead(&scratch.default_branch(), &bottom_branch),
+        vec!["1 e2e rebase bottom".to_string()],
+        "PR #{bottom}'s branch should be one ordinary commit on the default branch"
+    );
+    assert_eq!(
+        scratch.commits_ahead(&bottom_branch, &top_branch),
+        vec!["1 e2e rebase top".to_string()],
+        "PR #{top}'s branch should be one ordinary commit on the branch below it"
+    );
+
+    let mut expected = vec![bottom_branch, top_branch];
+    expected.sort();
+    assert_eq!(
+        scratch.remote_branches(),
+        expected,
+        "the strategy should have pushed the two head branches and nothing else"
+    );
+}
+
+/// Amending the bottom of a `linear-rebase` stack replays the commits of the
+/// pull request above onto the new tip of the branch below — rewriting them,
+/// which is what this strategy trades away, while keeping their number and their
+/// messages, which is what it keeps.
+///
+/// The pull request above is what is at risk, and its `Files changed` is what
+/// says whether the replay worked: GitHub diffs a pull request from the merge
+/// base of the two branches, so a branch left behind on the old tip of the
+/// branch below would show that change's file here as well as its own — the
+/// change below would be under review twice, in two pull requests.
+#[test]
+fn amending_below_a_linear_rebase_pull_request_replays_its_commits() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "rebasereplay");
+    scratch.set_config("spr.baseStrategy", "linear-rebase");
+
+    let (bottom_title, top_title) = ("e2e replay bottom", "e2e replay top");
+    let prs = scratch.push_stack(&[bottom_title, top_title]);
+    let (bottom, top) = (prs[0], prs[1]);
+    let (bottom_branch, top_branch) = (scratch.pr_head_branch(bottom), scratch.pr_head_branch(top));
+
+    // Give the pull request above some review history to lose: a second round
+    // of the change, which is a second commit on its branch. `push_stack` leaves
+    // the working copy on the top change.
+    std::fs::write(scratch.path().join(slug(top_title)), "a second round").unwrap();
+    jj_spr(
+        &["diff", "-r", "@", "-m", "the second round"],
+        scratch.path(),
+    );
+    assert_eq!(
+        scratch.commits_ahead(&bottom_branch, &top_branch),
+        vec![
+            "1 e2e replay top".to_string(),
+            "1 the second round".to_string()
+        ],
+        "the amend should have added a second commit to PR #{top}'s branch"
+    );
+
+    let before_top = scratch.remote_branch_sha(&top_branch);
+    let before_bottom = scratch.remote_branch_sha(&bottom_branch);
+
+    // Amend the change at the bottom, which is what the one above is based on.
+    run("jj", &["edit", "@-"], scratch.path());
+    std::fs::write(
+        scratch.path().join(slug(bottom_title)),
+        "amended bottom content",
+    )
+    .unwrap();
+    run("jj", &["edit", "@+"], scratch.path());
+    jj_spr(
+        &["diff", "--all", "-r", "trunk()..@", "-m", "amend"],
+        scratch.path(),
+    );
+
+    let after_bottom = scratch.remote_branch_sha(&bottom_branch);
+    assert_eq!(
+        scratch.compare(&before_bottom, &after_bottom),
+        "ahead",
+        "nothing moved under PR #{bottom}, so its own branch should have moved forward \
+         ({bottom_branch}: {before_bottom} -> {after_bottom})"
+    );
+
+    let after_top = scratch.remote_branch_sha(&top_branch);
+    let moved = scratch.compare(&before_top, &after_top);
+    assert!(
+        matches!(moved.as_str(), "diverged" | "behind"),
+        "PR #{top}'s branch should have been rewritten rather than added to, which is \
+         what this strategy gives up ({top_branch}: {before_top} -> {after_top} is {moved})"
+    );
+
+    assert_eq!(
+        scratch.commits_ahead(&bottom_branch, &top_branch),
+        vec![
+            "1 e2e replay top".to_string(),
+            "1 the second round".to_string()
+        ],
+        "both rounds of PR #{top} should have come along, still one parent each"
+    );
+    assert_eq!(
+        scratch.pr_files(top),
+        vec![slug(top_title)],
+        "PR #{top} should still be reviewing its own change and nothing else"
+    );
+
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        bottom_branch,
+        "PR #{top} should still be based on the branch of PR #{bottom}"
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "pushing below PR #{top} closed it"
+    );
+}
+
+/// A pull request pushed under one of the merging strategies is rebuilt as a
+/// chain the next time it is pushed under `linear-rebase`.
+///
+/// The review history cannot come with it — a merge commit says nothing about
+/// which of its ancestors were rounds of this change — so what this pins is that
+/// the branch does not stay merge-shaped. Left as it was, it would be a pull
+/// request in a stack GitHub offers to merge and whose branch that merge would
+/// destroy, for as long as nothing else about the change moved.
+#[test]
+fn switching_to_linear_rebase_rebuilds_a_merge_shaped_branch() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "rebasemigrate");
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let (bottom_title, top_title) = ("e2e migrate bottom", "e2e migrate top");
+    let prs = scratch.push_stack(&[bottom_title, top_title]);
+    let (bottom, top) = (prs[0], prs[1]);
+    let (bottom_branch, top_branch) = (scratch.pr_head_branch(bottom), scratch.pr_head_branch(top));
+
+    // Amend the bottom under `linear`, so that the branch above gains the merge
+    // commit that strategy brings the new base in with.
+    run("jj", &["edit", "@-"], scratch.path());
+    std::fs::write(scratch.path().join(slug(bottom_title)), "amended once").unwrap();
+    run("jj", &["edit", "@+"], scratch.path());
+    jj_spr(
+        &["diff", "--all", "-r", "trunk()..@", "-m", "amend"],
+        scratch.path(),
+    );
+
+    assert!(
+        scratch
+            .commits_ahead(&bottom_branch, &top_branch)
+            .iter()
+            .any(|commit| commit.starts_with("2 ")),
+        "the linear strategy should have left a merge commit on PR #{top}'s branch to \
+         migrate away from"
+    );
+
+    scratch.set_config("spr.baseStrategy", "linear-rebase");
+    run("jj", &["edit", "@-"], scratch.path());
+    std::fs::write(scratch.path().join(slug(bottom_title)), "amended twice").unwrap();
+    run("jj", &["edit", "@+"], scratch.path());
+    jj_spr(
+        &["diff", "--all", "-r", "trunk()..@", "-m", "amend again"],
+        scratch.path(),
+    );
+
+    for commit in scratch.commits_ahead(&bottom_branch, &top_branch) {
+        assert!(
+            commit.starts_with("1 "),
+            "PR #{top}'s branch should have been rebuilt without merge commits: {commit}"
+        );
+    }
+    assert_eq!(
+        scratch.pr_files(top),
+        vec![slug(top_title)],
+        "PR #{top} should still be reviewing its own change and nothing else"
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "rebuilding PR #{top}'s branch closed it"
     );
 }
 
@@ -1548,7 +1831,7 @@ fn squash_landing_a_github_stack_lands_one_commit_per_pull_request() {
 ///
 /// A stack of three, landing the top in one command, is the smallest shape
 /// where a cascade is more than one merge and the order of the merges matters.
-/// It runs without `spr.githubStacks`, because nothing here is about GitHub's
+/// It runs without `spr.stackDisplay = github`, because nothing here is about GitHub's
 /// stacks — a stack of jj-spr's own is enough to have unlanded parents.
 #[test]
 fn landing_the_top_of_a_stack_lands_the_pull_requests_below_it_first() {
