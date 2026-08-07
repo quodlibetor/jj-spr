@@ -143,10 +143,19 @@ The codebase follows a library + binary structure:
 
 ## Testing Strategy
 
-- **Integration tests** in `spr/tests/` verify end-to-end workflows using temporary Git/Jujutsu repos
 - **Unit tests** are colocated with implementation code
+- **Integration tests** in `spr/tests/` verify end-to-end workflows using temporary Git/Jujutsu repos
 - Tests require both `jj` and `git` binaries available in PATH
 - CI runs on Ubuntu with all dependencies installed
+
+### Where a test about GitHub belongs
+
+Three suites, and the line between the last two is what jj-spr decides versus what GitHub does:
+
+- `spr/tests/fake_github_diff_test.rs` — runs `jj spr diff` against an in-process fake GitHub (behind the `GitHubApi` trait) with a **bare repository standing in for the remote**, so every branch assertion is real git and needs no network. This is where anything jj-spr decides for itself belongs: branch shapes, which base a PR gets, which calls are made in which order, what is refused. Seconds per test.
+- `spr/tests/github_e2e_test.rs` — the live suite, skipped unless `E2E_TEST_REPO` is set (`quodlibetor/spr-private-tests`), run with `--test-threads=1`. This is for facts about GitHub: what a retarget does, what a deleted base branch does, what its stack merge does to the PRs above, what its stacks API accepts. Roughly a minute per test.
+- The live suite is also what keeps the fake honest. Every GitHub rule the fake reproduces — a stack refusing a base change, only a generated base branch being deleted, members having to chain base-to-head — is marked in the fake with the live test that pins it, and those tests say so too. **A fake with a wrong rule is worse than no test**, so a new rule in the fake needs a live test pinning it.
+- Prefer sharing the rule over restating it: `github::base_branch_to_take_away` exists so the real client and the fake apply one statement of "which base branch is ours to delete" rather than two.
 
 ## Configuration Options
 

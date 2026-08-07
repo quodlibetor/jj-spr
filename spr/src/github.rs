@@ -17,8 +17,10 @@ use std::{
     path::PathBuf,
 };
 
+mod api;
 mod stacks;
 
+pub use api::GitHubApi;
 pub use stacks::{
     AsyncMerge, Stack, StackApiError, StackBase, StackGitRef, StackPullRequest,
     StackPullRequestState, StackResult, UnstackOutcome,
@@ -48,6 +50,29 @@ pub struct PullRequest {
     pub merge_commit: Option<git2::Oid>,
     pub reviewers: HashMap<String, ReviewStatus>,
     pub review_status: Option<ReviewStatus>,
+}
+
+/// The branch a retarget leaves behind that is jj-spr's to delete, or `None`
+/// where nothing is to be deleted.
+///
+/// Two ways for the answer to be nothing: a pull request retargeted at the
+/// branch it already points at has left nothing, and a base branch jj-spr did
+/// not generate was never its to take away — deleting one of those would close
+/// whatever else is based on it, and under a linear `spr.baseStrategy` the base
+/// of a stacked pull request is the head branch of the pull request below.
+///
+/// A free function so that the rule has one statement rather than one per
+/// caller: [`GitHub::retarget_pull_request`] applies it against GitHub, and the
+/// fake GitHub the tests use applies it against a bare repository, so a test
+/// asserting that a branch went away is asserting this and not a copy of it.
+pub fn base_branch_to_take_away<'a>(
+    config: &crate::config::Config,
+    new_base: &GitHubBranch,
+    old_base: &'a GitHubBranch,
+) -> Option<&'a GitHubBranch> {
+    (old_base.branch_name() != new_base.branch_name()
+        && config.is_synthetic_base_branch(old_base.branch_name()))
+    .then_some(old_base)
 }
 
 /// An open pull request that sits on top of another one, as far as the base
@@ -644,15 +669,10 @@ impl GitHub {
             )));
         }
 
-        // Retargeting a pull request at the branch it already points at is not
-        // a reason to delete that branch — which is to say, to close it.
-        if old_base.branch_name() == new_base.branch_name()
-            || !self.config.is_synthetic_base_branch(old_base.branch_name())
-        {
-            return Ok(false);
+        match base_branch_to_take_away(&self.config, new_base, old_base) {
+            Some(old_base) => self.delete_remote_branch(old_base).await,
+            None => Ok(false),
         }
-
-        self.delete_remote_branch(old_base).await
     }
 
     /// [`Self::retarget_pull_request`] to the master branch.
@@ -1101,6 +1121,62 @@ impl GitHubBranch {
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
+
+    fn test_config() -> crate::config::Config {
+        crate::config::Config::new(
+            "acme".into(),
+            "codez".into(),
+            "origin".into(),
+            "master".into(),
+            "spr/foo/".into(),
+            false,
+        )
+    }
+
+    fn test_branch(name: &str) -> GitHubBranch {
+        GitHubBranch::new_from_branch_name(name, "origin", "master")
+    }
+
+    /// A retarget leaves behind the base branch jj-spr generated for the pull
+    /// request, and that one alone.
+    #[test]
+    fn a_generated_base_branch_a_pull_request_has_left_is_taken_away() {
+        let config = test_config();
+        let old = test_branch("spr/foo/master.a-feature");
+
+        assert_eq!(
+            base_branch_to_take_away(&config, &test_branch("master"), &old)
+                .map(GitHubBranch::branch_name),
+            Some("spr/foo/master.a-feature")
+        );
+    }
+
+    /// Two branches a retarget must never take away: the head branch of the pull
+    /// request below, which under a linear strategy is what a stacked pull request
+    /// is based on, and a branch somebody chose by hand. Deleting either would
+    /// close whatever is based on it.
+    #[test]
+    fn a_base_branch_that_is_not_ours_is_left_alone() {
+        let config = test_config();
+
+        for name in ["spr/foo/a-feature", "release-1.0", "master"] {
+            assert!(
+                base_branch_to_take_away(&config, &test_branch("master"), &test_branch(name))
+                    .is_none(),
+                "{name} is not this pull request's to delete"
+            );
+        }
+    }
+
+    /// Retargeting a pull request at the branch it already points at has left
+    /// nothing behind — and deleting that branch would be deleting its base.
+    #[test]
+    fn a_base_branch_that_was_not_left_is_not_taken_away() {
+        let config = test_config();
+        let base = test_branch("spr/foo/master.a-feature");
+
+        assert!(base_branch_to_take_away(&config, &base, &base).is_none());
+    }
 
     /// The statuses that mean GitHub is holding the pull request back.
     #[test]

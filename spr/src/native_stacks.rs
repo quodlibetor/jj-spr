@@ -42,7 +42,7 @@ use std::collections::HashSet;
 
 use crate::{
     error::{Error, Result},
-    github::{GitHub, Stack, StackApiError, StackResult, StackedPullRequest, UnstackOutcome},
+    github::{GitHubApi, Stack, StackApiError, StackResult, StackedPullRequest, UnstackOutcome},
     output::output,
 };
 
@@ -624,7 +624,7 @@ impl StackSession {
     /// whatever stack held it, and that has to be accounted for.
     pub async fn register(
         &mut self,
-        gh: &GitHub,
+        gh: &impl GitHubApi,
         links: &[ChainLink],
         apply: bool,
     ) -> Result<Vec<Reconciliation>> {
@@ -727,7 +727,7 @@ impl StackSession {
 
     async fn register_chain(
         &mut self,
-        gh: &GitHub,
+        gh: &impl GitHubApi,
         chain: &Chain,
         retargeted: &HashSet<u64>,
         apply: bool,
@@ -864,7 +864,7 @@ impl StackSession {
     /// number: there is no way to change a base and keep the stack, and none to
     /// put a stack back as it was. Whatever the run does not put back has to be
     /// said out loud; see [`Self::orphaned_pull_requests`].
-    pub async fn unlock_base(&mut self, gh: &GitHub, number: u64) -> Result<BaseUnlock> {
+    pub async fn unlock_base(&mut self, gh: &impl GitHubApi, number: u64) -> Result<BaseUnlock> {
         if self.released.contains(&number) {
             return Ok(BaseUnlock::NotStacked);
         }
@@ -892,7 +892,7 @@ impl StackSession {
     }
 
     /// The open stack holding pull request `number`.
-    async fn open_stack_for(&mut self, gh: &GitHub, number: u64) -> Result<Lookup> {
+    async fn open_stack_for(&mut self, gh: &impl GitHubApi, number: u64) -> Result<Lookup> {
         if self.unsupported {
             return Ok(Lookup::Unsupported);
         }
@@ -908,7 +908,7 @@ impl StackSession {
     }
 
     /// Make a stack of `chain`, answering with its number.
-    async fn create(&mut self, gh: &GitHub, chain: &[u64]) -> Result<u64> {
+    async fn create(&mut self, gh: &impl GitHubApi, chain: &[u64]) -> Result<u64> {
         let stack = propagate(gh.create_stack(chain).await)?;
         self.registered.extend(chain);
 
@@ -916,7 +916,12 @@ impl StackSession {
     }
 
     /// Dissolve stack `stack_number`, which is holding `members`.
-    async fn dissolve(&mut self, gh: &GitHub, stack_number: u64, members: &[u64]) -> Result<()> {
+    async fn dissolve(
+        &mut self,
+        gh: &impl GitHubApi,
+        stack_number: u64,
+        members: &[u64],
+    ) -> Result<()> {
         let outcome = propagate(gh.unstack(stack_number).await)?;
 
         match outcome {
@@ -1113,7 +1118,7 @@ impl DissolveReason {
 /// ways of saying it.
 pub async fn dissolve_any_stack_holding(
     stacks: Option<&mut StackSession>,
-    gh: &GitHub,
+    gh: &impl GitHubApi,
     number: u64,
     why: DissolveReason,
 ) -> Result<()> {
@@ -1160,7 +1165,7 @@ pub async fn dissolve_any_stack_holding(
 /// function.
 pub async fn dissolve_stacks_holding(
     mut stacks: Option<&mut StackSession>,
-    gh: &GitHub,
+    gh: &impl GitHubApi,
     pull_requests: &[StackedPullRequest],
     why: DissolveReason,
 ) -> Result<()> {

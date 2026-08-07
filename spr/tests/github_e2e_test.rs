@@ -5,6 +5,16 @@
  * pushing branches, opening pull requests, and reading their bodies back off
  * GitHub. Everything else in the suite stops at the library boundary.
  *
+ * What belongs here, now that `fake_github_diff_test.rs` can run `diff` against a
+ * fake GitHub and a bare repository without a network: everything that is a fact
+ * about *GitHub*. What a retarget does to a pull request, what a deleted base
+ * branch does to one, what its stack merge does to the ones above, what it makes
+ * of a force-pushed branch, what its stacks API accepts. A test against a fake
+ * cannot establish any of that — it would only be asserting the fake — so these
+ * are also the tests that keep that fake honest, and several of them say below
+ * which of its rules they pin. A test whose subject is what jj-spr decides
+ * belongs over there instead, where it costs seconds rather than a minute.
+ *
  * They are skipped unless E2E_TEST_REPO names a repository you are content for
  * them to open and close pull requests in:
  *
@@ -364,27 +374,6 @@ impl Scratch {
 
         files.sort();
         files
-    }
-
-    /// Every branch this run has put on the remote, by name, sorted.
-    fn remote_branches(&self) -> Vec<String> {
-        let listing = run(
-            "git",
-            &[
-                "ls-remote",
-                "--heads",
-                "origin",
-                &format!("{}*", self.prefix),
-            ],
-            self.path(),
-        );
-
-        let mut branches: Vec<String> = ls_remote_refs(&listing)
-            .map(|r| r.trim_start_matches("refs/heads/").to_owned())
-            .collect();
-
-        branches.sort();
-        branches
     }
 
     /// What GitHub reports about merging pull request `number`: the `mergeable`
@@ -849,44 +838,6 @@ fn diff_retargets_a_pull_request_whose_parent_was_merged_on_github() {
     );
 }
 
-/// Under `spr.baseStrategy = linear` a stacked pull request asks to be merged
-/// into the pull request below it, and no base branch is generated at all.
-///
-/// Only GitHub can show this: what a pull request is based on is a fact about
-/// the pull request, and the branches that do or do not exist are a fact about
-/// the remote.
-#[test]
-fn a_linear_stack_bases_each_pull_request_on_the_one_below() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "linear");
-    scratch.set_config("spr.baseStrategy", "linear");
-
-    let prs = scratch.push_stack(&["e2e linear bottom", "e2e linear top"]);
-    let (bottom, top) = (prs[0], prs[1]);
-
-    assert_eq!(
-        scratch.pr_base_branch(bottom),
-        scratch.default_branch(),
-        "the bottom of a stack is on the default branch under any strategy"
-    );
-    assert_eq!(
-        scratch.pr_base_branch(top),
-        scratch.pr_head_branch(bottom),
-        "PR #{top} should be based on the branch of PR #{bottom}"
-    );
-
-    let mut expected = vec![scratch.pr_head_branch(bottom), scratch.pr_head_branch(top)];
-    expected.sort();
-    assert_eq!(
-        scratch.remote_branches(),
-        expected,
-        "the linear strategy should have pushed the two head branches and nothing else"
-    );
-}
-
 /// Under `spr.stackDisplay = github` the pull requests a run pushes become a stack
 /// GitHub itself holds and draws.
 ///
@@ -897,6 +848,12 @@ fn a_linear_stack_bases_each_pull_request_on_the_one_below() {
 /// The target repository must have stacked pull requests enabled. Without it
 /// GitHub answers 404 on every stacks route and this fails saying so, which is
 /// the honest outcome: the setting was asked for and could not be honoured.
+///
+/// This is what pins the chain rule for the fake in `fake_github_diff_test.rs` —
+/// that GitHub accepts as a stack exactly the pull requests whose base ref is the
+/// head ref of the one below — and, since it sets one setting and lets the binary
+/// resolve the rest, the only test that covers `main.rs` choosing a base strategy
+/// from `spr.stackDisplay = github`.
 #[test]
 fn a_stack_pushed_by_jj_spr_becomes_a_github_stack() {
     let Some(target) = target() else {
@@ -942,122 +899,6 @@ fn a_stack_pushed_by_jj_spr_becomes_a_github_stack() {
     );
 }
 
-/// Amending the bottom of a linear stack moves both branches forward and never
-/// rewrites either: jj-spr does not force-push, and GitHub drops the review
-/// comments on commits that go missing.
-///
-/// The pull request above is the one at risk, because it is what has to gain
-/// the new commit from below.
-#[test]
-fn amending_below_a_linear_pull_request_only_moves_branches_forward() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "linearff");
-    scratch.set_config("spr.baseStrategy", "linear");
-
-    let prs = scratch.push_stack(&["e2e linearff bottom", "e2e linearff top"]);
-    let (bottom, top) = (prs[0], prs[1]);
-
-    // Both branches are read off the remote rather than off the pull requests
-    // that have them as their heads — see `remote_branch_sha`. Reading
-    // `head.sha` here made this test fail perhaps one run in three, reporting
-    // the bottom branch as `identical` when `ls-remote` already had the new
-    // commit: GitHub had not caught up, and nothing had been rewritten.
-    let branches: Vec<String> = prs.iter().map(|n| scratch.pr_head_branch(*n)).collect();
-    let before: Vec<String> = branches
-        .iter()
-        .map(|branch| scratch.remote_branch_sha(branch))
-        .collect();
-
-    // Amend the change at the bottom, which is what the one above is based on.
-    run("jj", &["edit", "@-"], scratch.path());
-    std::fs::write(
-        scratch.path().join(slug("e2e linearff bottom")),
-        "amended content",
-    )
-    .unwrap();
-    run("jj", &["edit", "@+"], scratch.path());
-    jj_spr(
-        &["diff", "--all", "-r", "trunk()..@", "-m", "amend"],
-        scratch.path(),
-    );
-
-    for ((number, branch), before) in prs.iter().zip(&branches).zip(&before) {
-        let after = scratch.remote_branch_sha(branch);
-        assert_eq!(
-            scratch.compare(before, &after),
-            "ahead",
-            "PR #{number}'s branch was rewritten rather than moved forward \
-             ({branch}: {before} -> {after})"
-        );
-    }
-
-    assert_eq!(
-        scratch.pr_base_branch(top),
-        scratch.pr_head_branch(bottom),
-        "PR #{top} should still be based on the branch of PR #{bottom}"
-    );
-    assert_eq!(
-        scratch.pr_state(top),
-        "open",
-        "pushing below PR #{top} closed it"
-    );
-}
-
-/// Under `spr.baseStrategy = linear-rebase` every pull request branch is a chain
-/// of single-parent commits on the branch below it.
-///
-/// Only GitHub can show this, and it is the whole promise of the strategy: its
-/// stack merge rebases the head branch of the pull request above the one it
-/// merges, a rebase keeps only the non-merge commits of a range, and the
-/// branches the merging strategies push are merge commits — so under those, that
-/// branch collapses onto its base and GitHub closes the pull request as empty.
-#[test]
-fn a_linear_rebase_stack_is_a_chain_of_single_parent_commits() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "rebase");
-    scratch.set_config("spr.baseStrategy", "linear-rebase");
-
-    let prs = scratch.push_stack(&["e2e rebase bottom", "e2e rebase top"]);
-    let (bottom, top) = (prs[0], prs[1]);
-    let (bottom_branch, top_branch) = (scratch.pr_head_branch(bottom), scratch.pr_head_branch(top));
-
-    assert_eq!(
-        scratch.pr_base_branch(bottom),
-        scratch.default_branch(),
-        "the bottom of a stack is on the default branch under any strategy"
-    );
-    assert_eq!(
-        scratch.pr_base_branch(top),
-        bottom_branch,
-        "PR #{top} should be based on the branch of PR #{bottom}"
-    );
-
-    assert_eq!(
-        scratch.commits_ahead(&scratch.default_branch(), &bottom_branch),
-        vec!["1 e2e rebase bottom".to_string()],
-        "PR #{bottom}'s branch should be one ordinary commit on the default branch"
-    );
-    assert_eq!(
-        scratch.commits_ahead(&bottom_branch, &top_branch),
-        vec!["1 e2e rebase top".to_string()],
-        "PR #{top}'s branch should be one ordinary commit on the branch below it"
-    );
-
-    let mut expected = vec![bottom_branch, top_branch];
-    expected.sort();
-    assert_eq!(
-        scratch.remote_branches(),
-        expected,
-        "the strategy should have pushed the two head branches and nothing else"
-    );
-}
-
 /// Amending the bottom of a `linear-rebase` stack replays the commits of the
 /// pull request above onto the new tip of the branch below — rewriting them,
 /// which is what this strategy trades away, while keeping their number and their
@@ -1068,6 +909,12 @@ fn a_linear_rebase_stack_is_a_chain_of_single_parent_commits() {
 /// base of the two branches, so a branch left behind on the old tip of the
 /// branch below would show that change's file here as well as its own — the
 /// change below would be under review twice, in two pull requests.
+///
+/// The local twin of this test, in `fake_github_diff_test.rs`, asserts the same
+/// branches without a network. What only this one can say is what GitHub makes of
+/// them: that a force-pushed branch leaves its pull request open, and that
+/// `Files changed` is recomputed from the new merge base rather than from
+/// wherever the branch used to sit. Both are assumptions the fake bakes in.
 #[test]
 fn amending_below_a_linear_rebase_pull_request_replays_its_commits() {
     let Some(target) = target() else {
@@ -1154,74 +1001,6 @@ fn amending_below_a_linear_rebase_pull_request_replays_its_commits() {
         scratch.pr_state(top),
         "open",
         "pushing below PR #{top} closed it"
-    );
-}
-
-/// A pull request pushed under one of the merging strategies is rebuilt as a
-/// chain the next time it is pushed under `linear-rebase`.
-///
-/// The review history cannot come with it — a merge commit says nothing about
-/// which of its ancestors were rounds of this change — so what this pins is that
-/// the branch does not stay merge-shaped. Left as it was, it would be a pull
-/// request in a stack GitHub offers to merge and whose branch that merge would
-/// destroy, for as long as nothing else about the change moved.
-#[test]
-fn switching_to_linear_rebase_rebuilds_a_merge_shaped_branch() {
-    let Some(target) = target() else {
-        eprintln!("skipping: set E2E_TEST_REPO to run");
-        return;
-    };
-    let scratch = Scratch::new(target, "rebasemigrate");
-    scratch.set_config("spr.baseStrategy", "linear");
-
-    let (bottom_title, top_title) = ("e2e migrate bottom", "e2e migrate top");
-    let prs = scratch.push_stack(&[bottom_title, top_title]);
-    let (bottom, top) = (prs[0], prs[1]);
-    let (bottom_branch, top_branch) = (scratch.pr_head_branch(bottom), scratch.pr_head_branch(top));
-
-    // Amend the bottom under `linear`, so that the branch above gains the merge
-    // commit that strategy brings the new base in with.
-    run("jj", &["edit", "@-"], scratch.path());
-    std::fs::write(scratch.path().join(slug(bottom_title)), "amended once").unwrap();
-    run("jj", &["edit", "@+"], scratch.path());
-    jj_spr(
-        &["diff", "--all", "-r", "trunk()..@", "-m", "amend"],
-        scratch.path(),
-    );
-
-    assert!(
-        scratch
-            .commits_ahead(&bottom_branch, &top_branch)
-            .iter()
-            .any(|commit| commit.starts_with("2 ")),
-        "the linear strategy should have left a merge commit on PR #{top}'s branch to \
-         migrate away from"
-    );
-
-    scratch.set_config("spr.baseStrategy", "linear-rebase");
-    run("jj", &["edit", "@-"], scratch.path());
-    std::fs::write(scratch.path().join(slug(bottom_title)), "amended twice").unwrap();
-    run("jj", &["edit", "@+"], scratch.path());
-    jj_spr(
-        &["diff", "--all", "-r", "trunk()..@", "-m", "amend again"],
-        scratch.path(),
-    );
-
-    for commit in scratch.commits_ahead(&bottom_branch, &top_branch) {
-        assert!(
-            commit.starts_with("1 "),
-            "PR #{top}'s branch should have been rebuilt without merge commits: {commit}"
-        );
-    }
-    assert_eq!(
-        scratch.pr_files(top),
-        vec![slug(top_title)],
-        "PR #{top} should still be reviewing its own change and nothing else"
-    );
-    assert_eq!(
-        scratch.pr_state(top),
-        "open",
-        "rebuilding PR #{top}'s branch closed it"
     );
 }
 
@@ -1365,6 +1144,11 @@ fn closing_a_synthetic_pull_request_takes_away_its_generated_base_branch() {
 /// a rule: switching the strategy and nothing else is silently a no-op, because
 /// the early return for a change that needs no push comes before the base is
 /// looked at.
+///
+/// It also pins the rule `base_branch_to_take_away` states and the fake in
+/// `fake_github_diff_test.rs` applies: that a base branch a pull request has
+/// been moved off can be deleted without closing it, and that the order is what
+/// makes that true.
 #[test]
 fn migrating_a_stack_to_linear_retargets_it_and_takes_away_its_base_branch() {
     let Some(target) = target() else {

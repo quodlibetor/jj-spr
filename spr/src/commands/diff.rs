@@ -106,7 +106,7 @@ fn resolve_cherry_pick(
 pub async fn diff(
     opts: DiffOptions,
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
 ) -> Result<()> {
     let mut result = Ok(());
@@ -164,30 +164,30 @@ pub async fn diff(
         output("⚠️", warning)?;
     }
 
-    let pull_request_tasks: Vec<_> = prepared_commits
-        .iter()
-        .map(|pc: &crate::jj::PreparedCommit| {
-            pc.pull_request_number
-                .map(|number| tokio::spawn(gh.clone().get_pull_request(number)))
-        })
-        .collect();
-
     // Every pull request is read before the loop pushes anything, rather than
-    // as each change comes up. The lookups still run concurrently — that is
-    // what the spawn above is for — but a run that pushed the change below
-    // while the lookup for the change above it was still in flight could read
-    // that pull request's base as the branch it had just moved, and so measure
-    // the change against its own effects. Under `spr.baseStrategy =
-    // linear-rebase` that is not a stale number but a wrong one: the base is
-    // what says where the change's own commits start, and a branch below that
-    // was rewritten shares no commit with the one the base names.
-    let mut pull_requests = Vec::with_capacity(pull_request_tasks.len());
-    for task in pull_request_tasks {
-        pull_requests.push(match task {
-            Some(task) => Some(task.await??),
-            None => None,
-        });
-    }
+    // as each change comes up. The lookups still run concurrently, but a run
+    // that pushed the change below while the lookup for the change above it was
+    // still in flight could read that pull request's base as the branch it had
+    // just moved, and so measure the change against its own effects. Under
+    // `spr.baseStrategy = linear-rebase` that is not a stale number but a wrong
+    // one: the base is what says where the change's own commits start, and a
+    // branch below that was rewritten shares no commit with the one the base
+    // names.
+    //
+    // Concurrent on this task rather than spawned onto the runtime, which is
+    // what lets the client be borrowed: a spawned future has to own one, and
+    // owning one is the difference between a client this can be given and one
+    // it has to be handed a clone of. The lookups are network waits, so there
+    // is nothing for another thread to do with them anyway.
+    let pull_requests = futures::future::join_all(prepared_commits.iter().map(|pc| async {
+        match pc.pull_request_number {
+            Some(number) => gh.get_pull_request(number).await.map(Some),
+            None => Ok(None),
+        }
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
 
     let mut message_on_prompt = "".to_string();
 
@@ -598,7 +598,7 @@ async fn diff_impl(
     opts: &DiffOptions,
     message_on_prompt: &mut String,
     jj: &crate::jj::Jujutsu,
-    gh: &crate::github::GitHub,
+    gh: &impl crate::github::GitHubApi,
     config: &crate::config::Config,
     local_commit: &mut crate::jj::PreparedCommit,
     master_base_oid: Oid,
