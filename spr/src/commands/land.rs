@@ -91,21 +91,128 @@ async fn decide_landing(
     })
 }
 
-/// Whether `commit` sits directly on the master branch, with no change of its
-/// own below it that has not landed.
+/// The changes this land has to put on the master branch, bottom first, ending
+/// with the one it was asked for.
 ///
-/// Asked of the local stack rather than of what the Pull Request is based on,
-/// because the two answer different questions. A Pull Request keeps whatever
-/// base branch it was given until something moves it, so a change at the bottom
-/// of what was once a stack still points at a generated base branch long after
-/// everything below it landed. That is not a change with unlanded parents, and
-/// it is unlanded parents this asks about.
-fn sits_directly_on_master(
+/// A Pull Request branch carries the whole local stack below it, so merging one
+/// from the middle of a stack puts every change under it on the master branch
+/// as well — under the middle one's title, inside the middle one's squash,
+/// while the Pull Requests those changes belong to stay open with nothing left
+/// to show. Landing them in their own right instead is what this is for: each
+/// lands as its own commit, and each Pull Request is closed by the merge that
+/// carried it.
+///
+/// It is also what GitHub does with a stack of its own. `gh stack merge <n>`
+/// merges every member up to and including the one named, and the choice it
+/// offers is how far *up* to go, never how far down. jj-spr merges them one at
+/// a time rather than through GitHub's stack merge, which is a difference of
+/// mechanism only — the account of why that endpoint is not jj-spr's to call is
+/// at the top of `impl GitHub` in `github::stacks`.
+///
+/// Which of the changes below the one being landed are still to land is asked
+/// of GitHub, one Pull Request at a time, rather than of the local chain. It
+/// cannot be read off the chain: landing does not rewrite the local changes, so
+/// one that has already landed still sits below its parent afterwards and looks
+/// exactly like one that has not. A change whose Pull Request GitHub has merged
+/// is therefore passed over — its content is on the master branch, and only the
+/// local history has yet to catch up.
+///
+/// Two shapes refuse the land instead of being passed over: a change with no
+/// Pull Request at all, and one whose Pull Request was closed without being
+/// merged. Neither has landed, and passing over either would not leave it
+/// unlanded — its commits are in the branch of every Pull Request above it, so
+/// the next merge takes them anyway. It would only land it with nothing on
+/// GitHub to say so.
+///
+/// Cherry-picked Pull Requests are the one shape this does not describe, and
+/// the caller settles that before asking: such a branch carries its change onto
+/// the master branch by itself, so nothing below it is part of the merge.
+///
+/// Where the chain starts is asked of the local stack rather than of what the
+/// Pull Request is based on, because the two answer different questions. A Pull
+/// Request keeps whatever base branch it was given until something moves it, so
+/// a change at the bottom of what was once a stack still points at a generated
+/// base branch long after everything below it landed. That is not a change with
+/// unlanded parents, and it is unlanded parents this is about.
+async fn changes_to_land(
     jj: &crate::jj::Jujutsu,
+    gh: &crate::github::GitHub,
     config: &crate::config::Config,
-    commit: &crate::jj::PreparedCommit,
-) -> Result<bool> {
-    Ok(jj.get_master_base_for_commit(config, commit.oid)? == commit.parent_oid)
+    commit: crate::jj::PreparedCommit,
+) -> Result<Vec<crate::jj::PreparedCommit>> {
+    let master_base = jj.get_master_base_for_commit(config, commit.oid)?;
+
+    // Sitting directly on the master branch, with nothing of its own below it
+    // that has not landed.
+    if master_base == commit.parent_oid {
+        return Ok(vec![commit]);
+    }
+
+    // Oldest first, which is the order they have to land in.
+    let chain = jj.get_prepared_commits_from_to(
+        config,
+        &format!("{}", master_base),
+        &format!("{}", commit.oid),
+        false,
+    )?;
+
+    // The check above says there is something below this change, so the revset
+    // cannot have come back empty; this only spares the arithmetic below an
+    // underflow if it ever does.
+    let Some(asked_for) = chain.len().checked_sub(1) else {
+        return Ok(vec![commit]);
+    };
+
+    let mut to_land = Vec::with_capacity(chain.len());
+
+    for (position, change) in chain.into_iter().enumerate() {
+        // The change this land was asked for is not judged here:
+        // `land_pull_request` has its own account of what makes a Pull Request
+        // unlandable, and it words those refusals as being about the Pull
+        // Request somebody named rather than about one below it.
+        if position == asked_for {
+            to_land.push(change);
+            break;
+        }
+
+        let Some(number) = change.pull_request_number else {
+            write_commit_title(&change)?;
+
+            return Err(Error::new(formatdoc!(
+                "This change is below the one being landed and has no Pull \
+                 Request. Landing that one would put this change on the \
+                 default branch too, because its Pull Request branch carries \
+                 it, and nothing on GitHub would say so. Run `jj spr diff` \
+                 over the stack first."
+            )));
+        };
+
+        let pull_request = gh.clone().get_pull_request(number).await?;
+
+        // A merged Pull Request is the only kind of closed one that has
+        // landed; `merge_commit` is what tells the two apart, since the state
+        // GitHub reports is `Closed` for both.
+        if pull_request.merge_commit.is_some() {
+            continue;
+        }
+
+        if pull_request.state != PullRequestState::Open {
+            write_commit_title(&change)?;
+
+            return Err(Error::new(formatdoc!(
+                "This change is below the one being landed, and Pull Request \
+                 #{number} was closed without being merged, so the change has \
+                 not landed. Landing the one above would put it on the default \
+                 branch anyway, because that Pull Request's branch carries it. \
+                 Take this change out of the stack, or push it again with `jj \
+                 spr diff`."
+            )));
+        }
+
+        to_land.push(change);
+    }
+
+    Ok(to_land)
 }
 
 /// How often a land that waits asks GitHub what the merge queue has done with
@@ -554,7 +661,7 @@ pub async fn land(
         .draws_the_stack()
         .then(StackSession::new);
 
-    let landed = land_pull_request(opts, jj, gh, config, &mut stacks).await;
+    let landed = land_the_stack(opts, jj, gh, config, &mut stacks).await;
 
     // What the stacks this land took apart were holding, less what has landed:
     // `land` registers nothing — only `diff` does — so every other member is
@@ -579,7 +686,109 @@ pub async fn land(
     landed.and(reported)
 }
 
-/// Land the one Pull Request `opts` names, in one of two orders.
+/// Land the Pull Request `opts` names and every one below it that has not
+/// landed, bottom first.
+///
+/// The chain is worked out once, here, before anything merges. It cannot be
+/// re-derived as the run goes: landing a Pull Request does not rewrite the
+/// local changes, so the one above it still has an unlanded parent afterwards
+/// and would look to [`changes_to_land`] exactly as it did at the start.
+///
+/// What each land in the chain needs of GitHub is settled here too, for the
+/// same reason it was settled once per land before: [`decide_landing`] asks
+/// about the master branch, which no land in this run changes, and a run
+/// refused for wanting a queue that branch does not keep must be refused before
+/// it has dissolved a stack or merged anything.
+async fn land_the_stack(
+    opts: LandOptions,
+    jj: &crate::jj::Jujutsu,
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+    stacks: &mut Option<StackSession>,
+) -> Result<()> {
+    let revision = opts.revision.as_deref().unwrap_or("@");
+    let landing_on = jj.get_prepared_commit_for_revision(config, revision)?;
+
+    // Asked here rather than left to `land_pull_request`, which asks the same
+    // thing of every change it is given. That one runs on the changes below
+    // this one first, so a land aimed at a change with no Pull Request would
+    // otherwise land those before finding out it has nothing to finish with.
+    if landing_on.pull_request_number.is_none() {
+        write_commit_title(&landing_on)?;
+
+        return Err(Error::new("This commit does not refer to a Pull Request."));
+    }
+
+    // A cherry-picked Pull Request carries its change onto the master branch by
+    // itself, so there is nothing under it to land — see [`changes_to_land`].
+    // The flag is read here rather than per change because it names the
+    // revision this land was asked for, and saying it of that revision's
+    // ancestors would claim something about them nobody said.
+    let changes = if resolve_cherry_pick(opts.cherry_pick, &landing_on.message) {
+        vec![landing_on]
+    } else {
+        changes_to_land(jj, gh, config, landing_on).await?
+    };
+
+    let landing = decide_landing(
+        gh,
+        config,
+        resolve_land_strategy(opts.queue, opts.no_queue, config.land_strategy),
+    )
+    .await?;
+
+    if changes.len() > 1 {
+        // A queued land hands the merging to GitHub and returns, so the next
+        // Pull Request in the chain would be asked to merge onto a master
+        // branch its parent has not reached yet — GitHub would refuse it, or
+        // worse, merge it and take the unlanded parent's commits along. Waiting
+        // is the only way to land a chain through a queue, so a run that will
+        // not wait is refused here rather than part way up.
+        if let Landing::Queue(_) = landing
+            && !opts.wait
+        {
+            return Err(Error::new(formatdoc!(
+                "Landing this Pull Request means landing the {} below it \
+                 first, and the default branch has a merge queue: each one has \
+                 to be merged before the next can be queued. Pass --wait to \
+                 stay until the queue has merged each of them, or land the \
+                 Pull Requests below this one yourself.",
+                if changes.len() == 2 {
+                    "one".to_string()
+                } else {
+                    (changes.len() - 1).to_string()
+                },
+            )));
+        }
+
+        output(
+            "🪜",
+            &format!(
+                "Landing {} Pull Requests, bottom first: {}",
+                changes.len(),
+                changes
+                    .iter()
+                    .filter_map(|change| change.pull_request_number)
+                    .map(|number| format!("#{}", number))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        )?;
+    }
+
+    // Stops at the first land that fails, leaving what has already landed
+    // landed. There is no putting those back, and the ones above them are no
+    // worse off than they were: each is still open, still based on what it was,
+    // and still lands with `jj spr land` once whatever refused this one is
+    // dealt with.
+    for change in changes {
+        land_pull_request(&opts, jj, gh, config, stacks, &landing, change).await?;
+    }
+
+    Ok(())
+}
+
+/// Land one Pull Request, in one of two orders.
 ///
 /// Which order depends on where the Pull Request already sits, and the
 /// difference is what a refused land costs:
@@ -605,21 +814,21 @@ pub async fn land(
 /// The Pull Requests a dissolved stack left loose are *not* reported here —
 /// [`land`] does that from `stacks`, so that they are named however this
 /// returns.
+///
+/// One of possibly several: [`land_the_stack`] calls this for each change it
+/// has to land, bottom first, and everything here is about the one it was
+/// given. `stacks` is what carries the run as a whole between them, so that a
+/// stack dissolved for one land is not dissolved again for the next and every
+/// Pull Request the run merged is accounted for at the end.
 async fn land_pull_request(
-    mut opts: LandOptions,
+    opts: &LandOptions,
     jj: &crate::jj::Jujutsu,
     gh: &crate::github::GitHub,
     config: &crate::config::Config,
     stacks: &mut Option<StackSession>,
+    landing: &Landing,
+    prepared_commit: crate::jj::PreparedCommit,
 ) -> Result<()> {
-    let revision = opts.revision.as_deref().unwrap_or("@");
-    let prepared_commit = jj.get_prepared_commit_for_revision(config, revision)?;
-
-    // Honor both the --cherry-pick flag and the "Cherry Pick:" marker on the
-    // commit description. When the validation TODO below is filled in, use
-    // opts.cherry_pick as the authoritative source.
-    opts.cherry_pick = resolve_cherry_pick(opts.cherry_pick, &prepared_commit.message);
-
     write_commit_title(&prepared_commit)?;
 
     let pull_request_number = if let Some(number) = prepared_commit.pull_request_number {
@@ -663,38 +872,12 @@ async fn land_pull_request(
     .await
     .reword("git fetch failed".to_string())?;
 
-    // What this land is going to ask for, settled before it changes anything on
-    // GitHub. Nothing below this changes the answer, and a land refused for
-    // wanting a queue the default branch does not keep should be refused before
-    // it has dissolved a stack or moved a base.
-    let landing = decide_landing(
-        gh,
-        config,
-        resolve_land_strategy(opts.queue, opts.no_queue, config.land_strategy),
-    )
-    .await?;
-
-    // Retargeting a Pull Request at the master branch says it is to be merged
-    // into that branch as it stands. Where the local change has parents that
-    // have not landed, what that merges is this change *and* those parents,
-    // because the Pull Request branch carries them.
-    //
-    // Said only of a queued land, and as a warning rather than a refusal.
-    // Nothing about the merge is different — a merged land has moved the base
-    // for the same reason since long before there was a queue — but a queued
-    // one is answered by GitHub minutes or hours later, by which time there is
-    // nothing left to read the wrong ordering off, so it is worth saying at the
-    // one moment somebody is watching.
-    if let Landing::Queue(_) = landing
-        && !sits_directly_on_master(jj, config, &prepared_commit)?
-    {
-        output(
-            "⚠️",
-            "This change has parents that have not landed. Queueing this Pull \
-             Request asks the merge queue to merge those parents' commits along \
-             with it. Land the Pull Requests below this one first to avoid that.",
-        )?;
-    }
+    // Nothing here asks whether the local change has parents that have not
+    // landed, and there used to be a warning that did. [`land_the_stack`] lands
+    // them, so by the time this runs for a change with unlanded parents, those
+    // parents are what the run has just put on the master branch — and the one
+    // shape where they are not, a cherry-picked Pull Request, is the one whose
+    // branch does not carry them either.
 
     // TODO: Implement Jujutsu-native cherry-pick and merge validation
     // For now, we'll trust GitHub's merge validation and skip local validation

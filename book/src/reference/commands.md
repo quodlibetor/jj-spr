@@ -96,7 +96,23 @@ jj spr land -r <change-id>
 jj spr land --cherry-pick -r <change-id>
 ```
 
-**Stacks:** Landing a pull request retargets the pull requests stacked on top of
+**Stacks:** Landing a pull request lands every pull request below it that has
+not landed, bottom first, and then that one. A pull request branch carries the
+local stack under it, so merging one from the middle of a stack on its own would
+put all of those changes on the default branch inside a single squash under a
+single title, and leave their pull requests open with nothing left to show.
+Landing them in their own right gives one commit per pull request, and closes
+each one with the merge that carried it — the same thing GitHub's own
+`gh stack merge` does with a stack. jj-spr says which pull requests a land is
+going to merge before it starts.
+
+A change below the one you asked for that has no pull request refuses the land:
+passing over it would not leave it unlanded — the branch above carries it — it
+would only land it with nothing on GitHub to say so. Run `jj spr diff` over the
+stack first. A pull request pushed with `--cherry-pick` carries its change onto
+the default branch by itself, so landing one lands nothing below it.
+
+Landing a pull request also retargets the pull requests stacked on top of
 it at the default branch, so the rest of the stack is ready to land without
 another `jj spr diff`. The base branches they pointed at are deleted, except
 under [`spr.baseStrategy = linear`](configuration.md#basestrategy), where what
@@ -124,13 +140,14 @@ moving it is what needs the stack gone, so there a refusal still costs the
 stack.
 
 Landing deliberately does *not* take GitHub up on that stack merge
-(`PUT /pulls/{n}/merge-async`), which closes every pull request below the one
-you asked for as merged. More seriously, GitHub follows that merge by rebasing
-the head branch of the pull request *above* onto its new base, and the branches
-jj-spr pushes are merge commits that a rebase discards: the branch collapses
-onto its base and GitHub closes the pull request as having no changes, review
-and all. For the same reason, do not merge a stacked pull request from GitHub's
-own interface.
+(`PUT /pulls/{n}/merge-async`), and not because of what it lands: merging
+everything below the pull request you asked for is right, and `jj spr land`
+does it too. The reason is what GitHub does afterwards. It rebases the head
+branch of the pull request *above* onto its new base, and the branches jj-spr
+pushes are merge commits that a rebase discards: the branch collapses onto its
+base and GitHub closes the pull request as having no changes, review and all.
+For the same reason, do not merge a stacked pull request from GitHub's own
+interface.
 
 **Important:** After landing, you must manually rebase your working copy:
 ```bash
@@ -157,6 +174,12 @@ sees as orphans once GitHub has closed the pull request.
 request, then deletes the branches and fetches what landed, the way a
 squash-merging land does. It waits for as long as the queue takes, and stopping
 it leaves the pull request queued.
+
+Landing a pull request with unlanded ones below it needs `--wait` where the
+default branch has a queue, and is refused without it. Each pull request has to
+be merged before the next can be queued, so a land that will not wait cannot
+reach the second one — it is refused up front rather than part way up the
+stack.
 
 ```bash
 # Queue the PR and return

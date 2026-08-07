@@ -454,6 +454,30 @@ impl Scratch {
         .is_empty()
     }
 
+    /// What `branch` points at on the remote right now.
+    ///
+    /// Asked of the remote rather than of the pull request that has the branch
+    /// as its head, because the two do not agree straight after a push: GitHub
+    /// updates a pull request's `head.sha` lazily, and a test that reads it
+    /// immediately gets the value from before the push perhaps one run in
+    /// three. Observed against the live API on 2026-08-06, `head.sha`
+    /// unchanged while `ls-remote` already had the new commit. The branch is
+    /// the thing under test wherever this is used, so there is nothing to be
+    /// gained by asking the slower of the two.
+    fn remote_branch_sha(&self, branch: &str) -> String {
+        let listing = run(
+            "git",
+            &["ls-remote", "--heads", "origin", branch],
+            self.path(),
+        );
+
+        listing
+            .split_whitespace()
+            .next()
+            .unwrap_or_else(|| panic!("branch {branch} is not on the remote"))
+            .to_owned()
+    }
+
     fn repo_arg(&self) -> String {
         format!("{}/{}", self.target.owner, self.target.repo)
     }
@@ -871,7 +895,17 @@ fn amending_below_a_linear_pull_request_only_moves_branches_forward() {
 
     let prs = scratch.push_stack(&["e2e linearff bottom", "e2e linearff top"]);
     let (bottom, top) = (prs[0], prs[1]);
-    let before: Vec<String> = prs.iter().map(|n| scratch.pr_head_sha(*n)).collect();
+
+    // Both branches are read off the remote rather than off the pull requests
+    // that have them as their heads — see `remote_branch_sha`. Reading
+    // `head.sha` here made this test fail perhaps one run in three, reporting
+    // the bottom branch as `identical` when `ls-remote` already had the new
+    // commit: GitHub had not caught up, and nothing had been rewritten.
+    let branches: Vec<String> = prs.iter().map(|n| scratch.pr_head_branch(*n)).collect();
+    let before: Vec<String> = branches
+        .iter()
+        .map(|branch| scratch.remote_branch_sha(branch))
+        .collect();
 
     // Amend the change at the bottom, which is what the one above is based on.
     run("jj", &["edit", "@-"], scratch.path());
@@ -886,12 +920,13 @@ fn amending_below_a_linear_pull_request_only_moves_branches_forward() {
         scratch.path(),
     );
 
-    for (number, before) in prs.iter().zip(&before) {
-        let after = scratch.pr_head_sha(*number);
+    for ((number, branch), before) in prs.iter().zip(&branches).zip(&before) {
+        let after = scratch.remote_branch_sha(branch);
         assert_eq!(
             scratch.compare(before, &after),
             "ahead",
-            "PR #{number}'s branch was rewritten rather than moved forward"
+            "PR #{number}'s branch was rewritten rather than moved forward \
+             ({branch}: {before} -> {after})"
         );
     }
 
@@ -1187,20 +1222,26 @@ fn retargeting_a_pull_request_in_a_github_stack_takes_it_out_of_the_stack() {
     );
 }
 
-/// Landing a pull request a GitHub stack holds takes the stack apart first and
-/// merges that pull request on its own, leaving the ones above it open, still
+/// Landing a pull request a GitHub stack holds takes the stack apart first,
+/// merges it and the ones below it, and leaves the ones above open, still
 /// carrying their own changes, and pointed at the default branch.
 ///
 /// Only GitHub can show this, and only against a stack GitHub is holding. This
 /// test is mostly about what did *not* happen: the alternative — merging
 /// through the stack, which is what GitHub's API is for — passes every local
 /// test and then destroys the pull request above, for the reasons set out at
-/// the top of `impl GitHub` in `github::stacks`. A stack of three, landing the
-/// middle, is the smallest
-/// shape that has both a pull request the stack merge would have dragged in and
-/// one it would have destroyed.
+/// the top of `impl GitHub` in `github::stacks`.
+///
+/// So the difference from GitHub's stack merge was never that nothing below
+/// lands. Both land everything below, and that is right. The difference is
+/// entirely above: jj-spr leaves those pull requests open, with their branches,
+/// their diffs and their reviews, where the stack merge rebases the next one
+/// onto its new base and collapses it.
+///
+/// A stack of three, landing the middle, is the smallest shape that has both a
+/// pull request below to be landed with it and one above to be left standing.
 #[test]
-fn landing_a_pull_request_in_a_github_stack_leaves_the_rest_of_the_stack_alone() {
+fn landing_a_pull_request_in_a_github_stack_leaves_the_ones_above_it_alone() {
     let Some(target) = target() else {
         eprintln!("skipping: set E2E_TEST_REPO to run");
         return;
@@ -1253,25 +1294,17 @@ fn landing_a_pull_request_in_a_github_stack_leaves_the_rest_of_the_stack_alone()
         "PR #{middle} should have been merged"
     );
 
-    // The whole point: only the pull request that was asked for.
-    assert_eq!(
-        scratch.pr_state(bottom),
-        "open",
-        "landing PR #{middle} must not close PR #{bottom} below it"
-    );
+    // The pull request below is landed in its own right rather than having its
+    // content dragged along inside this one's squash. Under the linear base
+    // strategy PR #{middle}'s head carries the whole stack's tree, so its
+    // changes were going to reach the default branch either way; merging it as
+    // its own pull request is what closes it, deletes its branch, and puts its
+    // change on the default branch under its own title.
     assert_eq!(
         scratch.pr_field(bottom, ".merged"),
-        "false",
-        "landing PR #{middle} must not merge PR #{bottom} below it"
+        "true",
+        "landing PR #{middle} had to land PR #{bottom} below it, whose change its branch carries"
     );
-    // Its *content* does land with PR #{middle} — under the linear base
-    // strategy that pull request's head carries the whole stack's tree, so the
-    // squash commit on the default branch holds both changes. GitHub still
-    // reports PR #{bottom} as changing its own file, because it compares
-    // against the merge base rather than against the branch tip. So the
-    // difference from GitHub's stack merge is not that nothing below lands: it
-    // is that the pull requests around this one stay open, keep their branches,
-    // and keep their reviews.
 
     assert_eq!(
         scratch.pr_state(top),
@@ -1498,6 +1531,153 @@ fn squash_landing_a_github_stack_lands_one_commit_per_pull_request() {
             scratch.commit_files(sha),
             vec![slug(title)],
             "the commit {sha} that landed for {title:?} should carry that change and no other"
+        );
+    }
+}
+
+/// Landing the top of a stack lands everything under it, one commit each.
+///
+/// The behaviour this pins is the whole of why `land` walks a chain rather than
+/// merging the one pull request it was pointed at. A pull request branch
+/// carries the local stack below it, so merging the top one alone would put all
+/// three changes on the default branch inside a single squash under the top
+/// one's title, and leave the two pull requests below open with nothing left to
+/// show. Only GitHub can tell the two apart: what is being read back is the
+/// shape of the default branch after the merges, and which pull requests GitHub
+/// itself closed as merged.
+///
+/// A stack of three, landing the top in one command, is the smallest shape
+/// where a cascade is more than one merge and the order of the merges matters.
+/// It runs without `spr.githubStacks`, because nothing here is about GitHub's
+/// stacks — a stack of jj-spr's own is enough to have unlanded parents.
+#[test]
+fn landing_the_top_of_a_stack_lands_the_pull_requests_below_it_first() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "cascadeland");
+
+    // The tag keeps this run's commits off every earlier run's: what this test
+    // merges stays on the default branch, and a change that adds a file that is
+    // already there with the same content is empty.
+    let tag = run_tag();
+    let titles = [
+        format!("e2e cascadeland bottom {tag}"),
+        format!("e2e cascadeland middle {tag}"),
+        format!("e2e cascadeland top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+
+    let before = scratch.default_branch_sha();
+
+    // `push_stack` leaves `@` on the top of the stack, so this is the one land
+    // in question: the pull request named is the only one asked for, and the
+    // two below it are landed because `land` works out that it has to.
+    let landed = jj_spr(&["land", "-r", "@"], scratch.path());
+    assert!(
+        landed.contains(&format!(
+            "Landing 3 Pull Requests, bottom first: #{}, #{}, #{}",
+            prs[0], prs[1], prs[2]
+        )),
+        "landing PR #{} had to say it was landing the two below it first:\n{landed}",
+        prs[2]
+    );
+
+    for number in &prs {
+        assert_eq!(
+            scratch.pr_field(*number, ".merged"),
+            "true",
+            "PR #{number} should have been merged by a land asked only for #{}",
+            prs[2]
+        );
+    }
+
+    let landed_commits = scratch.commits_landed_since(&before);
+    assert_eq!(
+        landed_commits.len(),
+        titles.len(),
+        "landing the top of a stack of {} should put one commit on the default branch per pull \
+         request, not one squash carrying all of them, got {landed_commits:?}",
+        titles.len()
+    );
+
+    // Oldest first, which is the order they were landed in: bottom to top.
+    for (sha, title) in landed_commits.iter().zip(&titles) {
+        assert_eq!(
+            scratch.commit_files(sha),
+            vec![slug(title)],
+            "the commit {sha} that landed for {title:?} should carry that change and no other"
+        );
+    }
+}
+
+/// A change with no pull request below the one being landed refuses the land.
+///
+/// The refusal is not fussiness about tidy state: the unpushed change's commits
+/// are in the branch of the pull request above it, so a land that passed over it
+/// would put it on the default branch anyway, with no pull request to record
+/// that it went. Refusing is the only outcome that does not land something
+/// silently.
+///
+/// Pinned end to end rather than in a unit test because the fact being checked
+/// is about the local chain jj-spr reads back from Jujutsu, and the same shape
+/// is what a half-pushed stack looks like in practice.
+#[test]
+fn landing_over_a_change_with_no_pull_request_is_refused() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "cascadegap");
+
+    let tag = run_tag();
+    let titles = [
+        format!("e2e cascadegap bottom {tag}"),
+        format!("e2e cascadegap top {tag}"),
+    ];
+    let prs = scratch.push_stack(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+
+    // Slide an unpushed change in between the two, which is what a stack looks
+    // like when only part of it has been through `jj spr diff`. `@` stays on
+    // the top change, which is the one being landed.
+    let gap = format!("e2e cascadegap unpushed {tag}");
+    run(
+        "jj",
+        &["new", "-A", "@-", "-m", &describe(&gap)],
+        scratch.path(),
+    );
+    std::fs::write(scratch.path().join(slug(&gap)), &gap).unwrap();
+    run("jj", &["edit", "@+"], scratch.path());
+
+    let before = scratch.default_branch_sha();
+
+    let said = try_jj_spr(&["land", "-r", "@"], scratch.path()).expect_err(
+        "landing over a change with no pull request should be refused, not land the change",
+    );
+    // jj-spr wraps what it says to the terminal, so the sentence is matched
+    // with its own line breaks taken out rather than in fragments short enough
+    // to survive them.
+    let unwrapped = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        unwrapped.contains("is below the one being landed and has no Pull Request"),
+        "the refusal had to name the missing pull request as the reason:\n{said}"
+    );
+    assert!(
+        unwrapped.contains(&gap),
+        "the refusal had to name which change is missing a pull request:\n{said}"
+    );
+
+    assert_eq!(
+        scratch.commits_landed_since(&before),
+        Vec::<String>::new(),
+        "a refused land must not have put anything on the default branch"
+    );
+    for number in &prs {
+        assert_eq!(
+            scratch.pr_state(*number),
+            "open",
+            "PR #{number} should still be open after a refused land"
         );
     }
 }

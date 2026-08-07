@@ -13,14 +13,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The first commit in a pull reuqest now uses the local commit's description.
 - `jj spr diff` remembers when PRs were created as cherry picks so
   `--cherry-pick` doesn't need to be specified each time the PR is updated.
+- `jj spr land` lands the pull requests below the one it was asked for, bottom
+  first, instead of merging that one alone. A pull request branch carries the
+  local stack under it, so squash-merging one from the middle of a stack used to
+  put every change below it on the default branch as well — inside that one
+  squash, under that one's title — while the pull requests those changes belong
+  to stayed open with nothing left to show. Each now lands as its own commit and
+  is closed by the merge that carried it, which is also what GitHub's own
+  `gh stack merge` does with a stack. A change below the one being landed that
+  has no pull request refuses the land, because passing over it would land it
+  with nothing on GitHub to say so. A pull request pushed with `--cherry-pick`
+  carries its change on its own, so nothing below it is landed. Where the
+  default branch has a merge queue this needs `--wait`, since each pull request
+  has to be merged before the next can be queued.
 - `jj spr land` puts a pull request in the merge queue where the default branch
   has one, instead of asking for a merge GitHub would refuse. The pull request
-  is retargeted at the default branch first, as it is before a squash-merge,
-  and a land whose local change has parents that have not landed says so before
-  queueing, because the queue will merge those parents' commits too. A queued
-  land stops there: GitHub merges later, so the pull request branches are left
-  in place — the queue merges the pull request branch — and `jj spr cleanup`
-  removes them once it has. `--queue` and `--no-queue` choose for one land.
+  is retargeted at the default branch first, as it is before a squash-merge. A
+  queued land stops there: GitHub merges later, so the pull request branches are
+  left in place — the queue merges the pull request branch — and `jj spr
+  cleanup` removes them once it has. `--queue` and `--no-queue` choose for one
+  land.
 - `jj spr land --wait` stays until the merge queue has merged the pull request,
   and then deletes the branches it used and fetches what landed, the way a
   squash-merging land does. It gives up if GitHub takes the pull request out of
@@ -93,14 +105,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer about the merge at all, and moving it means dissolving the stack, so
   there the refusal still costs the stack.
 
-  It deliberately does not take that offer up. The stack merge closes every
-  pull request below the one asked for as merged and — worse — follows the
-  merge by rebasing the head branch of the pull request *above* onto its new
-  base. The branches jj-spr pushes are merge commits that a rebase discards, so
-  that branch collapses onto its base and GitHub closes the pull request as
-  having no changes, review and all. For the same reason, do not merge a
-  stacked pull request from GitHub's own interface while GitHub is drawing the
-  stack.
+  It deliberately does not take that offer up, and not because of what the
+  stack merge lands: merging everything below the pull request asked for is
+  right, and `jj spr land` does it too. The reason is what the stack merge does
+  afterwards. It rebases the head branch of the pull request *above* onto its
+  new base, and the branches jj-spr pushes are merge commits that a rebase
+  discards, so that branch collapses onto its base and GitHub closes the pull
+  request as having no changes, review and all. For the same reason, do not
+  merge a stacked pull request from GitHub's own interface while
+  GitHub is drawing the stack.
 
 - `jj spr close` works under `spr.stackDisplay = github`. Closing itself needs nothing:
   GitHub allows it while a stack holds the pull request, and keeps the closed
