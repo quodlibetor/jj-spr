@@ -188,6 +188,32 @@ impl FakeGitHub {
             .clone()
     }
 
+    /// The `Stack` section of a pull request's body, as the fake holds it, or
+    /// `None` where the body carries no section.
+    ///
+    /// Read out of the body rather than out of a parsed field, because the body
+    /// is what GitHub stores and what a reviewer sees — a section that renders
+    /// wrong is a section that is wrong.
+    fn stack_section_of(&self, number: u64) -> Option<String> {
+        let sections = self
+            .state
+            .borrow()
+            .pull_requests
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+            .unwrap_or_else(|| panic!("the fake should hold PR #{number}"))
+            .sections
+            .clone();
+
+        // Rendered and re-parsed rather than read straight out of the map, so
+        // that a section which survives the map but not the body — the round
+        // trip a reviewer actually sees — fails here.
+        let body = jj_spr::message::build_github_body(&sections);
+        jj_spr::message::parse_message(&body, jj_spr::message::MessageSection::Summary)
+            .get(&jj_spr::message::MessageSection::Stack)
+            .cloned()
+    }
+
     fn head_of(&self, number: u64) -> String {
         self.state
             .borrow()
@@ -529,6 +555,16 @@ impl GitHubApi for FakeGitHub {
                 }
                 if let Some(state) = updates.state.clone() {
                     pull_request.state = state;
+                }
+                // GitHub stores the body, not the sections jj-spr parsed it
+                // from, so a body written here has to be read back the way
+                // `get_pull_request` reads one — otherwise a section that only
+                // survives in the map would look like it had been written.
+                if let Some(body) = updates.body.clone() {
+                    pull_request.sections = jj_spr::message::parse_message(
+                        &body,
+                        jj_spr::message::MessageSection::Summary,
+                    );
                 }
             }
 
@@ -2260,4 +2296,129 @@ async fn closing_in_a_stack_dissolves_it_before_retargeting() {
         unstacked < retargeted,
         "the stack has to go before a base moves: {calls:?}"
     );
+}
+
+/// The section names every pull request in the stack, top-down the way a stack
+/// is drawn, and marks the one whose body it is.
+#[tokio::test]
+async fn the_stack_section_lists_the_stack_and_marks_the_pull_request_being_read() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Synthetic, StackDisplay::Section);
+    let gh = local.github(&config);
+
+    local.stack(&["bottom", "middle", "top"]);
+    local
+        .diff(&gh, &config)
+        .await
+        .expect("the diff should succeed");
+
+    // Asserted by content rather than byte-for-byte: the delimiters and the
+    // preamble around the list are the marker change's business, not this one's.
+    for (number, expected) in [
+        (1, "- #3\n- #2\n- #1 <- you are here"),
+        (2, "- #3\n- #2 <- you are here\n- #1"),
+        (3, "- #3 <- you are here\n- #2\n- #1"),
+    ] {
+        let section = gh
+            .stack_section_of(number)
+            .unwrap_or_else(|| panic!("PR #{number} should carry a stack section"));
+
+        assert!(
+            section.contains(expected),
+            "PR #{number} should list the stack top-down and mark itself, but reads:\n{section}"
+        );
+    }
+}
+
+/// A stack of one is not a stack: a list with a single entry says nothing the
+/// pull request does not already say, so there is no section at all.
+#[tokio::test]
+async fn a_lone_pull_request_gets_no_stack_section() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Synthetic, StackDisplay::Section);
+    let gh = local.github(&config);
+
+    local.stack(&["alone"]);
+    local
+        .diff(&gh, &config)
+        .await
+        .expect("the diff should succeed");
+
+    assert_eq!(gh.stack_section_of(1), None);
+}
+
+/// The section is what `spr.stackDisplay = section` selects, and nothing else
+/// writes it — this is the disjointness, seen from the outside.
+#[tokio::test]
+async fn the_other_stack_displays_write_no_section() {
+    for display in [StackDisplay::None, StackDisplay::Github] {
+        let local = Local::new();
+        let config = local.config(BaseStrategy::LinearRebase, display);
+        let gh = local.github(&config);
+
+        local.stack(&["bottom", "top"]);
+        local
+            .diff(&gh, &config)
+            .await
+            .expect("the diff should succeed");
+
+        assert_eq!(
+            gh.stack_section_of(1),
+            None,
+            "{display:?} should not write a stack section"
+        );
+        assert_eq!(gh.stack_section_of(2), None, "{display:?} likewise");
+    }
+}
+
+/// Switching away from the section takes it off the pull requests that have
+/// one, rather than leaving a list nothing updates any more. This is what makes
+/// the setting safe to change your mind about.
+#[tokio::test]
+async fn moving_off_the_section_takes_the_existing_ones_away() {
+    let local = Local::new();
+    let with_section = local.config(BaseStrategy::LinearRebase, StackDisplay::Section);
+    let gh = local.github(&with_section);
+
+    local.stack(&["bottom", "top"]);
+    local
+        .diff(&gh, &with_section)
+        .await
+        .expect("the diff should succeed");
+    assert!(
+        gh.stack_section_of(1).is_some(),
+        "the first run should have written a section to take away"
+    );
+
+    let without = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    local
+        .diff(&gh, &without)
+        .await
+        .expect("the second diff should succeed");
+
+    assert_eq!(gh.stack_section_of(1), None);
+    assert_eq!(gh.stack_section_of(2), None);
+}
+
+/// A pull request pushed as a cherry-pick carries its change alone and is based
+/// straight on the master branch, so the run's pull requests may or may not be
+/// stacked on each other. There is no one shape to describe, so none is.
+#[tokio::test]
+async fn a_cherry_picked_run_writes_no_stack_section() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Synthetic, StackDisplay::Section);
+    let gh = local.github(&config);
+
+    local.stack(&["bottom", "top"]);
+    local
+        .diff_with(
+            &gh,
+            &config,
+            &["--all", "-r", "trunk()..@", "--cherry-pick"],
+        )
+        .await
+        .expect("the diff should succeed");
+
+    assert_eq!(gh.stack_section_of(1), None);
+    assert_eq!(gh.stack_section_of(2), None);
 }
