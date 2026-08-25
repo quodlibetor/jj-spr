@@ -453,6 +453,30 @@ impl Scratch {
         answer
     }
 
+    /// Wait until GitHub reports pull request `number` in state `want`, and
+    /// panic if it never does.
+    ///
+    /// Closing a pull request because a branch went away is something GitHub
+    /// does a moment after the deletion rather than as part of it, so a test
+    /// that reads the state straight afterwards reads the state from before.
+    /// Polled rather than slept through for the same reason `pr_merge_state`
+    /// polls: the wait is usually one round and the cap is only there so a
+    /// failure is a failure rather than a hang.
+    fn wait_for_pr_state(&self, number: u64, want: &str) {
+        for _ in 0..20 {
+            if self.pr_state(number) == want {
+                return;
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        panic!(
+            "Pull Request #{number} should be {want}, and is {}",
+            self.pr_state(number)
+        );
+    }
+
     /// The commit the default branch is at right now.
     fn default_branch_sha(&self) -> String {
         run(
@@ -1824,6 +1848,11 @@ fn contract_test_for(rule: GitHubRule) -> &'static str {
         GitHubRule::SquashMergeLandsOneCommit => {
             "squash_landing_a_github_stack_lands_one_commit_per_pull_request"
         }
+        GitHubRule::ReopeningNeedsTheRefsBack
+        | GitHubRule::AResurrectedBaseRefNeedsNoParticularCommit
+        | GitHubRule::AClosedPullRequestsBaseCannotMove => {
+            "a_closed_pull_request_needs_its_branches_back_before_it_reopens"
+        }
     }
 }
 
@@ -1844,6 +1873,222 @@ fn every_github_rule_has_a_contract_test() {
             "{rule:?} names `{name}` as the test that pins it, and this file has no such test"
         );
     }
+}
+
+/// The three rules a repair of a closed pull request rests on, in the order they
+/// bite.
+///
+/// One test for all three because they are one situation: a branch in the middle
+/// of a chain goes, and what it takes to put back what it closed is the question.
+/// Splitting them would mean building the same wreckage three times, at forty
+/// seconds a go, to ask three thirds of one question.
+///
+/// Asked of GitHub directly rather than through jj-spr, as the other contract
+/// tests are. `reopen`'s whole order — branch back, reopen, unstack, retarget —
+/// is derived from these, and a test that watched jj-spr go in that order would
+/// pass just as well if GitHub had allowed any other.
+#[test]
+fn a_closed_pull_request_needs_its_branches_back_before_it_reopens() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "reopen");
+    // A linear stack, so the top pull request's base really is the bottom one's
+    // head branch and one deletion takes out both — which is what makes one of
+    // them the "lost its base" case and the other the "lost its own branch"
+    // case, without having to build two wrecks.
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let prs = scratch.push_stack(&["reopen bottom", "reopen top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    let shared = scratch.pr_head_branch(bottom);
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        shared,
+        "a linear stack should base the top pull request on the bottom one's branch"
+    );
+    let head_was_at = scratch.remote_branch_sha(&shared);
+
+    // The wreckage a merge queue leaves when it deletes a landed branch before it
+    // has retargeted what sits on it.
+    run(
+        "git",
+        &["push", "origin", "--delete", &shared],
+        scratch.path(),
+    );
+
+    scratch.wait_for_pr_state(bottom, "closed");
+    scratch.wait_for_pr_state(top, "closed");
+
+    // GitHubRule::AClosedPullRequestsBaseCannotMove — so the tempting shortcut,
+    // moving the base out of the way and reopening afterwards, is not available.
+    // A different refusal from the stack's lock on a base: there is no stack here
+    // at all.
+    let refusal = scratch.api_fails(&[
+        "--method",
+        "PATCH",
+        &format!("repos/{}/pulls/{top}", scratch.repo_arg()),
+        "-f",
+        &format!("base={}", scratch.default_branch()),
+    ]);
+    assert!(
+        refusal.contains("closed"),
+        "GitHub should refuse to move a closed pull request's base: {refusal}"
+    );
+
+    // GitHubRule::ReopeningNeedsTheRefsBack — and the refusal names the branch,
+    // which is the whole of it. Nothing about the pull request itself is wrong.
+    let refusal = scratch.api_fails(&[
+        "--method",
+        "PATCH",
+        &format!("repos/{}/pulls/{top}", scratch.repo_arg()),
+        "-f",
+        "state=open",
+    ]);
+    assert!(
+        refusal.contains(&shared),
+        "the refusal should name the branch that is missing: {refusal}"
+    );
+
+    // GitHubRule::AResurrectedBaseRefNeedsNoParticularCommit, the base half: the
+    // branch goes back at the tip of the default branch, which is emphatically
+    // not where it was, and the pull request reopens anyway.
+    let elsewhere = scratch.remote_branch_sha(&scratch.default_branch());
+    assert_ne!(
+        elsewhere, head_was_at,
+        "the test needs a commit that is not where the branch was"
+    );
+    run(
+        "git",
+        &[
+            "push",
+            "origin",
+            &format!("{elsewhere}:refs/heads/{shared}"),
+        ],
+        scratch.path(),
+    );
+
+    run(
+        "gh",
+        &[
+            "api",
+            "--method",
+            "PATCH",
+            &format!("repos/{}/pulls/{top}", scratch.repo_arg()),
+            "-f",
+            "state=open",
+        ],
+        scratch.path(),
+    );
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "a pull request that lost its base should reopen once any commit is at that ref"
+    );
+
+    // And the head half, off the same restored branch: for the pull request whose
+    // *own* branch this was, the commit is the wrong one, and that is refused.
+    let refusal = scratch.api_fails(&[
+        "--method",
+        "PATCH",
+        &format!("repos/{}/pulls/{bottom}", scratch.repo_arg()),
+        "-f",
+        "state=open",
+    ]);
+    assert!(
+        refusal.contains("force-pushed") || refusal.contains("recreated"),
+        "a head branch back at the wrong commit should be refused for that reason: {refusal}"
+    );
+
+    // Put it back where it was and the very same request goes through, which is
+    // what says the refusal was about the commit and not about the pull request.
+    run(
+        "git",
+        &[
+            "push",
+            "--force",
+            "origin",
+            &format!("{head_was_at}:refs/heads/{shared}"),
+        ],
+        scratch.path(),
+    );
+
+    run(
+        "gh",
+        &[
+            "api",
+            "--method",
+            "PATCH",
+            &format!("repos/{}/pulls/{bottom}", scratch.repo_arg()),
+            "-f",
+            "state=open",
+        ],
+        scratch.path(),
+    );
+    assert_eq!(
+        scratch.pr_state(bottom),
+        "open",
+        "a head branch back at the recorded commit should reopen the pull request"
+    );
+}
+
+/// `jj spr diff` puts back a pull request GitHub closed when its base branch was
+/// deleted out from under it.
+///
+/// The repair end to end against the real thing, and the reason it exists: a
+/// merge queue that deletes a landed branch before it has retargeted what sits on
+/// it leaves the pull request above closed, and until now the next `diff` refused
+/// to touch it.
+#[test]
+fn diff_puts_back_a_pull_request_closed_when_its_base_branch_was_deleted() {
+    let Some(target) = target() else {
+        eprintln!("skipping: set E2E_TEST_REPO to run");
+        return;
+    };
+    let scratch = Scratch::new(target, "reopendiff");
+    scratch.set_config("spr.baseStrategy", "linear");
+
+    let prs = scratch.push_stack(&["repair bottom", "repair top"]);
+    let (bottom, top) = (prs[0], prs[1]);
+
+    let shared = scratch.pr_head_branch(bottom);
+    run(
+        "git",
+        &["push", "origin", "--delete", &shared],
+        scratch.path(),
+    );
+    scratch.wait_for_pr_state(top, "closed");
+
+    // The change below is gone the way a landed one is, leaving one change on the
+    // trunk whose pull request is closed for no reason of its own.
+    run("jj", &["abandon", "@-"], scratch.path());
+    jj_spr(&["diff", "-r", "@", "-m", "put back"], scratch.path());
+
+    assert_eq!(
+        scratch.pr_state(top),
+        "open",
+        "diff should have put the pull request back"
+    );
+    assert_eq!(
+        scratch.pr_base_branch(top),
+        scratch.default_branch(),
+        "and retargeted it onto the branch its change now sits on"
+    );
+    assert!(
+        !scratch.remote_has_branch(&shared),
+        "the branch diff put back in order to reopen the pull request is a \
+         scaffold, and should be gone again"
+    );
+
+    // The pull request whose own branch went is a different loss, and diff says
+    // so rather than pretending otherwise: nothing here reopens it.
+    assert_eq!(
+        scratch.pr_state(bottom),
+        "closed",
+        "a pull request whose own branch is gone is not repairable and stays closed"
+    );
 }
 
 /// A stack owns its members' base refs: GitHub refuses to move one while the

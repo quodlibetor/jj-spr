@@ -86,6 +86,19 @@ pub fn base_branch_to_take_away<'a>(
 /// Taking the pull request below out of the stack — landing it or closing it —
 /// makes that base branch obsolete, and under a linear `spr.baseStrategy` also
 /// doomed, since it is the head branch of the pull request below.
+/// A closed, unmerged pull request and the two branches it names.
+///
+/// Enough to ask whether it is closed because a branch went missing, and no
+/// more: `cleanup` walks every closed pull request in the repository, and
+/// fetching each one in full to find the few that are broken would be a request
+/// per pull request for a question two branch names answer.
+#[derive(Debug, Clone)]
+pub struct ClosedPullRequest {
+    pub number: u64,
+    pub head: GitHubBranch,
+    pub base: GitHubBranch,
+}
+
 #[derive(Debug, Clone)]
 pub struct StackedPullRequest {
     pub number: u64,
@@ -343,6 +356,14 @@ pub struct PullRequestMergeabilityQuery;
     response_derives = "Debug"
 )]
 pub struct OpenPullRequestBranchesQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/closed_pull_requests.graphql",
+    response_derives = "Debug"
+)]
+pub struct ClosedPullRequestsQuery;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -775,11 +796,89 @@ impl GitHub {
             .await
     }
 
+    /// Reopen pull request `number`.
+    ///
+    /// Sends `state` and nothing else, which is not fussiness: an update
+    /// carrying a `base` is refused outright while a stack holds the pull
+    /// request (`GitHubRule::StackLocksBaseRefs`), and refused again while the
+    /// pull request is closed (`GitHubRule::AClosedPullRequestsBaseCannotMove`),
+    /// so a reopen that took the opportunity to fix the base as well would fail
+    /// for both reasons at once and reopen nothing.
+    ///
+    /// Both refs the pull request names have to be on the remote before this
+    /// will do anything — `GitHubRule::ReopeningNeedsTheRefsBack`. See
+    /// [`crate::reopen`], which is what puts them back.
+    pub async fn reopen_pull_request(&self, number: u64) -> Result<()> {
+        self.update_pull_request(
+            number,
+            PullRequestUpdate {
+                state: Some(PullRequestState::Open),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Whether the remote has `branch`.
+    ///
+    /// Asked of the remote rather than of a remote-tracking ref, because the
+    /// question is only ever asked about a branch something is suspected to have
+    /// deleted, and a remote-tracking ref is exactly what goes on claiming such
+    /// a branch is there.
+    pub async fn remote_branch_exists(&self, branch: &GitHubBranch) -> Result<bool> {
+        let output = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.repo_path)
+            .arg("ls-remote")
+            .arg("--exit-code")
+            .arg("--heads")
+            .arg("--")
+            .arg(&self.config.remote_name)
+            .arg(branch.on_github())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await?;
+
+        Ok(output.status.success())
+    }
+
+    /// Put `branch` on the remote at `oid`.
+    ///
+    /// Not a force push: this is for a branch that is not supposed to be there,
+    /// so one that turns out to be there is somebody else's and the push failing
+    /// is the right answer.
+    pub async fn create_remote_branch(&self, branch: &GitHubBranch, oid: git2::Oid) -> Result<()> {
+        let output = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.repo_path)
+            .arg("push")
+            .arg("--no-verify")
+            .arg("--")
+            .arg(&self.config.remote_name)
+            .arg(format!("{}:{}", oid, branch.on_github()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(Error::new(format!(
+                "Could not create {} on {}: {}",
+                branch.branch_name(),
+                self.config.remote_name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Delete `branch` from the remote, reporting whether the remote had it.
     ///
     /// A failure here is not an error: the branch may have been deleted
     /// already, either by someone else or by GitHub itself.
-    async fn delete_remote_branch(&self, branch: &GitHubBranch) -> Result<bool> {
+    pub async fn delete_remote_branch(&self, branch: &GitHubBranch) -> Result<bool> {
         let output = tokio::process::Command::new("git")
             .arg("--git-dir")
             .arg(&self.repo_path)
@@ -1089,6 +1188,70 @@ impl GitHub {
                 estimated_time_to_merge: entry.estimated_time_to_merge,
             }),
         })
+    }
+
+    /// Every closed, unmerged pull request in the repository, with the branches
+    /// it names.
+    ///
+    /// `CLOSED` is not `MERGED`: GraphQL keeps them apart, where the REST API
+    /// reports both as `closed` and leaves `merged_at` to tell them apart. So
+    /// nothing here has been merged, and every one of them is a pull request
+    /// somebody either closed or lost.
+    pub async fn get_closed_pull_requests(&self) -> Result<Vec<ClosedPullRequest>> {
+        let mut closed = Vec::new();
+        let mut after: Option<String> = None;
+
+        loop {
+            let variables = closed_pull_requests_query::Variables {
+                owner: self.config.owner.clone(),
+                name: self.config.repo.clone(),
+                first: 100,
+                after: after.clone(),
+            };
+            let request_body = ClosedPullRequestsQuery::build_query(variables);
+            let res = self
+                .graphql_client
+                .post("https://api.github.com/graphql")
+                .json(&request_body)
+                .send()
+                .await?;
+            let response_body: Response<closed_pull_requests_query::ResponseData> =
+                res.json().await?;
+
+            if let Some(errors) = response_body.errors {
+                let error = Err(Error::new(
+                    "fetching closed Pull Requests failed".to_string(),
+                ));
+                return errors
+                    .into_iter()
+                    .fold(error, |err, e| err.context(e.to_string()));
+            }
+
+            let prs = response_body
+                .data
+                .ok_or_else(|| Error::new("failed to fetch closed Pull Requests"))?
+                .repository
+                .ok_or_else(|| Error::new("failed to find repository"))?
+                .pull_requests;
+
+            if let Some(nodes) = prs.nodes {
+                for node in nodes.into_iter().flatten() {
+                    closed.push(ClosedPullRequest {
+                        number: node.number as u64,
+                        head: self.config.new_github_branch(&node.head_ref_name),
+                        base: self.config.new_github_branch(&node.base_ref_name),
+                    });
+                }
+            }
+
+            if prs.page_info.has_next_page {
+                after = prs.page_info.end_cursor;
+            } else {
+                break;
+            }
+        }
+
+        Ok(closed)
     }
 
     pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {

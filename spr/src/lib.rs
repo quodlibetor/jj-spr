@@ -14,6 +14,7 @@ pub mod jj;
 pub mod message;
 pub mod native_stacks;
 pub mod output;
+pub mod reopen;
 pub mod replay;
 pub mod revision_utils;
 pub mod stacked;

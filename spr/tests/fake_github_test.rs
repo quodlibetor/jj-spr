@@ -65,6 +65,14 @@ struct FakePullRequest {
     draft: bool,
     /// The commit a merge landed this pull request as, where it has been merged.
     merged: Option<git2::Oid>,
+    /// Where the head branch was when this pull request was closed.
+    ///
+    /// GitHub will not reopen a pull request whose head branch has come back at
+    /// any other commit — `GitHubRule::AResurrectedBaseRefNeedsNoParticularCommit`,
+    /// which is one rule about two refs and this is the half that bites. Nothing
+    /// but the reopen reads it, so it is recorded only when a pull request is
+    /// closed.
+    head_oid_when_closed: Option<git2::Oid>,
 }
 
 /// One stack, as the fake holds it. Members are bottom first, and a merged one
@@ -95,6 +103,17 @@ enum Call {
     Retargeted {
         number: u64,
         to: String,
+    },
+    /// A pull request put back after a branch went missing under it. Recorded
+    /// separately from `Updated` because the whole question about a repair is
+    /// *when* it happened relative to the dissolve and the retarget, and an
+    /// `Updated` carrying no base is indistinguishable from a title change.
+    Reopened {
+        number: u64,
+    },
+    /// A branch put back so a pull request could be reopened.
+    BranchCreated {
+        branch: String,
     },
     StackCreated {
         members: Vec<u64>,
@@ -308,9 +327,41 @@ impl FakeGitHub {
         Ok(())
     }
 
-    /// Set the base of a pull request, subject to the rule above.
+    /// GitHubRule::AClosedPullRequestsBaseCannotMove — a closed pull request's
+    /// base is frozen, whether or not a stack holds it.
+    ///
+    /// Separate from the stack's lock and outliving it, which is the whole point
+    /// of reproducing it: between the two, a repair cannot move the base out of
+    /// the way and then reopen. It has to put the branch back, reopen, and only
+    /// then move the base — and a fake that refused only the stacked case would
+    /// let a jj-spr that got that order wrong pass.
+    fn refuse_a_closed_base_change(&self, number: u64) -> Result<()> {
+        let closed = self
+            .state
+            .borrow()
+            .pull_requests
+            .iter()
+            .any(|pull_request| {
+                pull_request.number == number && pull_request.state == PullRequestState::Closed
+            });
+
+        if closed {
+            return Err(self.refusal(
+                GitHubRule::AClosedPullRequestsBaseCannotMove,
+                format!(
+                    "Pull Request #{number} is closed, so its base branch cannot be \
+                     changed (this is GitHub's 422)"
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Set the base of a pull request, subject to the two rules above.
     fn set_base(&self, number: u64, base: &str) -> Result<()> {
         self.refuse_a_stacked_base_change(number)?;
+        self.refuse_a_closed_base_change(number)?;
 
         let mut state = self.state.borrow_mut();
         let pull_request = state
@@ -331,9 +382,16 @@ impl FakeGitHub {
     /// after" order in jj-spr exists for: without it here, a test would watch the
     /// branch go away and see nothing wrong with it going first.
     fn delete_branch(&self, branch: &GitHubBranch) -> bool {
+        let name = branch.branch_name().to_string();
+
+        // Read before the ref goes, because a pull request closed by losing its
+        // own branch still has to record where that branch was: that commit is
+        // the only one it can ever be reopened at.
+        let was_at = self.tip(&name);
+
         let repo = git2::Repository::open(&self.remote).expect("the remote repository");
 
-        let existed = match repo.find_reference(&format!("refs/heads/{}", branch.branch_name())) {
+        let existed = match repo.find_reference(&format!("refs/heads/{name}")) {
             Ok(mut reference) => {
                 reference.delete().expect("deleting a branch");
                 true
@@ -341,13 +399,28 @@ impl FakeGitHub {
             Err(_) => false,
         };
 
+        // Both sides, which is not a detail. A branch in the middle of a chain
+        // is one pull request's head and the next one's base, so deleting it
+        // closes *two* — and the one closed by losing its base is the one
+        // nobody meant to close and the one `crate::reopen` exists to put back.
+        // A fake that only closed the second would never produce the situation
+        // the repair is for.
         let mut state = self.state.borrow_mut();
         for pull_request in state.pull_requests.iter_mut() {
-            if pull_request.state == PullRequestState::Open
-                && pull_request.base == branch.branch_name()
-            {
-                pull_request.state = PullRequestState::Closed;
+            if pull_request.state != PullRequestState::Open {
+                continue;
             }
+
+            let head_oid = if pull_request.head == name {
+                was_at
+            } else if pull_request.base == name {
+                self.tip(&pull_request.head)
+            } else {
+                continue;
+            };
+
+            pull_request.state = PullRequestState::Closed;
+            pull_request.head_oid_when_closed = Some(head_oid);
         }
 
         existed
@@ -526,6 +599,7 @@ impl GitHubApi for FakeGitHub {
                 .unwrap_or_default(),
             sections: message.clone(),
             state: PullRequestState::Open,
+            head_oid_when_closed: None,
             draft,
             merged: None,
         });
@@ -575,6 +649,113 @@ impl GitHubApi for FakeGitHub {
         }
 
         Ok(())
+    }
+
+    /// GitHubRule::ReopeningNeedsTheRefsBack and
+    /// GitHubRule::AResurrectedBaseRefNeedsNoParticularCommit — the two rules
+    /// that fix what a repair has to do, and in what order.
+    ///
+    /// Both refs have to be on the remote, and the stack is not consulted:
+    /// GitHub reopens a stacked pull request perfectly happily, and it is only
+    /// the *base change* afterwards that a stack refuses. A fake that refused
+    /// the reopen while stacked would let a jj-spr that dissolved the stack too
+    /// early — before the reopen, when it is not needed — look correct.
+    ///
+    /// The head ref is checked for identity and the base ref only for existence,
+    /// which is the asymmetry `crate::reopen` is built on: it is what lets a
+    /// repair put a base branch back at whatever commit suits and never fetch
+    /// the one that was there.
+    async fn reopen_pull_request(&self, number: u64) -> Result<()> {
+        let pull_request = self
+            .state
+            .borrow()
+            .pull_requests
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+            .cloned()
+            .ok_or_else(|| Error::new(format!("fake GitHub: no Pull Request #{number}")))?;
+
+        let head_oid = self.tip(&pull_request.head);
+
+        if head_oid.is_zero() {
+            return Err(self.refusal(
+                GitHubRule::ReopeningNeedsTheRefsBack,
+                format!(
+                    "state cannot be changed. The {} branch has been deleted",
+                    pull_request.head
+                ),
+            ));
+        }
+
+        if self.tip(&pull_request.base).is_zero() {
+            return Err(self.refusal(
+                GitHubRule::ReopeningNeedsTheRefsBack,
+                format!(
+                    "state cannot be changed. The {} branch has been deleted",
+                    pull_request.base
+                ),
+            ));
+        }
+
+        if pull_request
+            .head_oid_when_closed
+            .is_some_and(|was| was != head_oid)
+        {
+            return Err(self.refusal(
+                GitHubRule::AResurrectedBaseRefNeedsNoParticularCommit,
+                format!(
+                    "state cannot be changed. The {} branch was force-pushed or recreated",
+                    pull_request.head
+                ),
+            ));
+        }
+
+        let mut state = self.state.borrow_mut();
+        if let Some(pull_request) = state
+            .pull_requests
+            .iter_mut()
+            .find(|pull_request| pull_request.number == number)
+        {
+            pull_request.state = PullRequestState::Open;
+            pull_request.head_oid_when_closed = None;
+        }
+
+        state.calls.push(Call::Reopened { number });
+
+        Ok(())
+    }
+
+    async fn remote_branch_exists(&self, branch: &GitHubBranch) -> Result<bool> {
+        Ok(!self.tip(branch.branch_name()).is_zero())
+    }
+
+    async fn create_remote_branch(&self, branch: &GitHubBranch, oid: git2::Oid) -> Result<()> {
+        let repo = git2::Repository::open(&self.remote).expect("the remote repository");
+
+        // Not forced, as the real one is not: a branch that is already there
+        // belongs to somebody else and the push failing is the answer.
+        repo.reference(
+            &format!("refs/heads/{}", branch.branch_name()),
+            oid,
+            false,
+            "fake GitHub: a branch put back",
+        )
+        .map_err(|error| {
+            Error::new(format!(
+                "fake GitHub: could not create {}: {error}",
+                branch.branch_name()
+            ))
+        })?;
+
+        self.state.borrow_mut().calls.push(Call::BranchCreated {
+            branch: branch.branch_name().to_owned(),
+        });
+
+        Ok(())
+    }
+
+    async fn delete_remote_branch(&self, branch: &GitHubBranch) -> Result<bool> {
+        Ok(self.delete_branch(branch))
     }
 
     async fn retarget_pull_request(
@@ -2232,6 +2413,269 @@ async fn closing_a_pull_request_retargets_the_ones_above_it_first() {
     assert!(
         closed < retargeted,
         "the close comes first, and the retarget of the one above after it: {calls:?}"
+    );
+}
+
+/// A pull request GitHub closed when its base branch was deleted is put back by
+/// the next `diff`, and the branch that was put back to do it is taken away
+/// again.
+///
+/// The situation a merge queue leaves when it deletes a landed branch before it
+/// has retargeted what sits on it. Until this, `diff` refused to touch the pull
+/// request at all and said to open a new one — which throws away the review.
+#[tokio::test]
+async fn diff_puts_back_a_pull_request_closed_by_a_deleted_base_branch() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Linear, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["repair bottom", "repair top"]);
+    local.diff(&gh, &config).await.expect("the push");
+
+    // The branch below is both the bottom pull request's head and the top one's
+    // base, so deleting it closes both — which is exactly what makes the top one
+    // a pull request nobody meant to close.
+    let shared = gh.head_of(1);
+    assert_eq!(gh.base_of(2), shared, "a linear stack chains base to head");
+    gh.delete_branch(&gh.branch(&shared));
+
+    // The change below is gone the way a landed one is, leaving one change on the
+    // trunk whose pull request is closed for no reason of its own.
+    run("jj", &["abandon", "@-"], &local.repo);
+    local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "put back"])
+        .await
+        .expect("the repair");
+
+    let pull_request = gh.get_pull_request(2).await.expect("the pull request");
+    assert_eq!(
+        pull_request.state,
+        PullRequestState::Open,
+        "the pull request should have been put back"
+    );
+    assert_eq!(
+        gh.base_of(2),
+        MASTER,
+        "and retargeted onto the branch its change now sits on"
+    );
+    assert!(
+        !local.has_branch(&shared),
+        "the branch put back to reopen it is a scaffold and should be gone: {shared}"
+    );
+
+    // And in that order. Putting the branch back is what makes the reopen
+    // possible, and the reopen is what makes the retarget possible; a repair that
+    // did any of it in another order would be refused by the rules above rather
+    // than merely look untidy.
+    let calls = gh.calls();
+    let created = calls
+        .iter()
+        .position(|call| matches!(call, Call::BranchCreated { branch } if *branch == shared))
+        .expect("the branch should have been put back");
+    let reopened = calls
+        .iter()
+        .position(|call| matches!(call, Call::Reopened { number: 2 }))
+        .expect("the pull request should have been reopened");
+    let retargeted = calls
+        .iter()
+        .position(|call| matches!(call, Call::Retargeted { number: 2, .. }))
+        .expect("the pull request should have been retargeted");
+    assert!(
+        created < reopened && reopened < retargeted,
+        "branch back, then reopen, then retarget: {calls:?}"
+    );
+}
+
+/// A dry run over a pull request closed by a deleted base branch plans the
+/// repair and makes none of it.
+///
+/// Worth its own test because the dry run cannot simply skip the work: the
+/// commit everything below is planned against is read off the base branch, and
+/// that branch is the one that is missing. So a dry run has to plan against the
+/// commit a real run would put the branch back at — and one that did not would
+/// not print a smaller plan, it would fail outright on a zero oid.
+#[tokio::test]
+async fn a_dry_run_plans_the_repair_and_changes_nothing() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Linear, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["dryrepair bottom", "dryrepair top"]);
+    local.diff(&gh, &config).await.expect("the push");
+
+    let shared = gh.head_of(1);
+    gh.delete_branch(&gh.branch(&shared));
+    run("jj", &["abandon", "@-"], &local.repo);
+
+    let calls_before = gh.calls().len();
+    local
+        .diff_with(&gh, &config, &["-r", "@", "--dry-run"])
+        .await
+        .expect("the dry run");
+
+    let pull_request = gh.get_pull_request(2).await.expect("the pull request");
+    assert_eq!(
+        pull_request.state,
+        PullRequestState::Closed,
+        "a dry run should not have reopened anything"
+    );
+    assert!(
+        !local.has_branch(&shared),
+        "and should not have put a branch back: {shared}"
+    );
+    assert_eq!(
+        gh.calls().len(),
+        calls_before,
+        "a dry run should have asked GitHub to do nothing: {:?}",
+        &gh.calls()[calls_before..]
+    );
+}
+
+/// The repair reopens the pull request *before* it dissolves the stack holding
+/// it, because the stack was never what stopped the reopen.
+///
+/// `GitHubRule::ReopeningNeedsTheRefsBack` from the side that is easy to get
+/// wrong: everything else jj-spr does to a stacked pull request needs the stack
+/// gone first, so dissolving up front looks like the safe habit. It is not — it
+/// destroys a stack a run might have left alone, and the reopen would have worked
+/// anyway.
+#[tokio::test]
+async fn a_repair_reopens_before_it_dissolves_the_stack() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&[
+        "stackrepair bottom",
+        "stackrepair middle",
+        "stackrepair top",
+    ]);
+    local.diff(&gh, &config).await.expect("the push");
+    assert_eq!(
+        gh.open_stacks().len(),
+        1,
+        "the run should have made a stack"
+    );
+
+    let shared = gh.head_of(1);
+    gh.delete_branch(&gh.branch(&shared));
+
+    run("jj", &["abandon", "@--"], &local.repo);
+    local
+        .diff_with(
+            &gh,
+            &config,
+            &["--all", "-r", "trunk()..@", "-m", "put back"],
+        )
+        .await
+        .expect("the repair");
+
+    let calls = gh.calls();
+    let reopened = calls
+        .iter()
+        .position(|call| matches!(call, Call::Reopened { number: 2 }))
+        .expect("the pull request should have been reopened");
+    let unstacked = calls
+        .iter()
+        .position(|call| matches!(call, Call::Unstacked { .. }))
+        .expect("the stack should have been dissolved to move the base");
+    let retargeted = calls
+        .iter()
+        .position(|call| matches!(call, Call::Retargeted { number: 2, .. }))
+        .expect("the pull request should have been retargeted");
+
+    assert!(
+        reopened < unstacked,
+        "the reopen needs no stack dissolved and should come first: {calls:?}"
+    );
+    assert!(
+        unstacked < retargeted,
+        "and the dissolve still has to precede the retarget: {calls:?}"
+    );
+}
+
+/// A pull request whose own branch is gone is not put back, and the run says why
+/// rather than opening a new pull request behind the reviewer's back.
+///
+/// The other half of `GitHubRule::AResurrectedBaseRefNeedsNoParticularCommit`: a
+/// head branch has to come back at the exact commit the closed pull request
+/// records, and jj-spr has no claim to still have that commit. So this is a real
+/// loss and is reported as one.
+#[tokio::test]
+async fn a_pull_request_whose_own_branch_is_gone_is_not_put_back() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Linear, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["ownbranch only"]);
+    local.diff(&gh, &config).await.expect("the push");
+
+    let head = gh.head_of(1);
+    gh.delete_branch(&gh.branch(&head));
+
+    local.write("ownbranch only", "amended");
+    let refused = local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "amended"])
+        .await
+        .expect_err("the run should refuse");
+
+    let said = refused.messages().join(" ");
+    assert!(
+        said.contains("its own branch is gone"),
+        "the refusal should say which loss this is: {said}"
+    );
+
+    let pull_request = gh.get_pull_request(1).await.expect("the pull request");
+    assert_eq!(
+        pull_request.state,
+        PullRequestState::Closed,
+        "and nothing should have reopened it"
+    );
+}
+
+/// A pull request somebody closed on purpose stays closed, and the run says so.
+///
+/// The repair is for a pull request closed *by* something, and the difference is
+/// whether the branches it names are still there. Both of this one's are, so
+/// reopening it is a decision and not a repair — and quietly making it would undo
+/// what the person who closed it asked for.
+#[tokio::test]
+async fn a_pull_request_closed_on_purpose_is_left_closed() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Linear, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["onpurpose only"]);
+    local.diff(&gh, &config).await.expect("the push");
+
+    gh.update_pull_request(
+        1,
+        PullRequestUpdate {
+            state: Some(PullRequestState::Closed),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the close");
+
+    local.write("onpurpose only", "amended");
+    let refused = local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "amended"])
+        .await
+        .expect_err("the run should refuse");
+
+    let said = refused.messages().join(" ");
+    assert!(
+        said.contains("closed deliberately"),
+        "the refusal should tell this apart from a branch going missing: {said}"
+    );
+
+    let calls = gh.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::Reopened { .. })),
+        "nothing should have been reopened: {calls:?}"
     );
 }
 

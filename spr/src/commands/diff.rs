@@ -689,7 +689,7 @@ async fn diff_impl(
     config: &crate::config::Config,
     local_commit: &mut crate::jj::PreparedCommit,
     master_base_oid: Oid,
-    pull_request: Option<PullRequest>,
+    mut pull_request: Option<PullRequest>,
     change_below: Option<&PushedChange>,
     stacks: Option<&mut StackSession>,
     stack_changes: &HashMap<u64, StackChange>,
@@ -769,31 +769,102 @@ async fn diff_impl(
         validate_commit_message(message)?;
     }
 
-    if let Some(ref pull_request) = pull_request {
-        if pull_request.state == PullRequestState::Closed {
-            return Err(Error::new(formatdoc!(
-                "Pull request is closed. If you want to open a new one, \
-                 remove the 'Pull Request' section from the commit message."
-            )));
-        }
+    // A closed pull request is not necessarily one somebody closed. Deleting a
+    // branch closes every pull request based on it
+    // (`GitHubRule::DeletingABaseBranchClosesItsPullRequests`), so a landed
+    // branch taken away before the pull requests above it were retargeted leaves
+    // one closed in the middle of a stack, with nothing wrong with it but its
+    // base. That is a repair, and `crate::reopen` is what makes it; anything
+    // else is somebody's decision and is still refused.
+    //
+    // Done here, before any of the work below reads the pull request, for two
+    // reasons that come to the same thing: everything downstream is entitled to
+    // an open pull request whose branches exist, and the oids the pull request
+    // carries are read from those branches — `get_pull_request` fetches them
+    // both in one go, so a missing base leaves *both* stale or absent, and
+    // `merge_base` on the result would fail below before the repair could
+    // happen. So the repair is made and the pull request read again, after
+    // which the run proceeds exactly as it would have had the branch never gone.
+    //
+    // `master_base_oid` is what the branch goes back at. Any commit reopens a
+    // pull request, since a resurrected base ref is checked for existence and
+    // not identity (`GitHubRule::AResurrectedBaseRefNeedsNoParticularCommit`),
+    // and that one is on the master branch — so GitHub has it, this repository
+    // has it, and the diff the pull request shows until it is retargeted is the
+    // truthful "what this branch adds to master".
+    let mut scaffold = None;
 
-        if !opts.update_message {
-            let mut pull_request_updates: PullRequestUpdate = Default::default();
-            pull_request_updates.update_message(pull_request, message);
-
-            if !pull_request_updates.is_empty() {
-                output(
-                    "⚠️",
-                    indoc!(
-                        "The Pull Request's title/message differ from the \
-                         local commit's message.
-                         Use `spr diff --update-message` to overwrite the \
-                         title and message on GitHub with the local message, \
-                         or `spr amend` to go the other way (rewrite the local \
-                         commit message with what is on GitHub)."
-                    ),
-                )?;
+    // Decided before it is acted on, because acting on it replaces the pull
+    // request this borrows.
+    let missing_base = match pull_request.as_ref() {
+        Some(closed) if closed.state == PullRequestState::Closed => {
+            match crate::reopen::diagnose(gh, closed).await? {
+                crate::reopen::Reopenable::ItsBaseBranchIsMissing => {
+                    Some((closed.number, closed.base.clone()))
+                }
+                why => return Err(crate::reopen::cannot_be_put_back(closed.number, why)),
             }
+        }
+        _ => None,
+    };
+
+    if let Some((number, base)) = missing_base {
+        if opts.dry_run {
+            output(
+                "🚑",
+                &format!(
+                    "Pull Request #{number} is closed because {} is gone from the \
+                     remote. This run would put the branch back, reopen the Pull \
+                     Request and retarget it",
+                    base.branch_name()
+                ),
+            )?;
+
+            // The branch is not on the remote, so neither is the commit read off
+            // it — and everything below works from that commit. A real run puts
+            // the branch back at `master_base_oid` before anything looks at it,
+            // so a dry run plans against the same commit or it plans against a
+            // zero oid and fails to plan at all.
+            if let Some(closed) = pull_request.as_mut() {
+                closed.base_oid = master_base_oid;
+            }
+        } else {
+            scaffold = crate::reopen::put_back(gh, number, &base, master_base_oid).await?;
+
+            output(
+                "🚑",
+                &format!(
+                    "Reopened Pull Request #{number}, which was closed when {} was \
+                     deleted out from under it",
+                    base.branch_name()
+                ),
+            )?;
+
+            // Read again rather than patched by hand: the reopen changed the
+            // state, and the branch that has just come back is what the oids on
+            // it are read from.
+            pull_request = Some(gh.get_pull_request(number).await?);
+        }
+    }
+
+    if let Some(ref pull_request) = pull_request
+        && !opts.update_message
+    {
+        let mut pull_request_updates: PullRequestUpdate = Default::default();
+        pull_request_updates.update_message(pull_request, message);
+
+        if !pull_request_updates.is_empty() {
+            output(
+                "⚠️",
+                indoc!(
+                    "The Pull Request's title/message differ from the \
+                     local commit's message.
+                     Use `spr diff --update-message` to overwrite the \
+                     title and message on GitHub with the local message, \
+                     or `spr amend` to go the other way (rewrite the local \
+                     commit message with what is on GitHub)."
+                ),
+            )?;
         }
     }
 
@@ -1321,6 +1392,24 @@ async fn diff_impl(
         // which it writes to as it did before there were base strategies. See
         // [`may_push_base_commit_to`], which draws that line.
         if let (Some(base_branch), Some(base_branch_commit)) = (&base_branch, base_branch_commit) {
+            // Where a repair put this very branch back so the pull request could
+            // be reopened, the commit it went back at was chosen to reopen the
+            // pull request and nothing else, and it has no reason to be an
+            // ancestor of the one being pushed now. Leased to the scaffold, so
+            // the force applies to the commit this run put there and to no
+            // other: a branch someone else has written to since is a rejected
+            // push, exactly as it would have been without the repair.
+            if let Some(scaffold) = scaffold
+                .as_ref()
+                .filter(|scaffold| scaffold.branch().branch_name() == base_branch.branch_name())
+            {
+                cmd.arg(format!(
+                    "--force-with-lease={}:{}",
+                    base_branch.on_github(),
+                    scaffold.at()
+                ));
+            }
+
             cmd.arg(format!(
                 "{}:{}",
                 base_branch_commit,
@@ -1381,6 +1470,15 @@ async fn diff_impl(
                 )
                 .await?;
             }
+
+            // The branch the pull request ends this run based on, named before
+            // the branches below take `base_branch` apart, because what becomes
+            // of a repair's scaffold is settled after them and by this.
+            let final_base = base_branch
+                .as_ref()
+                .unwrap_or(&config.master_ref)
+                .branch_name()
+                .to_string();
 
             if let Some(base_branch) = base_branch {
                 // We are using a base branch.
@@ -1449,6 +1547,32 @@ async fn diff_impl(
             if !pull_request_updates.is_empty() {
                 gh.update_pull_request(pull_request.number, pull_request_updates)
                     .await?;
+            }
+
+            // The branch a repair put back is the repair's to take away, and now
+            // is when it may go: the retargeting above is done and GitHub has
+            // confirmed it, so nothing points at the branch any more and taking
+            // it away closes nothing. A branch this run went on to make the
+            // pull request's real base is not a scaffold any more and stays.
+            //
+            // A run that fails between the repair and here leaves the branch
+            // behind, and deliberately so — it is the base of an open pull
+            // request by then, and taking it away would close the pull request
+            // this run has just put back. It is left for the next run to
+            // retarget off and delete, or for `jj spr cleanup` to sweep once
+            // nothing is based on it.
+            if let Some(scaffold) = scaffold.take() {
+                if scaffold.branch().branch_name() == final_base {
+                    // Kept, and deliberately not reported: the branch is where
+                    // the pull request lives now, so there is nothing left of
+                    // the repair to say.
+                } else {
+                    let name = scaffold.branch().branch_name().to_string();
+
+                    if scaffold.take_away(gh).await? {
+                        output("🗑️", &format!("Deleted {name}"))?;
+                    }
+                }
             }
         } else {
             // We are creating a new Pull Request.

@@ -114,11 +114,35 @@ pub enum GitHubRule {
     /// A squash merge puts exactly one commit on the base branch, carrying the
     /// whole of the pull request.
     SquashMergeLandsOneCommit,
+
+    /// A closed pull request cannot be reopened while either of the refs it
+    /// names is missing: the reopen is refused, naming the branch. Restoring
+    /// the ref lets the very same request through, and a stack holding the pull
+    /// request has nothing to do with it — the missing ref is the whole of the
+    /// refusal. This is why putting a pull request back starts by putting a
+    /// branch back.
+    ReopeningNeedsTheRefsBack,
+
+    /// The two refs are checked differently. A *base* ref is checked for
+    /// existence only, so any commit at all reopens the pull request — which is
+    /// what lets a repair create the branch straight at the commit the pull
+    /// request is about to be retargeted onto, and never show a diff that was
+    /// never true. A *head* ref is checked for identity: it must come back at
+    /// the commit the closed pull request still records, or the reopen is
+    /// refused for having been force-pushed or recreated.
+    AResurrectedBaseRefNeedsNoParticularCommit,
+
+    /// The base of a *closed* pull request cannot be moved at all, stack or no
+    /// stack. This is a different refusal from [`Self::StackLocksBaseRefs`] and
+    /// outlives it, and between them they fix the order a repair has to go in:
+    /// the pull request is reopened before its base is moved, and the ref is put
+    /// back before it is reopened.
+    AClosedPullRequestsBaseCannotMove,
 }
 
 impl GitHubRule {
     /// Every rule, so that a test can walk them.
-    pub const ALL: [GitHubRule; 10] = [
+    pub const ALL: [GitHubRule; 13] = [
         Self::StackLocksBaseRefs,
         Self::MergingAStackedPullRequestNeedsTheAsyncEndpoint,
         Self::MergeIsLeasedToTheHead,
@@ -129,6 +153,9 @@ impl GitHubRule {
         Self::AsyncMergeRebasesTheSurvivors,
         Self::AForcePushKeepsThePullRequestOpen,
         Self::SquashMergeLandsOneCommit,
+        Self::ReopeningNeedsTheRefsBack,
+        Self::AResurrectedBaseRefNeedsNoParticularCommit,
+        Self::AClosedPullRequestsBaseCannotMove,
     ];
 }
 
@@ -157,6 +184,22 @@ pub trait GitHubApi {
         number: u64,
         updates: PullRequestUpdate,
     ) -> impl Future<Output = Result<()>>;
+
+    /// See [`GitHub::reopen_pull_request`].
+    fn reopen_pull_request(&self, number: u64) -> impl Future<Output = Result<()>>;
+
+    /// See [`GitHub::remote_branch_exists`].
+    fn remote_branch_exists(&self, branch: &GitHubBranch) -> impl Future<Output = Result<bool>>;
+
+    /// See [`GitHub::create_remote_branch`].
+    fn create_remote_branch(
+        &self,
+        branch: &GitHubBranch,
+        oid: git2::Oid,
+    ) -> impl Future<Output = Result<()>>;
+
+    /// See [`GitHub::delete_remote_branch`].
+    fn delete_remote_branch(&self, branch: &GitHubBranch) -> impl Future<Output = Result<bool>>;
 
     /// See [`GitHub::retarget_pull_request`].
     fn retarget_pull_request(
@@ -269,6 +312,22 @@ impl GitHubApi for GitHub {
 
     async fn update_pull_request(&self, number: u64, updates: PullRequestUpdate) -> Result<()> {
         GitHub::update_pull_request(self, number, updates).await
+    }
+
+    async fn reopen_pull_request(&self, number: u64) -> Result<()> {
+        GitHub::reopen_pull_request(self, number).await
+    }
+
+    async fn remote_branch_exists(&self, branch: &GitHubBranch) -> Result<bool> {
+        GitHub::remote_branch_exists(self, branch).await
+    }
+
+    async fn create_remote_branch(&self, branch: &GitHubBranch, oid: git2::Oid) -> Result<()> {
+        GitHub::create_remote_branch(self, branch, oid).await
+    }
+
+    async fn delete_remote_branch(&self, branch: &GitHubBranch) -> Result<bool> {
+        GitHub::delete_remote_branch(self, branch).await
     }
 
     async fn retarget_pull_request(

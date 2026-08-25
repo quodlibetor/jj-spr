@@ -1,0 +1,15 @@
+query ClosedPullRequestsQuery($owner: String!, $name: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: [CLOSED], first: $first, after: $after) {
+      nodes {
+        number
+        headRefName
+        baseRefName
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
