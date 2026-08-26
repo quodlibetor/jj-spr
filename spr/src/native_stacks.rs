@@ -280,7 +280,12 @@ impl Reconciliation {
 }
 
 /// `#12, #13`.
-fn numbers(pull_requests: &[u64]) -> String {
+///
+/// Public because every sentence jj-spr says about a run's pull requests names
+/// them this way, and `diff` has one of its own to say — about the changes it
+/// takes in above the revisions it was given, which is not a fact about a stack
+/// and so is not written here.
+pub fn numbers(pull_requests: &[u64]) -> String {
     pull_requests
         .iter()
         .map(|number| format!("#{number}"))

@@ -215,6 +215,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Under a linear `spr.baseStrategy`, `jj spr diff` no longer treats the
+  revisions it was named as the whole of the stack. Which change a pull request
+  is stacked on is a fact about the local chain, so a run now reaches past what
+  it was given, in both directions. Downwards it takes the chain of pull
+  requests below its bottom change as context: that change's branch is the base,
+  and the chain is part of the stack registered with GitHub under
+  `spr.stackDisplay = github`. Nothing down there is pushed or retargeted.
+  Adding a change on top of a stack and running plain `jj spr diff` used to give
+  that change a synthetic base branch and register a stack of one — that is, no
+  stack at all — leaving it outside the stack it was visibly on top of; it now
+  takes the branch below as its base and is added to the existing stack, which
+  keeps its number and URL. Upwards the run pushes the changes stacked on it
+  that already have pull requests, reporting them as `Also pushing #…`, because
+  a run that moves a base moves their ground too: amending the bottom of a stack
+  used to leave the branches above it un-replayed, and inserting a change into
+  the middle of one used to leave the pull request above pointing at the change
+  it had displaced. Both walks stop at the first change with no pull request, so
+  a run never opens one that was not asked for, and at a fork, where there is no
+  one change above to mean. A synthetic base branch is still the fallback where
+  the change below has no open pull request, or where its branch has fallen
+  behind that change as it is locally — jj-spr names the pull request it could
+  not build on rather than quietly putting the unpushed edits into the diff
+  above. `--cherry-pick` turns both walks off, and `spr.baseStrategy =
+  synthetic` never had them: it bases nothing on the change below, so a run has
+  no reason to reach past what it was given.
+
 - `jj spr close` no longer closes the pull requests around the one it is asked
   to close. It asks GitHub which open pull requests are based on the closed
   one's head branch, points them at the closed pull request's own base — so

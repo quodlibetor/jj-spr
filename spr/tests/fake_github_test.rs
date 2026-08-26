@@ -1483,6 +1483,14 @@ fn describe(title: &str) -> String {
     format!("{title}\n\nSummary:\nthe summary of {title}.")
 }
 
+/// Branch names in the order [`Local::spr_branches`] returns them, so that a test
+/// can name the branches it expects in the order they were pushed.
+fn sorted<const N: usize>(branches: [String; N]) -> Vec<String> {
+    let mut branches = branches.to_vec();
+    branches.sort();
+    branches
+}
+
 // ---------------------------------------------------------------------------
 // The tests
 
@@ -2865,4 +2873,340 @@ async fn a_cherry_picked_run_writes_no_stack_section() {
 
     assert_eq!(gh.stack_section_of(1), None);
     assert_eq!(gh.stack_section_of(2), None);
+}
+
+/// A change added on top of a stack and pushed on its own is based on the pull
+/// request below it, and joins the GitHub stack that already holds it.
+///
+/// The case that made the neighbourhood walks exist. Which change a pull request
+/// is stacked on is a fact about the local chain, not about the revisions a run
+/// was named, so a run of one has a change below it just as much as a run of
+/// three does — it simply is not the thing that pushed it. Without that, the new
+/// pull request took a base branch of its own and formed a chain of one, which
+/// GitHub has no stack for, so it sat outside the stack it was visibly on top of.
+#[tokio::test]
+async fn a_change_added_on_top_of_a_stack_joins_it() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["joining bottom", "joining middle"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    // A change on top of the stack, pushed without naming what is under it.
+    run("jj", &["new", "-m", &describe("joining top")], &local.repo);
+    local.write("joining top", "joining top");
+    local
+        .diff_with(&gh, &config, &["-r", "@"])
+        .await
+        .expect("the second push");
+
+    assert_eq!(
+        gh.base_of(3),
+        gh.head_of(2),
+        "the new pull request should be based on the branch of the change below it"
+    );
+    assert_eq!(
+        local.files_changed(&gh.base_of(3), &gh.head_of(3)),
+        vec![slug("joining top")],
+        "and should be reviewing its own change and nothing else"
+    );
+    assert_eq!(
+        local.spr_branches(),
+        sorted([gh.head_of(1), gh.head_of(2), gh.head_of(3)]),
+        "no base branch should have been generated for it"
+    );
+
+    let stacks = gh.open_stacks();
+    assert_eq!(stacks.len(), 1, "there should still be the one stack");
+    assert_eq!(stacks[0].number, 100, "and it should have kept its number");
+    assert_eq!(
+        stacks[0].members,
+        vec![1, 2, 3],
+        "with the new pull request added to it"
+    );
+    assert!(
+        gh.calls()
+            .iter()
+            .any(|call| matches!(call, Call::AddedToStack { .. })),
+        "and added rather than the stack being taken apart and rebuilt: {:?}",
+        gh.calls()
+    );
+}
+
+/// A run also pushes the pull requests stacked on top of what it was asked for.
+///
+/// Amending the bottom of a stack moves the ground under everything above it:
+/// under `linear-rebase` the branch above has to be replayed onto the new
+/// bottom, and left alone it would show the amended change's edits as its own
+/// once GitHub next compared the two. So the run reaches upwards and does it,
+/// rather than leaving a stack half-pushed and saying nothing.
+#[tokio::test]
+async fn a_run_pushes_the_pull_requests_stacked_on_what_it_was_asked_for() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["reaching bottom", "reaching top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    let (bottom, top) = (gh.head_of(1), gh.head_of(2));
+
+    // Amend the bottom, and ask for the bottom alone.
+    run("jj", &["edit", "@-"], &local.repo);
+    local.write("reaching bottom", "an amended bottom");
+    local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "amend"])
+        .await
+        .expect("the second push");
+
+    assert!(
+        local.descends_from(local.tip(&top), local.tip(&bottom)),
+        "the branch above should have been replayed onto what the bottom became, which is \
+         what a run that stopped at the revision it was given would have left undone"
+    );
+    assert_eq!(
+        local.commits_ahead(&bottom, &top),
+        vec!["1 reaching top".to_string()],
+        "and should still be a chain carrying its own change"
+    );
+    assert_eq!(
+        local.files_changed(&bottom, &top),
+        vec![slug("reaching top")],
+        "and should still be reviewing that change and nothing else"
+    );
+    assert_eq!(
+        gh.base_of(2),
+        bottom,
+        "nothing was retargeted, so the stack has no reason to come apart"
+    );
+    let stacks = gh.open_stacks();
+    assert_eq!(stacks.len(), 1, "there should still be the one stack");
+    assert_eq!(stacks[0].number, 100, "with the same number as before");
+    assert_eq!(stacks[0].members, vec![1, 2], "holding the same two");
+}
+
+/// A change inserted into the middle of a stack is woven into it: the pull
+/// request above moves onto the new one, which is based on what it displaced.
+///
+/// Both walks at once, and the case where reaching upwards is the whole of the
+/// work — the inserted change's own pull request could be opened without
+/// touching anything above, and the stack would then say the two neighbours are
+/// adjacent when the local chain no longer has them so.
+#[tokio::test]
+async fn a_change_inserted_into_a_stack_is_woven_into_it() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["weaving bottom", "weaving top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    run(
+        "jj",
+        &[
+            "new",
+            "--insert-before",
+            "@",
+            "-m",
+            &describe("weaving middle"),
+        ],
+        &local.repo,
+    );
+    local.write("weaving middle", "weaving middle");
+    local
+        .diff_with(&gh, &config, &["-r", "@"])
+        .await
+        .expect("the second push");
+
+    assert_eq!(
+        gh.base_of(3),
+        gh.head_of(1),
+        "the inserted pull request should be based on the one it was put on top of"
+    );
+    assert_eq!(
+        gh.base_of(2),
+        gh.head_of(3),
+        "and the one above should have moved onto it"
+    );
+    assert_eq!(
+        local.files_changed(&gh.base_of(2), &gh.head_of(2)),
+        vec![slug("weaving top")],
+        "which is what keeps the top reviewing its own change rather than both"
+    );
+    assert_eq!(
+        local.spr_branches(),
+        sorted([gh.head_of(1), gh.head_of(2), gh.head_of(3)]),
+        "no base branch should have been generated for the inserted change"
+    );
+
+    let stacks = gh.open_stacks();
+    assert_eq!(stacks.len(), 1, "one stack should be left standing");
+    assert_eq!(
+        stacks[0].members,
+        vec![1, 3, 2],
+        "holding all three in the order the local chain has them. Its number is not the \
+         one it had: retargeting #2 means taking apart the stack that held it, and a stack \
+         cannot be reshaped in place"
+    );
+}
+
+/// A branch below that has fallen behind its change is not used as a base.
+///
+/// The one thing a run cannot take on trust about a change it did not push: the
+/// branch below might not carry that change as it is now, and basing on it would
+/// put the unpushed edits into the diff of everything above. So the base falls
+/// back to a branch of jj-spr's own, exactly as under `synthetic`, and the run
+/// says which pull request it could not build on.
+#[tokio::test]
+async fn a_branch_below_that_has_fallen_behind_is_not_used_as_a_base() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["stale bottom", "stale top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    // Amend the top without pushing it, so its branch no longer carries it, and
+    // then stack a new change on it.
+    local.write("stale top", "an amendment that was never pushed");
+    run(
+        "jj",
+        &["new", "-m", &describe("stale newcomer")],
+        &local.repo,
+    );
+    local.write("stale newcomer", "stale newcomer");
+    local
+        .diff_with(&gh, &config, &["-r", "@"])
+        .await
+        .expect("the second push");
+
+    assert!(
+        config.is_synthetic_base_branch(&gh.base_of(3)),
+        "the new pull request should have a base branch of its own, not the stale branch \
+         below it: {}",
+        gh.base_of(3)
+    );
+    assert_eq!(
+        local.files_changed(&gh.base_of(3), &gh.head_of(3)),
+        vec![slug("stale newcomer")],
+        "which is what keeps the unpushed edits below out of its diff"
+    );
+    let stacks = gh.open_stacks();
+    assert_eq!(stacks.len(), 1, "the stack below should be left standing");
+    assert_eq!(stacks[0].number, 100, "with the number it had");
+    assert_eq!(
+        stacks[0].members,
+        vec![1, 2],
+        "and holding what it held: the new pull request is chained to nothing, so there \
+         is nothing to add it to"
+    );
+}
+
+/// `--cherry-pick` turns the neighbourhood off, in both directions.
+///
+/// A cherry-picked change is against the master branch rather than against what
+/// it sits on, so there is no chain for it to join — and nothing above it has
+/// had its ground moved, because the run built nothing that the changes above
+/// are based on.
+#[tokio::test]
+async fn a_cherry_pick_takes_in_no_neighbours() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["picked bottom", "picked middle", "picked top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    let before = local.tip(&gh.head_of(3));
+
+    run("jj", &["edit", "@-"], &local.repo);
+    local
+        .diff_with(&gh, &config, &["-r", "@", "--cherry-pick", "-m", "cherry"])
+        .await
+        .expect("the cherry-picked push");
+
+    assert_eq!(
+        gh.base_of(2),
+        MASTER,
+        "the cherry-picked change should be against the default branch"
+    );
+    assert_eq!(
+        local.tip(&gh.head_of(3)),
+        before,
+        "and the change above it should have been left alone"
+    );
+}
+
+/// The synthetic strategy takes in no neighbours either: it bases nothing on the
+/// change below, so a run has no reason to reach past what it was given.
+#[tokio::test]
+async fn the_synthetic_strategy_pushes_only_what_it_was_asked_for() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::Synthetic, StackDisplay::None);
+    let gh = local.github(&config);
+
+    local.stack(&["untouched bottom", "untouched top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    let before = local.tip(&gh.head_of(2));
+
+    run("jj", &["edit", "@-"], &local.repo);
+    local.write("untouched bottom", "an amended bottom");
+    local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "amend"])
+        .await
+        .expect("the second push");
+
+    assert_eq!(
+        local.tip(&gh.head_of(2)),
+        before,
+        "the pull request above should not have been pushed"
+    );
+}
+
+/// A range bounded part-way up a stack does not mistake its own bottom for the
+/// master branch.
+///
+/// `jj spr diff -r 'B..D'` and `--all --base B` say which changes to push. They
+/// used to be read as saying what those changes are based on as well: the change
+/// above B came out "directly based on master", so its pull request was
+/// retargeted at the master branch — which took it out of its stack, put every
+/// change below it into its own diff, and left the pull requests under it
+/// unstacked. Only the local chain says what a change is stacked on.
+#[tokio::test]
+async fn a_range_bounded_inside_a_stack_keeps_what_it_pushes_stacked() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["bounded bottom", "bounded middle", "bounded top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    local.write("bounded middle", "an amended middle");
+    local
+        .diff_with(&gh, &config, &["-r", "@--..@-", "-m", "amend"])
+        .await
+        .expect("the bounded push");
+
+    assert_eq!(
+        gh.base_of(2),
+        gh.head_of(1),
+        "the bottom of the range should still be based on the change under it, which the \
+         range excluded but the local chain still has"
+    );
+    assert_eq!(
+        local.files_changed(&gh.base_of(2), &gh.head_of(2)),
+        vec![slug("bounded middle")],
+        "so its diff is its own change and not everything below it too"
+    );
+
+    let stacks = gh.open_stacks();
+    assert_eq!(stacks.len(), 1, "one stack should be left standing");
+    assert_eq!(stacks[0].number, 100, "the one that was already there");
+    assert_eq!(
+        stacks[0].members,
+        vec![1, 2, 3],
+        "still holding all three: nothing was retargeted, so nothing had to come apart"
+    );
 }

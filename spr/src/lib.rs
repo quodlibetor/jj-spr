@@ -13,6 +13,7 @@ pub mod github;
 pub mod jj;
 pub mod message;
 pub mod native_stacks;
+pub mod neighbourhood;
 pub mod output;
 pub mod reopen;
 pub mod replay;

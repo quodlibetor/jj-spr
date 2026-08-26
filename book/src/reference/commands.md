@@ -65,6 +65,16 @@ jj spr diff --cherry-pick
 jj spr diff -m "Address review comments"
 ```
 
+Under a linear [`spr.baseStrategy`](configuration.md#basestrategy) a run reaches
+past the revisions you named, because which change a pull request is stacked on
+is a fact about your local chain rather than about what you happened to type: it
+bases the bottom of the run on the pull request below it and counts that chain as
+part of the stack, and it pushes the changes above the run that already have pull
+requests, reporting them as `Also pushing #…`. Both walks stop at the first change
+without a pull request, so nothing you did not ask for is ever opened, and
+`--cherry-pick` turns them off. See
+[a linear run takes in its neighbours](configuration.md#a-linear-run-takes-in-its-neighbours).
+
 ---
 
 ### `jj spr land`

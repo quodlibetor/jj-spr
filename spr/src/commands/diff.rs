@@ -15,11 +15,13 @@ use crate::{
         GitHub, GitHubBranch, PullRequest, PullRequestRequestReviewers, PullRequestState,
         PullRequestUpdate,
     },
-    jj::{DryRunAction, StackChange},
+    jj::{DryRunAction, PreparedCommit, StackChange},
     message::{MessageSection, build_stack_section, validate_commit_message},
     native_stacks::{
         ChainLink, DissolveReason, Reconciliation, StackSession, dissolve_any_stack_holding,
+        numbers,
     },
+    neighbourhood,
     output::{output, write_commit_title},
     replay,
     utils::{parse_name_list, remove_all_parens, run_command},
@@ -130,21 +132,62 @@ pub async fn diff(
         vec![jj.get_prepared_commit_for_revision(config, &target_rev)?]
     };
 
-    let (Some(first_commit), Some(top_commit)) =
-        (prepared_commits.first(), prepared_commits.last())
-    else {
+    if prepared_commits.is_empty() {
         output("👋", "No commits found - nothing to do. Good bye!")?;
         return result;
-    };
+    }
 
-    // Determine the master base OID - this is the commit on master that the stack is based on
-    let master_base_oid = if use_range_mode {
-        // For range mode, the parent of the first commit is the master base
-        first_commit.parent_oid
-    } else {
-        // For single commit mode, find the actual merge base with master
-        jj.get_master_base_for_commit(config, first_commit.oid)?
-    };
+    // Under a linear `spr.baseStrategy` a pull request is based on the branch of
+    // the change below it, which is a fact about the local chain rather than
+    // about the revisions this run was handed — so the run takes in its
+    // neighbours. See [`crate::neighbourhood`] for what that reaches and why.
+    //
+    // `--cherry-pick` is the one thing that switches it off, and switches off
+    // both halves: a cherry-picked change is deliberately against the master
+    // branch rather than against what it sits on, so there is no chain for it to
+    // join and nothing above it whose ground this run moves.
+    let integrates_with_neighbours =
+        config.base_strategy.bases_on_the_change_below() && !opts.cherry_pick;
+
+    if integrates_with_neighbours {
+        let above = descendants_to_push(jj, config, &prepared_commits)?;
+
+        if !above.is_empty() {
+            output(
+                "🧵",
+                &format!(
+                    "Also pushing {}, stacked on what was asked for: this run may move what \
+                     they are based on, and a pull request left behind would show the changes \
+                     below it as its own.",
+                    numbers(
+                        &above
+                            .iter()
+                            .filter_map(|c| c.pull_request_number)
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+            )?;
+            prepared_commits.extend(above);
+        }
+    }
+
+    let (first_commit, top_commit) = (
+        prepared_commits.first().expect("a first commit"),
+        prepared_commits.last().expect("a last commit"),
+    );
+
+    // The commit on the master branch that the local chain is based on, which is
+    // what a change sitting on it has its pull request against and what a
+    // `--cherry-pick` is cherry-picked onto.
+    //
+    // Always the merge base, never the bottom of the range. A run bounded
+    // part-way up a stack — `jj spr diff -r 'B..D'`, or `--all --base B` — used
+    // to take B for the master branch, so the change above B came out "directly
+    // based on master" and its pull request was retargeted at the master branch,
+    // taking it out of the stack it was in and putting everything below it into
+    // its diff. Which revisions a run pushes and what those changes are based on
+    // are different questions, and only the local chain answers the second.
+    let master_base_oid = jj.get_master_base_for_commit(config, first_commit.oid)?;
 
     // Where the stack for the PR bodies starts. It runs back to the master branch
     // whatever revisions this run was asked to push, so that a PR is described
@@ -161,6 +204,19 @@ pub async fn diff(
     // would be stale by the time the sections are worked out. A change id
     // survives that.
     let stack_top_change_id = jj.get_change_id_for_commit(top_commit.oid)?;
+    let bottom_parent_oid = first_commit.parent_oid;
+
+    // The chain of pull requests the run sits on but does not push. `below` is
+    // the change immediately under the run offered to its bottom as a base, in
+    // exactly the form a change this run pushed would be offered in, and
+    // `below_links` is that chain as the stack registration sees it — without
+    // which a change pushed on its own would be a chain of one and would start
+    // an island instead of joining the stack it sits on.
+    let (below_links, below) = if integrates_with_neighbours {
+        below_the_run(jj, gh, config, bottom_parent_oid, master_base_oid).await?
+    } else {
+        (Vec::new(), None)
+    };
 
     // A change this run would open a pull request for has no number yet, and a
     // dry run opens nothing, so there is no number to give it. The stack it
@@ -235,13 +291,19 @@ pub async fn diff(
     // The changes are walked bottom-up, so the change below the one being
     // pushed has already been pushed and can be offered to it as a base. See
     // [`linear_base`] for when that offer is taken up.
-    let mut change_below: Option<PushedChange> = None;
+    //
+    // The run starts holding the change under its own bottom, where there is one
+    // with a pull request whose branch still carries it: that change is below
+    // this one in just the same sense, and the only difference is that this run
+    // is not the thing that pushed it.
+    let mut change_below: Option<PushedChange> = below;
 
     // The ordered pull requests of the run, which the registration needs and
     // which no revset can answer: whether one change's pull request is chained
     // to the one below is decided inside the loop, from trees and from what
-    // GitHub already has. Accumulated bottom-up, as the loop walks.
-    let mut links: Vec<ChainLink> = Vec::new();
+    // GitHub already has. Accumulated bottom-up, as the loop walks, on top of
+    // the chain the run already sits on.
+    let mut links: Vec<ChainLink> = below_links;
 
     for (prepared_commit, pull_request) in zip(prepared_commits.iter_mut(), pull_requests) {
         if result.is_err() {
@@ -512,6 +574,156 @@ impl PushedChange {
 /// Say what became of the run's stack registration.
 fn report_stack(outcome: &Reconciliation) -> Result<()> {
     output("🧱", &format!("GitHub stack: {}", outcome.describe()))
+}
+
+/// The changes stacked on top of the run that it should push as well.
+///
+/// The revset asks jj for every local descendant of the top of the run;
+/// [`neighbourhood::descendants_to_push`] decides how far up of that the run
+/// actually reaches, and says why.
+///
+/// A commit id rather than a change id, unlike the stack sections further down:
+/// this runs before anything has been pushed or any message rewritten, so the
+/// commit is still there to be named.
+fn descendants_to_push(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    run: &[PreparedCommit],
+) -> Result<Vec<PreparedCommit>> {
+    let top = run.last().expect("a run of at least one change").oid;
+    let descendants =
+        jj.get_prepared_commits_for_revset(config, &format!("(({top})::) ~ ({top})"))?;
+
+    Ok(neighbourhood::descendants_to_push(top, descendants))
+}
+
+/// The chain of pull requests the run sits on, as `(the chain for the stack
+/// registration, the change to offer the run's bottom as a base)`.
+///
+/// Nothing here is pushed. `parent_oid` is the local parent of the run's bottom
+/// change, and what comes back describes the pull requests underneath it that
+/// this run builds on but leaves alone.
+///
+/// The base is offered only where the pull request below could really serve as
+/// one, which is one question beyond "is there a pull request there":
+///
+/// - **it has to be open.** A closed pull request's branch is not something to
+///   base on and not something GitHub will hold in a new stack.
+/// - **its branch has to carry the change as it is now.** For a change this run
+///   pushed that is guaranteed by the push; for one below the run it is not, and
+///   a branch that has fallen behind its change would put that change's
+///   unpushed work into the diff of everything above it. This is also what
+///   rules out a pull request pushed with `--cherry-pick`, whose branch carries
+///   the change rebased onto the master branch rather than the change's own
+///   tree.
+///
+/// Where the base is not offered the chain is dropped with it, rather than being
+/// returned on its own: the run's bottom then keeps or gets a base branch of its
+/// own, so nothing it pushes is chained to what is below, and registering the
+/// pull requests underneath as a stack would be reshaping a stack this run has
+/// no part in.
+async fn below_the_run(
+    jj: &crate::jj::Jujutsu,
+    gh: &impl crate::github::GitHubApi,
+    config: &crate::config::Config,
+    parent_oid: Oid,
+    master_base_oid: Oid,
+) -> Result<(Vec<ChainLink>, Option<PushedChange>)> {
+    let nothing = (Vec::new(), None);
+
+    if parent_oid == master_base_oid {
+        // The run starts on the master branch, so there is nothing under it.
+        return Ok(nothing);
+    }
+
+    let ancestors = jj
+        .get_prepared_commits_for_revset(config, &format!("({master_base_oid})..({parent_oid})"))?;
+    let below = neighbourhood::ancestors_below(parent_oid, ancestors);
+
+    let Some(parent) = below.last() else {
+        return Ok(nothing);
+    };
+
+    // Read together, and before anything is pushed, for the same reason the
+    // run's own pull requests are: a base read after a push could be one this
+    // run had just moved.
+    let pull_requests = futures::future::join_all(below.iter().map(|commit| {
+        let number = commit
+            .pull_request_number
+            .expect("`ancestors_below` only returns changes with a pull request");
+
+        gh.get_pull_request(number)
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+
+    let Some(parent_pull_request) = pull_requests
+        .last()
+        .filter(|pr| pr.state == PullRequestState::Open)
+    else {
+        return Ok(nothing);
+    };
+
+    if jj.get_tree_oid_for_commit(parent_pull_request.head_oid)?
+        != jj.get_tree_oid_for_commit(parent.oid)?
+    {
+        output(
+            "⚠️",
+            &format!(
+                "The branch of #{number} does not carry that change as it is now, so this run \
+                 cannot base on it and what it pushes will not be stacked on it. Push the whole \
+                 stack in one run — `jj spr diff --all -r 'trunk()..@'` — to stack them.",
+                number = parent_pull_request.number,
+            ),
+        )?;
+
+        return Ok(nothing);
+    }
+
+    // How far down the chain reaches: from the parent, for as long as each pull
+    // request is open and based on the branch of the one below it, which is the
+    // very link GitHub checks when it is told these are a stack. A break below
+    // is where somebody else's stack starts.
+    let mut start = pull_requests.len() - 1;
+    while start > 0 {
+        let lower = &pull_requests[start - 1];
+
+        if lower.state != PullRequestState::Open
+            || pull_requests[start].base.branch_name() != lower.head.branch_name()
+        {
+            break;
+        }
+
+        start -= 1;
+    }
+    let chain = &pull_requests[start..];
+
+    let links = chain
+        .iter()
+        .enumerate()
+        .map(|(position, pull_request)| ChainLink {
+            pull_request: Some(pull_request.number),
+            based_on: position.checked_sub(1).map(|below| chain[below].number),
+            // Nothing below the run is pushed, so nothing below it is
+            // retargeted either.
+            retargeted: false,
+        })
+        .collect();
+
+    let base = PushedChange {
+        local_oid: parent.oid,
+        head_oid: parent_pull_request.head_oid,
+        branch: parent_pull_request.head.clone(),
+        // The tree check above is exactly the statement that this branch is not
+        // a cherry-pick of the change but the change itself.
+        pushed_as_cherry_pick: false,
+        pull_request_number: Some(parent_pull_request.number),
+        based_on: chain.len().checked_sub(2).map(|below| chain[below].number),
+        retargeted: false,
+    };
+
+    Ok((links, Some(base)))
 }
 
 /// The pull request below that this change's pull request is chained to, in the
