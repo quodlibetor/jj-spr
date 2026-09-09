@@ -14,6 +14,7 @@ name = "jj-spr"
 path = "src/main.rs"
 
 [dependencies]
+arboard = { version = "^3.6.1", default-features = false, features = ["wayland-data-control"] }
 clap = { version = "^4.5.48", features = ["derive", "wrap_help"] }
 console = "^0.16.1"
 debug-ignore = "1.0.5"

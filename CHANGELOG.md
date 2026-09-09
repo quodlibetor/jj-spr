@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and how its checks are doing. A check that fails without blocking the merge
   — one the base branch does not require — is called out separately from one
   that does.
+- `jj spr list --format slack` prints the listing as a Markdown bullet list to
+  paste into a chat message asking for reviews: one bullet per pull request,
+  its title under an emoji for where its review stands, and its URL on the
+  line below. `--format slack-links` prints the same list with each title
+  made a terminal hyperlink instead, keeping every pull request to one line.
+  The default format can be set with `spr.listFormat`.
+- `jj spr list --copy` puts the listing on the clipboard as well as printing
+  it, as HTML with a real link per pull request where the format has links to
+  carry. No terminal turns a hyperlink back into a link when you copy it —
+  every copy path writes plain text — so this is what gets the links into a
+  chat message. The plain-text flavour that goes alongside spells the URLs
+  out, since the escapes that draw a hyperlink on screen paste as rubbish.
 
 ### Changed
 

@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::error::Result;
-use crate::error::ResultExt;
+use crate::error::{Error, Result, ResultExt};
+use crate::output::output;
 use graphql_client::{GraphQLQuery, Response};
 use reqwest;
 use tabled::Table;
@@ -23,11 +23,59 @@ type URI = String;
 )]
 pub struct SearchQuery;
 
+#[derive(Debug, clap::Parser)]
+pub struct ListOptions {
+    /// How to print the listing. Defaults to the `spr.listFormat` setting,
+    /// and to `table` when that is not set either.
+    #[clap(long, value_enum)]
+    format: Option<ListFormat>,
+
+    /// Also put the listing on the clipboard, as rich text where the format
+    /// has links to carry: pasting it into a chat message gives real links
+    /// rather than the text of a terminal escape.
+    #[clap(long)]
+    copy: bool,
+}
+
+/// The shapes a listing can be printed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ListFormat {
+    /// A table of columns, one row per pull request.
+    Table,
+    /// A Markdown list to paste into a chat message asking for reviews: one
+    /// bullet per pull request, its title under an emoji for where the review
+    /// stands, and its URL on the line below.
+    Slack,
+    /// The same list, but with each title made a terminal hyperlink to its
+    /// pull request instead of the URL being printed on its own line.
+    SlackLinks,
+}
+
+impl ListFormat {
+    /// Read the format from the `spr.listFormat` setting, which is spelled
+    /// the way the command line spells it.
+    fn from_config(git_config: &git2::Config) -> Result<Option<Self>> {
+        let Some(value) = crate::config::get_config_value("spr.listFormat", git_config) else {
+            return Ok(None);
+        };
+
+        <Self as clap::ValueEnum>::from_str(&value, true)
+            .map(Some)
+            .map_err(|message| Error::new(format!("spr.listFormat: {message}")))
+    }
+}
+
 pub async fn list(
+    opts: ListOptions,
     graphql_client: reqwest::Client,
     jj: &crate::jj::Jujutsu,
     config: &crate::config::Config,
 ) -> Result<()> {
+    let format = match opts.format {
+        Some(format) => format,
+        None => ListFormat::from_config(&jj.git_repo.config()?)?.unwrap_or(ListFormat::Table),
+    };
+
     let variables = search_query::Variables {
         query: format!(
             "repo:{}/{} is:open is:pr author:@me archived:false",
@@ -49,7 +97,7 @@ pub async fn list(
         .get_local_pull_request_stacks(config)
         .context("Reading the local change stacks".to_string())?;
 
-    print_pr_info(response_body, &stacks).context("Printing PR info".to_string())
+    print_pr_info(response_body, &stacks, format, opts.copy).context("Printing PR info".to_string())
 }
 
 #[derive(Tabled)]
@@ -172,13 +220,11 @@ fn merge_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> Merge
 /// one reviewer requesting changes correctly outweighs another's approval.
 /// The individual review states are consulted only when there is no verdict,
 /// to report feedback that `reviewDecision` has no way to express.
-fn review_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> String {
+fn review_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> ReviewStatus {
     match pr.review_decision {
-        Some(search_query::PullRequestReviewDecision::APPROVED) => {
-            console::style("Accepted").green().to_string()
-        }
+        Some(search_query::PullRequestReviewDecision::APPROVED) => ReviewStatus::Accepted,
         Some(search_query::PullRequestReviewDecision::CHANGES_REQUESTED) => {
-            console::style("Changes Requested").red().to_string()
+            ReviewStatus::ChangesRequested
         }
         None | Some(search_query::PullRequestReviewDecision::REVIEW_REQUIRED) => {
             let commented = pr
@@ -195,12 +241,54 @@ fn review_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> Stri
                 });
 
             if commented {
-                console::style("Commented").yellow().to_string()
+                ReviewStatus::Commented
             } else {
-                "Pending".to_string()
+                ReviewStatus::Pending
             }
         }
-        Some(search_query::PullRequestReviewDecision::Other(ref d)) => d.clone(),
+        Some(search_query::PullRequestReviewDecision::Other(ref d)) => {
+            ReviewStatus::Other(d.clone())
+        }
+    }
+}
+
+/// Where a pull request stands with its reviewers.
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewStatus {
+    /// A reviewer approved it.
+    Accepted,
+    /// A reviewer asked for changes.
+    ChangesRequested,
+    /// A reviewer said something without reaching a verdict.
+    Commented,
+    /// Nobody has reviewed it yet.
+    Pending,
+    /// A verdict this build does not know, reported as GitHub words it.
+    Other(String),
+}
+
+impl ReviewStatus {
+    /// How the status reads in the table.
+    fn label(&self) -> String {
+        match self {
+            ReviewStatus::Accepted => console::style("Accepted").green().to_string(),
+            ReviewStatus::ChangesRequested => console::style("Changes Requested").red().to_string(),
+            ReviewStatus::Commented => console::style("Commented").yellow().to_string(),
+            ReviewStatus::Pending => "Pending".to_string(),
+            ReviewStatus::Other(decision) => decision.clone(),
+        }
+    }
+
+    /// How the status reads in a chat message, where there is no column to
+    /// put a word in and colour does not survive the paste.
+    fn emoji(&self) -> &'static str {
+        match self {
+            ReviewStatus::Accepted => "✅",
+            ReviewStatus::ChangesRequested => "🔴",
+            ReviewStatus::Commented => "💬",
+            ReviewStatus::Pending => "⏳",
+            ReviewStatus::Other(_) => "❔",
+        }
     }
 }
 
@@ -295,9 +383,10 @@ fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> Com
 struct PullRequest {
     number: u64,
     merge_status: String,
-    review_status: String,
+    review_status: ReviewStatus,
     comment_status: String,
-    description: String,
+    title: String,
+    url: String,
 }
 
 /// One block of the table.
@@ -312,6 +401,8 @@ struct Group {
 fn print_pr_info(
     response_body: Response<search_query::ResponseData>,
     stacks: &[Vec<u64>],
+    format: ListFormat,
+    copy: bool,
 ) -> Result<()> {
     let groups = group_by_stack(collect_pull_requests(response_body), stacks);
 
@@ -319,8 +410,64 @@ fn print_pr_info(
         return Ok(());
     }
 
+    // The clipboard flavours are built before the listing is consumed, since
+    // building either one takes the pull requests.
+    let clipboard = copy.then(|| clipboard_flavours(&groups, format));
+
+    let text = match format {
+        ListFormat::Table => build_table(&groups).to_string(),
+        ListFormat::Slack => build_list(&groups, Link::OwnLine),
+        ListFormat::SlackLinks => build_list(&groups, Link::OnTheTitle),
+    };
+
     let term = console::Term::stdout();
-    term.write_line(&build_table(groups).to_string())?;
+    term.write_line(&text)?;
+
+    if let Some(flavours) = clipboard {
+        put_on_clipboard(flavours).context("Copying the listing to the clipboard".to_string())?;
+        output("📋", "Copied to the clipboard")?;
+    }
+
+    Ok(())
+}
+
+/// What `--copy` puts on the clipboard.
+struct Flavours {
+    /// The plain text an application that wants no formatting will take.
+    text: String,
+    /// The HTML flavour, where the format has links to carry. Chat clients
+    /// take this one, which is how a paste ends up with real links rather
+    /// than with the URLs written out.
+    html: Option<String>,
+}
+
+/// Build what `--copy` puts on the clipboard for `format`.
+///
+/// The chat formats agree once they are HTML — a title that is a link is what
+/// both of them were reaching for — so the two differ only in the plain text
+/// they fall back to. That plain text is the spelled-out form for both, since
+/// the terminal escapes that make a hyperlink on screen paste as rubbish
+/// everywhere else.
+fn clipboard_flavours(groups: &[Group], format: ListFormat) -> Flavours {
+    match format {
+        ListFormat::Table => Flavours {
+            text: build_table(groups).to_string(),
+            html: None,
+        },
+        ListFormat::Slack | ListFormat::SlackLinks => Flavours {
+            text: build_list(groups, Link::OwnLine),
+            html: Some(build_html_list(groups)),
+        },
+    }
+}
+
+fn put_on_clipboard(flavours: Flavours) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new()?;
+
+    match flavours.html {
+        Some(html) => clipboard.set().html(html, Some(flavours.text))?,
+        None => clipboard.set_text(flavours.text)?,
+    }
 
     Ok(())
 }
@@ -347,18 +494,13 @@ fn collect_pull_requests(response_body: Response<search_query::ResponseData>) ->
         let comment_status = comment_status(&pr).icon().to_string();
         let review_status = review_status(&pr);
 
-        let description = format!(
-            "{}\n{}",
-            console::style(&pr.title).bold(),
-            console::style(&pr.url).dim(),
-        );
-
         pull_requests.push(PullRequest {
             number: pr.number as u64,
             merge_status,
             review_status,
             comment_status,
-            description,
+            title: pr.title,
+            url: pr.url,
         });
     }
 
@@ -410,27 +552,31 @@ fn group_by_stack(pull_requests: Vec<PullRequest>, stacks: &[Vec<u64>]) -> Vec<G
     groups
 }
 
-fn build_table(groups: Vec<Group>) -> Table {
+fn build_table(groups: &[Group]) -> Table {
     // The Stack column is only worth its width when there is more than one
     // group to tell apart: a listing that is one stack from top to bottom
     // already reads in order without it.
     let stack_column_earns_its_place = groups.len() > 1;
 
     let rows: Vec<Row> = groups
-        .into_iter()
+        .iter()
         .flat_map(|group| {
             let last = group.pull_requests.len() - 1;
             let is_stack = group.is_stack;
             group
                 .pull_requests
-                .into_iter()
+                .iter()
                 .enumerate()
                 .map(move |(position, pull_request)| Row {
                     stack: stack_marker(is_stack, position, last),
-                    merge_status: pull_request.merge_status,
-                    review_status: pull_request.review_status,
-                    comment_status: pull_request.comment_status,
-                    description: pull_request.description,
+                    merge_status: pull_request.merge_status.clone(),
+                    review_status: pull_request.review_status.label(),
+                    comment_status: pull_request.comment_status.clone(),
+                    description: format!(
+                        "{}\n{}",
+                        console::style(&pull_request.title).bold(),
+                        console::style(&pull_request.url).dim(),
+                    ),
                 })
         })
         .collect();
@@ -444,6 +590,95 @@ fn build_table(groups: Vec<Group>) -> Table {
     table.with(Style::sharp());
 
     table
+}
+
+/// Where the URL of a pull request goes in a chat listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    /// Printed under the title, on a line of its own. Chat clients make a
+    /// bare URL a link, so this pastes as a link wherever it lands.
+    OwnLine,
+    /// Attached to the title as a terminal hyperlink, so the bullet is one
+    /// short line. Terminals that do not know the escape show the title and
+    /// nothing else, and so, at the time of writing, does a paste into Slack.
+    OnTheTitle,
+}
+
+/// Build the listing as a Markdown bullet list to paste into a chat message
+/// asking for reviews.
+///
+/// Each stack is a block of its own, separated by a blank line, in the order
+/// the table would have printed them: newest change first, the way `jj log`
+/// reads. There are no stack markers, because indentation is all a chat
+/// client will keep, and no merge or comment status, because what a reviewer
+/// needs from the message is which pull requests are still waiting on them.
+fn build_list(groups: &[Group], link: Link) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .pull_requests
+                .iter()
+                .map(|pull_request| bullet(pull_request, link))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Build the listing as HTML, one list per stack, each title a link to its
+/// pull request. This is the flavour a chat client pastes from.
+fn build_html_list(groups: &[Group]) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            let items: String = group
+                .pull_requests
+                .iter()
+                .map(|pull_request| {
+                    format!(
+                        "<li>{} <a href=\"{}\">{}</a></li>",
+                        pull_request.review_status.emoji(),
+                        escape_html(&pull_request.url),
+                        escape_html(&pull_request.title),
+                    )
+                })
+                .collect();
+            format!("<ul>{items}</ul>")
+        })
+        .collect()
+}
+
+/// Escape the characters that would otherwise be read as markup. A pull
+/// request title is somebody's prose and a URL carries query strings, so both
+/// can hold any of them.
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn bullet(pull_request: &PullRequest, link: Link) -> String {
+    let emoji = pull_request.review_status.emoji();
+    let title = &pull_request.title;
+    let url = &pull_request.url;
+
+    match link {
+        Link::OwnLine => format!("- {emoji} {title}\n  {url}"),
+        Link::OnTheTitle => format!("- {emoji} {}", hyperlink(url, title)),
+    }
+}
+
+/// Wrap `text` in the OSC 8 escape sequence that makes a terminal draw it as
+/// a link to `url`.
+///
+/// The sequence is `ESC ] 8 ; ; URL ST`, the text, then the same with an
+/// empty URL to close it. `ST` is written as `ESC \\`, which every terminal
+/// that understands the escape accepts, rather than the BEL some also take.
+fn hyperlink(url: &str, text: &str) -> String {
+    format!("\u{1b}]8;;{url}\u{1b}\\{text}\u{1b}]8;;\u{1b}\\")
 }
 
 /// Draw where a row sits in its stack, in the shape `jj log` gives a branch:
@@ -699,8 +934,8 @@ mod tests {
         assert_eq!(comment_icon(&fields), CommentStatus::AwaitingReply.icon());
     }
 
-    /// The Reviews cell, stripped of styling so tests assert on wording.
-    fn review_cell(decision: &str, review_states: &[&str]) -> String {
+    /// Where a pull request stands with its reviewers, as the payload says.
+    fn review_state(decision: &str, review_states: &[&str]) -> ReviewStatus {
         let states = review_states
             .iter()
             .map(|state| format!(r#"{{"state":"{state}"}}"#))
@@ -714,8 +949,13 @@ mod tests {
         );
         let pull_requests = collect_pull_requests(response(&fields));
         assert_eq!(pull_requests.len(), 1, "expected exactly one pull request");
-        let cell = pull_requests.into_iter().next().unwrap().review_status;
-        console::strip_ansi_codes(&cell).into_owned()
+        pull_requests.into_iter().next().unwrap().review_status
+    }
+
+    /// The Reviews cell, stripped of styling so tests assert on wording.
+    fn review_cell(decision: &str, review_states: &[&str]) -> String {
+        let label = review_state(decision, review_states).label();
+        console::strip_ansi_codes(&label).into_owned()
     }
 
     #[test]
@@ -882,9 +1122,10 @@ mod tests {
         PullRequest {
             number,
             merge_status: MergeStatus::Passing.label().to_string(),
-            review_status: "Pending".to_string(),
+            review_status: ReviewStatus::Pending,
             comment_status: CommentStatus::Quiet.icon().to_string(),
-            description: format!("pull request {number}"),
+            title: format!("pull request {number}"),
+            url: format!("https://github.com/o/r/pull/{number}"),
         }
     }
 
@@ -943,7 +1184,7 @@ mod tests {
     #[test]
     fn the_stack_column_appears_only_when_it_separates_groups() {
         let one_stack = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2, 1]]);
-        let table = build_table(one_stack).to_string();
+        let table = build_table(&one_stack).to_string();
         assert!(
             !table.contains("Stack"),
             "one stack needs no Stack column, got:\n{table}"
@@ -951,7 +1192,7 @@ mod tests {
 
         let two_stacks =
             group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2], vec![1]]);
-        let table = build_table(two_stacks).to_string();
+        let table = build_table(&two_stacks).to_string();
         assert!(
             table.contains("Stack"),
             "two stacks need a Stack column, got:\n{table}"
@@ -979,5 +1220,167 @@ mod tests {
     #[test]
     fn loose_pull_requests_have_no_marker() {
         assert_eq!(stack_marker(false, 0, 1), "");
+    }
+
+    /// The chat listing is what gets pasted into a review request, so each
+    /// bullet has to carry the URL it is asking someone to open.
+    #[test]
+    fn the_chat_list_prints_a_bullet_and_a_url_per_pull_request() {
+        let groups = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2, 1]]);
+        assert_eq!(
+            build_list(&groups, Link::OwnLine),
+            "- \u{23f3} pull request 2\n  https://github.com/o/r/pull/2\n\
+             - \u{23f3} pull request 1\n  https://github.com/o/r/pull/1"
+        );
+    }
+
+    /// A blank line is the only thing that tells one stack from the next once
+    /// the Stack column is gone.
+    #[test]
+    fn separate_stacks_are_separate_blocks_in_the_chat_list() {
+        let groups = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2], vec![1]]);
+        let list = build_list(&groups, Link::OwnLine);
+        assert_eq!(
+            list.split("\n\n").count(),
+            2,
+            "the two stacks should be two blocks, got:\n{list}"
+        );
+    }
+
+    /// The hyperlink form exists to keep a bullet to one line, so the URL
+    /// must be in the escape and nowhere else.
+    #[test]
+    fn a_hyperlinked_title_carries_the_url_on_one_line() {
+        let bullet = bullet(&pull_request(1), Link::OnTheTitle);
+        assert_eq!(
+            bullet,
+            "- \u{23f3} \u{1b}]8;;https://github.com/o/r/pull/1\u{1b}\\\
+             pull request 1\u{1b}]8;;\u{1b}\\"
+        );
+        assert!(!bullet.contains('\n'), "got:\n{bullet}");
+    }
+
+    /// The emoji is the whole report in a chat message, so two statuses that
+    /// share one would leave the reader unable to tell them apart.
+    #[test]
+    fn each_review_status_has_an_emoji_of_its_own() {
+        let statuses = [
+            ReviewStatus::Accepted,
+            ReviewStatus::ChangesRequested,
+            ReviewStatus::Commented,
+            ReviewStatus::Pending,
+            ReviewStatus::Other("SOMETHING_NEW".to_string()),
+        ];
+        let emojis: std::collections::HashSet<_> =
+            statuses.iter().map(ReviewStatus::emoji).collect();
+        assert_eq!(emojis.len(), statuses.len(), "got {emojis:?}");
+    }
+
+    /// The emoji has to follow GitHub's verdict, not just exist.
+    #[test]
+    fn the_emoji_reports_the_review_decision() {
+        assert_eq!(
+            review_state(r#""APPROVED""#, &["APPROVED"]).emoji(),
+            ReviewStatus::Accepted.emoji()
+        );
+        assert_eq!(
+            review_state(r#""CHANGES_REQUESTED""#, &["CHANGES_REQUESTED"]).emoji(),
+            ReviewStatus::ChangesRequested.emoji()
+        );
+        assert_eq!(
+            review_state("null", &[]).emoji(),
+            ReviewStatus::Pending.emoji()
+        );
+    }
+
+    /// `spr.listFormat` is read through the same parser as the command line,
+    /// so the setting is spelled the way the flag is.
+    #[test]
+    fn the_setting_is_spelled_the_way_the_flag_is() {
+        use clap::ValueEnum;
+
+        assert_eq!(ListFormat::from_str("table", true), Ok(ListFormat::Table));
+        assert_eq!(ListFormat::from_str("slack", true), Ok(ListFormat::Slack));
+        assert_eq!(
+            ListFormat::from_str("slack-links", true),
+            Ok(ListFormat::SlackLinks)
+        );
+        assert!(ListFormat::from_str("not-a-format", true).is_err());
+    }
+
+    /// The HTML flavour is what makes a paste into a chat message a set of
+    /// real links, so every title has to be an anchor to its pull request.
+    #[test]
+    fn the_html_flavour_makes_every_title_a_link() {
+        let groups = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2, 1]]);
+        assert_eq!(
+            build_html_list(&groups),
+            "<ul>\
+             <li>\u{23f3} <a href=\"https://github.com/o/r/pull/2\">pull request 2</a></li>\
+             <li>\u{23f3} <a href=\"https://github.com/o/r/pull/1\">pull request 1</a></li>\
+             </ul>"
+        );
+    }
+
+    /// Each stack is a list of its own, which is what keeps the blocks apart
+    /// once the blank lines of the plain text are gone.
+    #[test]
+    fn each_stack_is_its_own_html_list() {
+        let groups = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2], vec![1]]);
+        assert_eq!(build_html_list(&groups).matches("<ul>").count(), 2);
+    }
+
+    /// A title is somebody's prose and a URL carries query strings, so either
+    /// can hold characters that would otherwise close the markup around them.
+    #[test]
+    fn markup_in_a_title_or_url_is_escaped() {
+        let pull_request = PullRequest {
+            title: r#"fix: <script> & "quotes""#.to_string(),
+            url: "https://github.com/o/r/pull/1?a=1&b=2".to_string(),
+            ..pull_request(1)
+        };
+        let groups = vec![Group {
+            pull_requests: vec![pull_request],
+            is_stack: true,
+        }];
+
+        assert_eq!(
+            build_html_list(&groups),
+            "<ul><li>\u{23f3} <a href=\"https://github.com/o/r/pull/1?a=1&amp;b=2\">\
+             fix: &lt;script&gt; &amp; &quot;quotes&quot;</a></li></ul>"
+        );
+    }
+
+    /// The escapes that draw a hyperlink on screen paste as rubbish, so the
+    /// plain-text flavour spells the URLs out whichever chat format was asked
+    /// for. The HTML flavour is the same either way: a title that is a link is
+    /// what both formats were reaching for.
+    #[test]
+    fn the_clipboard_never_carries_terminal_escapes() {
+        let groups = group_by_stack(vec![pull_request(1)], &[vec![1]]);
+
+        for format in [ListFormat::Slack, ListFormat::SlackLinks] {
+            let flavours = clipboard_flavours(&groups, format);
+            assert!(
+                !flavours.text.contains('\u{1b}'),
+                "{format:?} put escapes on the clipboard: {:?}",
+                flavours.text
+            );
+            assert_eq!(flavours.text, build_list(&groups, Link::OwnLine));
+            assert_eq!(
+                flavours.html.as_deref(),
+                Some(build_html_list(&groups)).as_deref()
+            );
+        }
+    }
+
+    /// A table has no links to carry, so there is nothing for an HTML flavour
+    /// to add over the text of the table itself.
+    #[test]
+    fn copying_a_table_copies_the_table() {
+        let groups = group_by_stack(vec![pull_request(1)], &[vec![1]]);
+        let flavours = clipboard_flavours(&groups, ListFormat::Table);
+        assert_eq!(flavours.text, build_table(&groups).to_string());
+        assert_eq!(flavours.html, None);
     }
 }

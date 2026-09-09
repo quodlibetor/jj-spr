@@ -154,5 +154,6 @@ Stored in git config under `spr.*` namespace:
 - `spr.githubRepository` - Owner/repo name
 - `spr.branchPrefix` - Prefix for generated branches (default: `spr/`)
 - `spr.requireApproval` - Require PR approval before landing
+- `spr.listFormat` - How `jj spr list` prints: `table` (default), `slack` (a Markdown bullet list to paste into a chat message, review-status emoji plus the URL under each title), or `slack-links` (the same list with each title made a terminal hyperlink)
 - `spr.githubHost` - Custom GitHub Enterprise host
 - `spr.githubToken` - GitHub API token (typically stored via `jj spr init`)
