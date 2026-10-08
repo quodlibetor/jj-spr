@@ -223,12 +223,12 @@ impl GitHub {
         {
             if output.status.success() {
                 let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
+                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::ZERO_SHA1)
             } else {
-                git2::Oid::zero()
+                git2::Oid::ZERO_SHA1
             }
         } else {
-            git2::Oid::zero()
+            git2::Oid::ZERO_SHA1
         };
 
         let head_oid = if let Ok(output) = tokio::process::Command::new("git")
@@ -238,12 +238,12 @@ impl GitHub {
         {
             if output.status.success() {
                 let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
+                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::ZERO_SHA1)
             } else {
-                git2::Oid::zero()
+                git2::Oid::ZERO_SHA1
             }
         } else {
-            git2::Oid::zero()
+            git2::Oid::ZERO_SHA1
         };
 
         let mut sections = parse_message(&pr.body, MessageSection::Summary);

@@ -136,7 +136,7 @@ impl Git {
             let commit = repo.find_commit(prepared_commit.oid)?;
             if limit != Some(0) {
                 message = build_commit_message(&prepared_commit.message);
-                if Some(&message[..]) != commit.message() {
+                if Some(&message[..]) != commit.message().ok() {
                     updating = true;
                 }
             } else {

@@ -150,7 +150,7 @@ impl Jujutsu {
 
         for reference in refs {
             let reference = reference?;
-            if let Some(name) = reference.name() {
+            if let Ok(name) = reference.name() {
                 ref_names.insert(name.to_string());
             }
         }

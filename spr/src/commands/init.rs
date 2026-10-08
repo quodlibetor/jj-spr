@@ -131,7 +131,12 @@ pub async fn init() -> Result<()> {
         ),
     )?;
 
-    let url = repo.git_repo.find_remote(&remote)?.url().map(String::from);
+    let url = repo
+        .git_repo
+        .find_remote(&remote)?
+        .url()
+        .ok()
+        .map(String::from);
     let regex = lazy_regex::regex!(r#"github\.com[/:]([\w\-\.]+/[\w\-\.]+?)(.git)?$"#);
     let github_repo = config
         .get_string("spr.githubRepository")
