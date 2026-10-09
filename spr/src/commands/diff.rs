@@ -27,7 +27,7 @@ pub struct DiffOptions {
 
     /// Update the pull request title and description on GitHub from the local
     /// commit message
-    #[clap(long)]
+    #[clap(long, short = 'u')]
     update_message: bool,
 
     /// Submit any new Pull Request as a draft

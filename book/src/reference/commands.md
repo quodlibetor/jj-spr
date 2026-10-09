@@ -43,7 +43,7 @@ jj spr diff [OPTIONS]
 - `-a, --all` - Create/update PRs for all changes from base to current
 - `--base <REV>` - Base revision for `--all` mode (default: trunk)
 - `-m, --message <MSG>` - Message for PR update commits
-- `--update-message` - Update PR title/description from local commit
+- `-u, --update-message` - Update PR title/description from local commit
 - `--draft` - Create PR as draft
 - `--cherry-pick` - Create PR as if cherry-picked onto main
 
