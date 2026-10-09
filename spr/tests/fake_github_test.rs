@@ -3051,15 +3051,16 @@ async fn a_change_inserted_into_a_stack_is_woven_into_it() {
     );
 }
 
-/// A branch below that has fallen behind its change is not used as a base.
+/// A branch below that has fallen behind its change is built on as GitHub has
+/// it, rather than moved off.
 ///
 /// The one thing a run cannot take on trust about a change it did not push: the
-/// branch below might not carry that change as it is now, and basing on it would
-/// put the unpushed edits into the diff of everything above. So the base falls
-/// back to a branch of jj-spr's own, exactly as under `synthetic`, and the run
-/// says which pull request it could not build on.
+/// branch below might not carry that change as it is now. Basing the new change
+/// on the local chain would put the unpushed edits into its diff, and giving it a
+/// base branch of its own would leave it out of the stack. So it is carried onto
+/// the branch as GitHub has it, and joins the stack there.
 #[tokio::test]
-async fn a_branch_below_that_has_fallen_behind_is_not_used_as_a_base() {
+async fn a_change_on_a_branch_that_has_fallen_behind_is_built_on_that_branch() {
     let local = Local::new();
     let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
     let gh = local.github(&config);
@@ -3081,26 +3082,220 @@ async fn a_branch_below_that_has_fallen_behind_is_not_used_as_a_base() {
         .await
         .expect("the second push");
 
-    assert!(
-        config.is_synthetic_base_branch(&gh.base_of(3)),
-        "the new pull request should have a base branch of its own, not the stale branch \
-         below it: {}",
-        gh.base_of(3)
+    assert_eq!(
+        gh.base_of(3),
+        gh.head_of(2),
+        "the new pull request should be based on the branch below it, stale or not"
     );
     assert_eq!(
         local.files_changed(&gh.base_of(3), &gh.head_of(3)),
         vec![slug("stale newcomer")],
-        "which is what keeps the unpushed edits below out of its diff"
+        "and should be reviewing its own change, without the unpushed edits below"
     );
     let stacks = gh.open_stacks();
     assert_eq!(stacks.len(), 1, "the stack below should be left standing");
     assert_eq!(stacks[0].number, 100, "with the number it had");
     assert_eq!(
         stacks[0].members,
-        vec![1, 2],
-        "and holding what it held: the new pull request is chained to nothing, so there \
-         is nothing to add it to"
+        vec![1, 2, 3],
+        "and the new pull request added on top of it"
     );
+}
+
+/// Pushing the middle of a stack whose bottom has fallen behind leaves the stack
+/// standing.
+///
+/// Rebasing a stack onto a newer trunk rewrites every change in it, so the
+/// bottom's branch no longer carries the bottom as it is locally. A run asked
+/// for the middle used to take the middle off that branch onto a base branch of
+/// its own — and a retarget takes apart the stack holding it, leaving the bottom
+/// out of the one registered in its place. The run was not asked to touch the
+/// bottom, and the stack is not its to reshape.
+///
+/// Under both linear strategies: `linear` writes a commit on every push rather
+/// than replaying to the same one, so it is the one where a run that wrongly
+/// thinks it has work to do shows up as a branch that moved.
+#[tokio::test]
+async fn pushing_above_a_branch_that_has_fallen_behind_keeps_the_stack() {
+    for strategy in [BaseStrategy::LinearRebase, BaseStrategy::Linear] {
+        keeps_the_stack_above_a_branch_that_has_fallen_behind(strategy).await;
+    }
+}
+
+async fn keeps_the_stack_above_a_branch_that_has_fallen_behind(strategy: BaseStrategy) {
+    let local = Local::new();
+    let config = local.config(strategy, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["behind bottom", "behind middle", "behind top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    let bottom = gh.head_of(1);
+    let bottom_before = local.tip(&bottom);
+    let id = |revset: &str| {
+        run(
+            "jj",
+            &["log", "--no-graph", "-r", revset, "-T", "change_id"],
+            &local.repo,
+        )
+    };
+    let (bottom_change, middle_change) = (id("@--"), id("@-"));
+
+    // Move the trunk on, and rebase the stack onto it.
+    run(
+        "jj",
+        &["new", MASTER, "-m", "the trunk moves on"],
+        &local.repo,
+    );
+    std::fs::write(local.repo.join("elsewhere.txt"), "elsewhere\n").expect("a test file");
+    run("jj", &["bookmark", "set", MASTER, "-r", "@"], &local.repo);
+    run("jj", &["git", "push", "-b", MASTER], &local.repo);
+    run(
+        "jj",
+        &["rebase", "-s", &bottom_change, "-d", MASTER],
+        &local.repo,
+    );
+
+    // Amend the middle, and ask for the middle alone.
+    run("jj", &["edit", &middle_change], &local.repo);
+    local.write("behind middle", "an amended middle");
+    local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "amend"])
+        .await
+        .expect("the second push");
+
+    assert_eq!(
+        local.tip(&bottom),
+        bottom_before,
+        "the bottom was not asked for, so its branch should not have been pushed"
+    );
+    assert_eq!(
+        gh.base_of(2),
+        bottom,
+        "the middle should still be based on the bottom's branch"
+    );
+    assert_eq!(
+        local.files_changed(&gh.base_of(2), &gh.head_of(2)),
+        vec![slug("behind middle")],
+        "and should be reviewing its own change, without the trunk's"
+    );
+    assert_eq!(
+        local.files_changed(&gh.base_of(3), &gh.head_of(3)),
+        vec![slug("behind top")],
+        "as should the top, which the run pushed because its ground moved"
+    );
+    assert!(
+        !gh.calls()
+            .iter()
+            .any(|call| matches!(call, Call::Unstacked { .. })),
+        "nothing should have been unstacked: {:?}",
+        gh.calls()
+    );
+    let stacks = gh.open_stacks();
+    assert_eq!(stacks.len(), 1, "the one stack should be left standing");
+    assert_eq!(stacks[0].number, 100, "with the number it had");
+    assert_eq!(stacks[0].members, vec![1, 2, 3], "holding all three");
+
+    // The bottom is still behind, and still on the old trunk. Measured against
+    // the trunk the local chain has moved to, the middle would look in need of
+    // a rebase on every run until the bottom is pushed.
+    let tips = [local.tip(&gh.head_of(2)), local.tip(&gh.head_of(3))];
+    let calls_before = gh.calls().len();
+    local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "again"])
+        .await
+        .expect("the third push");
+
+    assert_eq!(
+        [local.tip(&gh.head_of(2)), local.tip(&gh.head_of(3))],
+        tips,
+        "a run with nothing to do should push nothing"
+    );
+    assert_eq!(
+        gh.calls().len(),
+        calls_before,
+        "and touch no pull request: {:?}",
+        &gh.calls()[calls_before..]
+    );
+}
+
+/// A change that conflicts with the stale branch below it cannot be built on
+/// that branch, and gets a base branch of its own as it would have before.
+///
+/// That takes the stack apart, which is the price of the change's diff being
+/// right: the only other base is the stale branch, and the change does not apply
+/// to it.
+#[tokio::test]
+async fn a_change_that_conflicts_with_the_stale_branch_below_gets_its_own_base() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["clash bottom", "clash top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    // The bottom rewrites its file without pushing it, and the top rewrites it
+    // again on top of that, so the top's edit does not apply to the file as the
+    // bottom's branch has it.
+    run("jj", &["edit", "@-"], &local.repo);
+    local.write("clash bottom", "the bottom, unpushed");
+    run("jj", &["edit", "@+"], &local.repo);
+    local.write("clash bottom", "the top's take on the bottom");
+    local
+        .diff_with(&gh, &config, &["-r", "@", "-m", "clash"])
+        .await
+        .expect("the second push");
+
+    assert!(
+        config.is_synthetic_base_branch(&gh.base_of(2)),
+        "the top should have a base branch of its own: {}",
+        gh.base_of(2)
+    );
+    assert_eq!(
+        local.files_changed(&gh.base_of(2), &gh.head_of(2)),
+        sorted([slug("clash bottom"), slug("clash top")]),
+        "reviewing everything it changes, and nothing the bottom changed"
+    );
+    assert!(
+        gh.calls()
+            .iter()
+            .any(|call| matches!(call, Call::Unstacked { stack: 100 })),
+        "the retarget should have taken the stack apart first: {:?}",
+        gh.calls()
+    );
+}
+
+/// A run that names the middle and the top together keeps the stack too: the
+/// revisions given make no difference to what the middle is built on.
+#[tokio::test]
+async fn pushing_a_range_above_a_branch_that_has_fallen_behind_keeps_the_stack() {
+    let local = Local::new();
+    let config = local.config(BaseStrategy::LinearRebase, StackDisplay::Github);
+    let gh = local.github(&config);
+
+    local.stack(&["range bottom", "range middle", "range top"]);
+    local.diff(&gh, &config).await.expect("the first push");
+
+    // Amend the bottom without pushing it, then amend the middle.
+    run("jj", &["edit", "@--"], &local.repo);
+    local.write("range bottom", "an amendment that was never pushed");
+    run("jj", &["edit", "@+"], &local.repo);
+    local.write("range middle", "an amended middle");
+    local
+        .diff_with(&gh, &config, &["--all", "-r", "@::", "-m", "amend"])
+        .await
+        .expect("the second push");
+
+    assert_eq!(gh.base_of(2), gh.head_of(1));
+    assert_eq!(
+        local.files_changed(&gh.base_of(2), &gh.head_of(2)),
+        vec![slug("range middle")],
+        "the middle should be reviewing its own change, without the bottom's unpushed edits"
+    );
+    let stacks = gh.open_stacks();
+    assert_eq!(stacks.len(), 1, "the one stack should be left standing");
+    assert_eq!(stacks[0].number, 100, "with the number it had");
+    assert_eq!(stacks[0].members, vec![1, 2, 3], "holding all three");
 }
 
 /// `--cherry-pick` turns the neighbourhood off, in both directions.

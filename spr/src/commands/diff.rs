@@ -546,6 +546,12 @@ struct PushedChange {
     /// for the change above: the diff would then leave out everything between
     /// master and this change.
     pushed_as_cherry_pick: bool,
+    /// Whether `branch` carries the change as GitHub has the chain below it
+    /// rather than as it is locally: somewhere below, a pull request's branch
+    /// had fallen behind its change, and this run built on that branch rather
+    /// than move anything off it. The change above has to be built the same
+    /// way, or its diff would carry what the branches below are missing.
+    behind: bool,
     /// The change's pull request, once it has one.
     ///
     /// A pull request this run is opening has no number until GitHub answers
@@ -609,13 +615,17 @@ fn descendants_to_push(
 ///
 /// - **it has to be open.** A closed pull request's branch is not something to
 ///   base on and not something GitHub will hold in a new stack.
-/// - **its branch has to carry the change as it is now.** For a change this run
-///   pushed that is guaranteed by the push; for one below the run it is not, and
-///   a branch that has fallen behind its change would put that change's
-///   unpushed work into the diff of everything above it. This is also what
-///   rules out a pull request pushed with `--cherry-pick`, whose branch carries
-///   the change rebased onto the master branch rather than the change's own
-///   tree.
+/// - **its branch has to carry the change as it is now, or the run has to build
+///   on the branch rather than the change.** For a change this run pushed that
+///   is guaranteed by the push; for one below the run it is not, and a branch
+///   that has fallen behind its change — the change was amended, or the chain
+///   rebased onto a newer master branch — would put that change's unpushed work
+///   into the diff of everything above it. Moving the run off that branch would
+///   keep the diffs clean, but a retarget takes apart any GitHub stack holding
+///   the pull request, and a run that was asked to push the changes above has no
+///   business reshaping the stack under them. So the base is offered marked
+///   [`PushedChange::behind`], and the run builds on the branch as GitHub has it
+///   instead of on the change as it is locally.
 ///
 /// Where the base is not offered the chain is dropped with it, rather than being
 /// returned on its own: the run's bottom then keeps or gets a base branch of its
@@ -665,20 +675,20 @@ async fn below_the_run(
         return Ok(nothing);
     };
 
-    if jj.get_tree_oid_for_commit(parent_pull_request.head_oid)?
-        != jj.get_tree_oid_for_commit(parent.oid)?
-    {
+    let behind = jj.get_tree_oid_for_commit(parent_pull_request.head_oid)?
+        != jj.get_tree_oid_for_commit(parent.oid)?;
+
+    if behind {
         output(
             "⚠️",
             &format!(
-                "The branch of #{number} does not carry that change as it is now, so this run \
-                 cannot base on it and what it pushes will not be stacked on it. Push the whole \
-                 stack in one run — `jj spr diff --all -r 'trunk()..@'` — to stack them.",
+                "The branch of #{number} does not carry that change as it is now, so what this \
+                 run pushes is built on that branch as GitHub has it, leaving it where it is. \
+                 Push #{number} too — `jj spr diff --all -r 'trunk()..@'` — to bring \
+                 the whole stack up to date.",
                 number = parent_pull_request.number,
             ),
         )?;
-
-        return Ok(nothing);
     }
 
     // How far down the chain reaches: from the parent, for as long as each pull
@@ -715,9 +725,10 @@ async fn below_the_run(
         local_oid: parent.oid,
         head_oid: parent_pull_request.head_oid,
         branch: parent_pull_request.head.clone(),
-        // The tree check above is exactly the statement that this branch is not
-        // a cherry-pick of the change but the change itself.
+        // Not a cherry-pick onto the master branch: whatever the branch carries,
+        // it is the head of the pull request the run's bottom is stacked on.
         pushed_as_cherry_pick: false,
+        behind,
         pull_request_number: Some(parent_pull_request.number),
         based_on: chain.len().checked_sub(2).map(|below| chain[below].number),
         retargeted: false,
@@ -924,7 +935,7 @@ async fn diff_impl(
     let pushed_as_cherry_pick = effective_cherry_pick && !directly_based_on_master;
 
     // The change below, if this change's pull request is to be based on it.
-    let linear_base = linear_base(
+    let mut linear_base = linear_base(
         config.base_strategy,
         change_below,
         local_commit.parent_oid,
@@ -932,9 +943,44 @@ async fn diff_impl(
         effective_cherry_pick,
     );
 
+    // Where the branch below does not carry the change below as it is locally,
+    // this change is carried onto that branch as GitHub has it — see
+    // [`PushedChange::behind`]. Worked out before the trees below, because a
+    // carry that conflicts sends the change back to a base branch of its own,
+    // and that is a different base and different trees.
+    let carried_tree = match linear_base.filter(|below| below.behind) {
+        Some(below) => {
+            let index = jj.cherrypick(local_commit.oid, below.head_oid)?;
+
+            if index.has_conflicts() {
+                output(
+                    "⚠️",
+                    &format!(
+                        "This change conflicts with {} as GitHub has it, so it cannot be \
+                         built on that branch and gets a base branch of its own. That takes \
+                         apart any GitHub stack holding its pull request.",
+                        below.branch.branch_name(),
+                    ),
+                )?;
+                linear_base = None;
+
+                None
+            } else {
+                Some((
+                    jj.write_index(index)?,
+                    jj.get_tree_oid_for_commit(below.head_oid)?,
+                ))
+            }
+        }
+        None => None,
+    };
+    let behind = linear_base.is_some_and(|below| below.behind);
+
     // Determine the trees the Pull Request branch and the base branch should
     // have when we're done here.
-    let (new_head_tree, new_base_tree) = if !effective_cherry_pick || directly_based_on_master {
+    let (new_head_tree, new_base_tree) = if let Some(trees) = carried_tree {
+        trees
+    } else if !effective_cherry_pick || directly_based_on_master {
         // Unless the user tells us to --cherry-pick, these should be the trees
         // of the current commit and its parent.
         // If the current commit is directly based on master (i.e.
@@ -1176,7 +1222,18 @@ async fn diff_impl(
                 master_base_oid,
             )
         };
-    let needs_merging_master = pr_master_base != master_base_oid;
+    // A change carried onto a branch that has fallen behind is on whatever
+    // master that branch is on, not the one the local chain has moved to:
+    // measured against the local chain it would count as needing a rebase on
+    // every run until the branch below is pushed.
+    let needs_merging_master = match linear_base.filter(|below| below.behind) {
+        Some(below) => {
+            let current_master_oid = jj.resolve_reference(config.master_ref.local())?;
+
+            pr_master_base != jj.git_repo.merge_base(below.head_oid, current_master_oid)?
+        }
+        None => pr_master_base != master_base_oid,
+    };
 
     // Whether the branch is the shape and in the place that
     // [`BaseStrategy::LinearRebase`] wants, which the trees below say nothing
@@ -1259,6 +1316,7 @@ async fn diff_impl(
                 head_oid: pull_request.head_oid,
                 branch: pull_request.head.clone(),
                 pushed_as_cherry_pick,
+                behind,
                 pull_request_number: Some(pull_request.number),
                 based_on: chain_link(linear_base, Some(&pull_request.base)),
                 // Nothing was pushed, so nothing was retargeted either.
@@ -1850,6 +1908,7 @@ async fn diff_impl(
         head_oid: pr_commit,
         branch: pull_request_branch,
         pushed_as_cherry_pick,
+        behind,
         pull_request_number,
         based_on,
         retargeted,
@@ -2299,6 +2358,7 @@ mod tests {
                 "main",
             ),
             pushed_as_cherry_pick: false,
+            behind: false,
             pull_request_number: Some(41),
             based_on: None,
             retargeted: false,
