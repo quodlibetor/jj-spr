@@ -23,6 +23,14 @@ type URI = String;
 )]
 pub struct SearchQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/pull_request_details.graphql",
+    response_derives = "Debug"
+)]
+pub struct PullRequestDetails;
+
 #[derive(Debug, clap::Parser)]
 pub struct ListOptions {
     /// How to print the listing. Defaults to the `spr.listFormat` setting,
@@ -82,14 +90,6 @@ pub async fn list(
             config.owner, config.repo
         ),
     };
-    let request_body = SearchQuery::build_query(variables);
-    let res = graphql_client
-        .post("https://api.github.com/graphql")
-        .json(&request_body)
-        .send()
-        .await?;
-    let response_body: Response<search_query::ResponseData> = res.json().await?;
-    let pull_requests = collect_pull_requests(response_body);
 
     // GitHub returns the pull requests in an order of its own, which says
     // nothing about how they depend on one another. GitHub's stacks and the
@@ -98,12 +98,93 @@ pub async fn list(
         .get_local_pull_request_stacks(config)
         .context("Reading the local change stacks".to_string())?;
 
+    // The chat formats print none of the table's own columns, so they do not
+    // wait for GitHub to work them out. The table asks about the local
+    // changes' pull requests alongside the search rather than after it, and
+    // afterwards only about the ones the search found that no local change
+    // carries.
+    let table = format == ListFormat::Table;
+    let local_numbers: Vec<u64> = if table {
+        local_stacks.iter().flatten().copied().collect()
+    } else {
+        Vec::new()
+    };
+    let (response_body, columns) = tokio::join!(
+        post::<SearchQuery>(&graphql_client, variables),
+        fetch_table_columns(&graphql_client, config, &local_numbers),
+    );
+    let mut pull_requests = collect_pull_requests(response_body?);
+    let mut columns = columns?;
+
+    if table {
+        let missing: Vec<u64> = pull_requests
+            .iter()
+            .map(|pull_request| pull_request.number)
+            .filter(|number| !columns.contains_key(number))
+            .collect();
+        columns.extend(fetch_table_columns(&graphql_client, config, &missing).await?);
+
+        for pull_request in &mut pull_requests {
+            pull_request.table_columns = columns.remove(&pull_request.number);
+        }
+    }
+
     let stacks: Vec<Vec<u64>> = github_stacks(&pull_requests)
         .into_iter()
         .chain(local_stacks)
         .collect();
 
     print_pr_info(pull_requests, &stacks, format, opts.copy).context("Printing PR info".to_string())
+}
+
+/// Send one GraphQL query.
+async fn post<Q: GraphQLQuery>(
+    graphql_client: &reqwest::Client,
+    variables: Q::Variables,
+) -> Result<Response<Q::ResponseData>> {
+    let response = graphql_client
+        .post("https://api.github.com/graphql")
+        .json(&Q::build_query(variables))
+        .send()
+        .await?;
+
+    Ok(response.json().await?)
+}
+
+/// The columns only the table prints, for each of the pull requests
+/// `numbers`, asked for one pull request per request with the requests sent
+/// together. A number GitHub has no pull request for is left out.
+async fn fetch_table_columns(
+    graphql_client: &reqwest::Client,
+    config: &crate::config::Config,
+    numbers: &[u64],
+) -> Result<std::collections::HashMap<u64, TableColumns>> {
+    let responses = futures::future::try_join_all(numbers.iter().map(|&number| async move {
+        let variables = pull_request_details::Variables {
+            owner: config.owner.clone(),
+            name: config.repo.clone(),
+            number: number as i64,
+        };
+        Ok::<_, Error>((
+            number,
+            post::<PullRequestDetails>(graphql_client, variables).await?,
+        ))
+    }))
+    .await?;
+
+    Ok(responses
+        .into_iter()
+        .filter_map(|(number, response)| {
+            let details = response.data?.repository?.pull_request?;
+            Some((
+                number,
+                TableColumns {
+                    merge_status: merge_status(&details).label().to_string(),
+                    comment_status: comment_status(&details).icon().to_string(),
+                },
+            ))
+        })
+        .collect())
 }
 
 /// The GitHub stacks `pull_requests` are in, each ordered the way the listing
@@ -201,8 +282,8 @@ impl MergeStatus {
 /// says whether anything is wrong, and `mergeStateStatus` says whether what
 /// is wrong actually stands in the way: `UNSTABLE` is GitHub's word for
 /// "mergeable, but some check that is not required is unhappy".
-fn merge_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> MergeStatus {
-    use search_query::{MergeStateStatus, MergeableState, StatusState};
+fn merge_status(pr: &pull_request_details::PullRequestDetailsRepositoryPullRequest) -> MergeStatus {
+    use pull_request_details::{MergeStateStatus, MergeableState, StatusState};
 
     if pr.is_draft {
         return MergeStatus::Draft;
@@ -371,7 +452,9 @@ macro_rules! viewer_handled {
 /// review thread, or in the PR's top-level comments, and we have not
 /// acknowledged it. GitHub returns comment connections oldest-first, so the
 /// last non-minimized node in each is the most recent one.
-fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> CommentStatus {
+fn comment_status(
+    pr: &pull_request_details::PullRequestDetailsRepositoryPullRequest,
+) -> CommentStatus {
     let top_level: Vec<_> = pr
         .comments
         .nodes
@@ -415,12 +498,19 @@ fn comment_status(pr: &search_query::SearchQuerySearchNodesOnPullRequest) -> Com
 /// the local changes it belongs.
 struct PullRequest {
     number: u64,
-    merge_status: String,
     review_status: ReviewStatus,
-    comment_status: String,
     title: String,
     url: String,
     stack_entry: Option<StackEntry>,
+    /// Fetched only for the table, and missing where GitHub did not answer
+    /// for this pull request.
+    table_columns: Option<TableColumns>,
+}
+
+/// The columns only the table prints.
+struct TableColumns {
+    merge_status: String,
+    comment_status: String,
 }
 
 /// Where a pull request sits in a GitHub stack.
@@ -532,15 +622,11 @@ fn collect_pull_requests(response_body: Response<search_query::ResponseData>) ->
             _ => continue,
         };
 
-        let merge_status = merge_status(&pr).label().to_string();
-        let comment_status = comment_status(&pr).icon().to_string();
         let review_status = review_status(&pr);
 
         pull_requests.push(PullRequest {
             number: pr.number as u64,
-            merge_status,
             review_status,
-            comment_status,
             title: pr.title,
             url: pr.url,
             stack_entry: pr.stack_entry.and_then(|entry| {
@@ -549,6 +635,7 @@ fn collect_pull_requests(response_body: Response<search_query::ResponseData>) ->
                     position: entry.position as u64,
                 })
             }),
+            table_columns: None,
         });
     }
 
@@ -617,9 +704,15 @@ fn build_table(groups: &[Group]) -> String {
                 .enumerate()
                 .map(|(position, pull_request)| Row {
                     stack: stack_marker(group.is_stack, position, last),
-                    merge_status: pull_request.merge_status.clone(),
+                    merge_status: pull_request.table_columns.as_ref().map_or_else(
+                        || MergeStatus::Unknown.label().to_string(),
+                        |columns| columns.merge_status.clone(),
+                    ),
                     review_status: pull_request.review_status.label(),
-                    comment_status: pull_request.comment_status.clone(),
+                    comment_status: pull_request
+                        .table_columns
+                        .as_ref()
+                        .map_or_else(String::new, |columns| columns.comment_status.clone()),
                     description: format!(
                         "{}\n{}",
                         console::style(&pull_request.title).bold(),
@@ -768,23 +861,21 @@ mod tests {
         serde_json::from_str(&json).expect("test payload should match the query's response shape")
     }
 
-    /// The single pull request a test payload describes.
-    fn pull_request_node(pr_fields: &str) -> search_query::SearchQuerySearchNodesOnPullRequest {
-        let nodes = response(pr_fields)
+    /// The table's own columns for one pull request, from a payload built the
+    /// way [`response`] builds one.
+    fn pull_request_node(
+        pr_fields: &str,
+    ) -> pull_request_details::PullRequestDetailsRepositoryPullRequest {
+        let json = format!(r#"{{"data":{{"repository":{{"pullRequest":{{{pr_fields}}}}}}}}}"#);
+        let response: Response<pull_request_details::ResponseData> = serde_json::from_str(&json)
+            .expect("test payload should match the query's response shape");
+        response
             .data
             .expect("the payload should have data")
-            .search
-            .nodes
-            .expect("the payload should have search nodes");
-        match nodes
-            .into_iter()
-            .flatten()
-            .next()
-            .expect("expected exactly one pull request")
-        {
-            search_query::SearchQuerySearchNodes::PullRequest(pr) => pr,
-            _ => panic!("the payload should describe a pull request"),
-        }
+            .repository
+            .expect("the payload should have a repository")
+            .pull_request
+            .expect("the payload should describe a pull request")
     }
 
     /// The fields the Merge column reads, as the query returns them.
@@ -847,10 +938,8 @@ mod tests {
     const NO_REVIEWS: &str = r#""reviewDecision":null,"reviews":{"nodes":[]}"#;
 
     fn comment_icon(pr_fields: &str) -> String {
-        let pull_requests =
-            collect_pull_requests(response(&format!("{},{pr_fields}", ready_to_merge())));
-        assert_eq!(pull_requests.len(), 1, "expected exactly one pull request");
-        pull_requests.into_iter().next().unwrap().comment_status
+        let pr = pull_request_node(&format!("{},{pr_fields}", ready_to_merge()));
+        comment_status(&pr).icon().to_string()
     }
 
     #[test]
@@ -1170,12 +1259,14 @@ mod tests {
     fn pull_request(number: u64) -> PullRequest {
         PullRequest {
             number,
-            merge_status: MergeStatus::Passing.label().to_string(),
             review_status: ReviewStatus::Pending,
-            comment_status: CommentStatus::Quiet.icon().to_string(),
             title: format!("pull request {number}"),
             url: format!("https://github.com/o/r/pull/{number}"),
             stack_entry: None,
+            table_columns: Some(TableColumns {
+                merge_status: MergeStatus::Passing.label().to_string(),
+                comment_status: CommentStatus::Quiet.icon().to_string(),
+            }),
         }
     }
 

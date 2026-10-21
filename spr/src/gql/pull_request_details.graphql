@@ -1,0 +1,54 @@
+# The columns only the table prints, asked for one pull request at a time.
+# Mergeability is by far the slowest thing GitHub answers here, and it works it
+# out one pull request after another within a request, so separate requests
+# sent together come back sooner than one request asking about them all. They
+# are asked for by number, which the local changes know before the search has
+# answered, so they need not wait for it.
+query PullRequestDetails($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      isDraft
+      # Whether the branches conflict. GitHub computes this lazily, so a
+      # pull request it has not looked at yet answers UNKNOWN, and asking
+      # is what prompts it to work the answer out for next time.
+      mergeable
+      # GitHub's own verdict on whether the pull request can merge, which
+      # folds in the checks its branch protection requires.
+      mergeStateStatus
+      # Every check on the head commit, required or not, rolled into one
+      # state. Null when the pull request has no checks at all.
+      statusCheckRollup {
+        state
+      }
+      comments(last: 20) {
+        nodes {
+          isMinimized
+          viewerDidAuthor
+          # Reacting to a comment is how you acknowledge it without writing
+          # a reply, so our own reactions count as having dealt with it.
+          reactionGroups {
+            viewerHasReacted
+          }
+        }
+      }
+      # Code review conversations. Bounded to keep the query's node count
+      # well inside GitHub's per-query limit; a PR busy enough to exceed
+      # these still reports discussion, just possibly not who spoke last
+      # in the oldest threads.
+      reviewThreads(last: 50) {
+        nodes {
+          isResolved
+          comments(last: 5) {
+            nodes {
+              isMinimized
+              viewerDidAuthor
+              reactionGroups {
+                viewerHasReacted
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
