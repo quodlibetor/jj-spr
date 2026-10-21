@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `jj spr list` groups pull requests by GitHub's stacked pull requests where
+  the repository has them, ahead of the stacks the local changes describe, and
+  prints each stack, and each pull request in no stack, as a block of its own
+  separated by a blank line.
 - jj-spr now works in workspaces that aren't colocated.
 - The first commit in a pull reuqest now uses the local commit's description.
 - `jj spr diff` remembers when PRs were created as cherry picks so

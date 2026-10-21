@@ -24,6 +24,14 @@ query SearchQuery($query: String!) {
           state
         }
         reviewDecision
+        # The GitHub stack the pull request is in, if any, and where in it:
+        # position 1 is the one nearest the base branch.
+        stackEntry {
+          position
+          stack {
+            number
+          }
+        }
         # Consulted only when reviewDecision has no verdict of its own; it
         # reports states, such as COMMENTED, that reviewDecision cannot.
         reviews(last: 20) {

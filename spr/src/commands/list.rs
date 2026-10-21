@@ -89,15 +89,48 @@ pub async fn list(
         .send()
         .await?;
     let response_body: Response<search_query::ResponseData> = res.json().await?;
+    let pull_requests = collect_pull_requests(response_body);
 
     // GitHub returns the pull requests in an order of its own, which says
-    // nothing about how they depend on one another. The local changes do know,
-    // so they decide the order the table is printed in.
-    let stacks = jj
+    // nothing about how they depend on one another. GitHub's stacks and the
+    // local changes do know, so they decide the order the table is printed in.
+    let local_stacks = jj
         .get_local_pull_request_stacks(config)
         .context("Reading the local change stacks".to_string())?;
 
-    print_pr_info(response_body, &stacks, format, opts.copy).context("Printing PR info".to_string())
+    let stacks: Vec<Vec<u64>> = github_stacks(&pull_requests)
+        .into_iter()
+        .chain(local_stacks)
+        .collect();
+
+    print_pr_info(pull_requests, &stacks, format, opts.copy).context("Printing PR info".to_string())
+}
+
+/// The GitHub stacks `pull_requests` are in, each ordered the way the listing
+/// prints a stack: top first, the way `jj log` reads.
+///
+/// Only the pull requests being listed are placed, so a member that is merged,
+/// closed or someone else's leaves no gap. The stacks themselves are put newest
+/// first, by stack number.
+fn github_stacks(pull_requests: &[PullRequest]) -> Vec<Vec<u64>> {
+    let mut stacks: std::collections::BTreeMap<std::cmp::Reverse<u64>, Vec<(u64, u64)>> =
+        std::collections::BTreeMap::new();
+    for pull_request in pull_requests {
+        if let Some(entry) = pull_request.stack_entry {
+            stacks
+                .entry(std::cmp::Reverse(entry.stack_number))
+                .or_default()
+                .push((entry.position, pull_request.number));
+        }
+    }
+
+    stacks
+        .into_values()
+        .map(|mut members| {
+            members.sort_by_key(|&(position, _)| std::cmp::Reverse(position));
+            members.into_iter().map(|(_, number)| number).collect()
+        })
+        .collect()
 }
 
 #[derive(Tabled)]
@@ -387,24 +420,33 @@ struct PullRequest {
     comment_status: String,
     title: String,
     url: String,
+    stack_entry: Option<StackEntry>,
 }
 
-/// One block of the table.
+/// Where a pull request sits in a GitHub stack.
+#[derive(Clone, Copy)]
+struct StackEntry {
+    stack_number: u64,
+    /// 1 is the pull request nearest the base branch.
+    position: u64,
+}
+
+/// One block of the listing.
 struct Group {
     pull_requests: Vec<PullRequest>,
-    /// Whether this group is a local stack. The pull requests that no local
-    /// change accounts for are gathered into a group of their own, which is
-    /// not a stack and so has nothing to draw in the Stack column.
+    /// Whether this group is a stack. A pull request that no stack accounts
+    /// for is a group of its own, which has nothing to draw in the Stack
+    /// column.
     is_stack: bool,
 }
 
 fn print_pr_info(
-    response_body: Response<search_query::ResponseData>,
+    pull_requests: Vec<PullRequest>,
     stacks: &[Vec<u64>],
     format: ListFormat,
     copy: bool,
 ) -> Result<()> {
-    let groups = group_by_stack(collect_pull_requests(response_body), stacks);
+    let groups = group_by_stack(pull_requests, stacks);
 
     if groups.is_empty() {
         return Ok(());
@@ -415,7 +457,7 @@ fn print_pr_info(
     let clipboard = copy.then(|| clipboard_flavours(&groups, format));
 
     let text = match format {
-        ListFormat::Table => build_table(&groups).to_string(),
+        ListFormat::Table => build_table(&groups),
         ListFormat::Slack => build_list(&groups, Link::OwnLine),
         ListFormat::SlackLinks => build_list(&groups, Link::OnTheTitle),
     };
@@ -451,7 +493,7 @@ struct Flavours {
 fn clipboard_flavours(groups: &[Group], format: ListFormat) -> Flavours {
     match format {
         ListFormat::Table => Flavours {
-            text: build_table(groups).to_string(),
+            text: build_table(groups),
             html: None,
         },
         ListFormat::Slack | ListFormat::SlackLinks => Flavours {
@@ -501,18 +543,27 @@ fn collect_pull_requests(response_body: Response<search_query::ResponseData>) ->
             comment_status,
             title: pr.title,
             url: pr.url,
+            stack_entry: pr.stack_entry.and_then(|entry| {
+                Some(StackEntry {
+                    stack_number: entry.stack?.number as u64,
+                    position: entry.position as u64,
+                })
+            }),
         });
     }
 
     pull_requests
 }
 
-/// Sort the pull requests into the stacks the local changes describe.
+/// Sort the pull requests into `stacks`: GitHub's stacks followed by the ones
+/// the local changes describe.
 ///
 /// The stacks are listed in the order they were given, each in its own group,
-/// and a pull request that no local change carries — one landed elsewhere, or
-/// opened from another machine — goes into a last group of its own rather than
-/// being dropped from a listing that is meant to show everything open.
+/// and a stack claims only the pull requests no earlier stack has, so where
+/// GitHub and the local changes disagree, GitHub's stack wins. A pull request
+/// that no stack carries — one landed elsewhere, or opened from another
+/// machine — is listed after the stacks, each in a group of its own, rather
+/// than being dropped from a listing that is meant to show everything open.
 fn group_by_stack(pull_requests: Vec<PullRequest>, stacks: &[Vec<u64>]) -> Vec<Group> {
     let position: std::collections::HashMap<u64, usize> = pull_requests
         .iter()
@@ -541,34 +592,31 @@ fn group_by_stack(pull_requests: Vec<PullRequest>, stacks: &[Vec<u64>]) -> Vec<G
         }
     }
 
-    let loose: Vec<PullRequest> = unclaimed.into_iter().flatten().collect();
-    if !loose.is_empty() {
-        groups.push(Group {
-            pull_requests: loose,
-            is_stack: false,
-        });
-    }
+    groups.extend(unclaimed.into_iter().flatten().map(|pull_request| Group {
+        pull_requests: vec![pull_request],
+        is_stack: false,
+    }));
 
     groups
 }
 
-fn build_table(groups: &[Group]) -> Table {
+/// Build the listing as tables, one per group, separated by a blank line.
+fn build_table(groups: &[Group]) -> String {
     // The Stack column is only worth its width when there is more than one
-    // group to tell apart: a listing that is one stack from top to bottom
-    // already reads in order without it.
+    // group: a listing that is one stack from top to bottom already reads in
+    // order without it.
     let stack_column_earns_its_place = groups.len() > 1;
 
-    let rows: Vec<Row> = groups
+    groups
         .iter()
-        .flat_map(|group| {
+        .map(|group| {
             let last = group.pull_requests.len() - 1;
-            let is_stack = group.is_stack;
-            group
+            let rows = group
                 .pull_requests
                 .iter()
                 .enumerate()
-                .map(move |(position, pull_request)| Row {
-                    stack: stack_marker(is_stack, position, last),
+                .map(|(position, pull_request)| Row {
+                    stack: stack_marker(group.is_stack, position, last),
                     merge_status: pull_request.merge_status.clone(),
                     review_status: pull_request.review_status.label(),
                     comment_status: pull_request.comment_status.clone(),
@@ -577,19 +625,20 @@ fn build_table(groups: &[Group]) -> Table {
                         console::style(&pull_request.title).bold(),
                         console::style(&pull_request.url).dim(),
                     ),
-                })
+                });
+
+            let mut builder = Table::builder(rows);
+            if !stack_column_earns_its_place {
+                builder.remove_column(0);
+            }
+
+            let mut table = builder.build();
+            table.with(Style::sharp());
+
+            table.to_string()
         })
-        .collect();
-
-    let mut builder = Table::builder(rows);
-    if !stack_column_earns_its_place {
-        builder.remove_column(0);
-    }
-
-    let mut table = builder.build();
-    table.with(Style::sharp());
-
-    table
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Where the URL of a pull request goes in a chat listing.
@@ -1126,6 +1175,7 @@ mod tests {
             comment_status: CommentStatus::Quiet.icon().to_string(),
             title: format!("pull request {number}"),
             url: format!("https://github.com/o/r/pull/{number}"),
+            stack_entry: None,
         }
     }
 
@@ -1158,25 +1208,53 @@ mod tests {
 
     /// A pull request with no local change — landed elsewhere, or opened from
     /// another machine — is still open, so it is still listed. It just has no
-    /// place among the stacks, and goes last.
+    /// place among the stacks, so it goes last, apart from everything else.
     #[test]
-    fn pull_requests_without_a_local_change_come_last() {
+    fn pull_requests_without_a_local_change_come_last_each_on_its_own() {
         assert_eq!(
             grouped(&[9, 1, 8, 2], &[vec![2, 1]]),
-            vec![vec![2, 1], vec![9, 8]],
+            vec![vec![2, 1], vec![9], vec![8]],
             "the pull requests with no local change keep GitHub's order"
         );
     }
 
-    /// The stacks describe the local changes, which may name pull requests
-    /// that are closed and so absent from the listing.
+    /// GitHub's stacks come before the local ones, so a pull request both of
+    /// them name is listed where GitHub's stack puts it, and the local stack
+    /// keeps only what is left.
     #[test]
-    fn stacks_may_name_pull_requests_that_are_not_listed() {
+    fn a_github_stack_claims_its_pull_requests_before_a_local_one() {
+        let github = vec![vec![3, 2]];
+        let local = vec![vec![4, 3, 2, 1]];
+        let stacks: Vec<Vec<u64>> = github.into_iter().chain(local).collect();
         assert_eq!(
-            grouped(&[1], &[vec![7, 1], vec![8]]),
-            vec![vec![1]],
-            "a stack with nothing left to show is dropped rather than emptied"
+            grouped(&[1, 2, 3, 4], &stacks),
+            vec![vec![3, 2], vec![4, 1]]
         );
+    }
+
+    fn stacked(number: u64, stack_number: u64, position: u64) -> PullRequest {
+        PullRequest {
+            stack_entry: Some(StackEntry {
+                stack_number,
+                position,
+            }),
+            ..pull_request(number)
+        }
+    }
+
+    /// GitHub numbers a stack's positions from the bottom, and the listing
+    /// prints the top first. A member that is not listed — merged, closed, or
+    /// someone else's — is simply absent.
+    #[test]
+    fn github_stacks_are_read_top_first_and_newest_first() {
+        let pull_requests = vec![
+            stacked(2, 10, 2),
+            pull_request(9),
+            stacked(5, 20, 2),
+            stacked(3, 10, 3),
+            stacked(4, 20, 1),
+        ];
+        assert_eq!(github_stacks(&pull_requests), vec![vec![5, 4], vec![3, 2]]);
     }
 
     /// Only the stack column can distinguish the groups, so it appears exactly
@@ -1184,7 +1262,7 @@ mod tests {
     #[test]
     fn the_stack_column_appears_only_when_it_separates_groups() {
         let one_stack = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2, 1]]);
-        let table = build_table(&one_stack).to_string();
+        let table = build_table(&one_stack);
         assert!(
             !table.contains("Stack"),
             "one stack needs no Stack column, got:\n{table}"
@@ -1192,11 +1270,25 @@ mod tests {
 
         let two_stacks =
             group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2], vec![1]]);
-        let table = build_table(&two_stacks).to_string();
+        let table = build_table(&two_stacks);
         assert!(
             table.contains("Stack"),
             "two stacks need a Stack column, got:\n{table}"
         );
+    }
+
+    /// Each group is a table of its own, with a blank line between them.
+    #[test]
+    fn each_group_is_its_own_table() {
+        let groups = group_by_stack(
+            vec![pull_request(3), pull_request(2), pull_request(1)],
+            &[vec![3, 2]],
+        );
+        let table = build_table(&groups);
+        let blocks: Vec<&str> = table.split("\n\n").collect();
+        assert_eq!(blocks.len(), 2, "got:\n{table}");
+        assert!(blocks[0].contains("pull request 3") && blocks[0].contains("pull request 2"));
+        assert!(blocks[1].contains("pull request 1"));
     }
 
     /// The markers have to say where each stack starts and ends, or the reader
@@ -1380,7 +1472,7 @@ mod tests {
     fn copying_a_table_copies_the_table() {
         let groups = group_by_stack(vec![pull_request(1)], &[vec![1]]);
         let flavours = clipboard_flavours(&groups, ListFormat::Table);
-        assert_eq!(flavours.text, build_table(&groups).to_string());
+        assert_eq!(flavours.text, build_table(&groups));
         assert_eq!(flavours.html, None);
     }
 }

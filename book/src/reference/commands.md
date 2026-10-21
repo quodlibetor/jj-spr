@@ -248,12 +248,15 @@ jj spr list [OPTIONS]
   counts as answering it, so a thumbs-up settles a thread you have nothing to
   add to.
 
-Pull requests are listed in the order of the local changes that carry them,
-newest change first, so a stack reads the way `jj log` prints it. Separate
-stacks are listed one after another, and a `Stack` column marks where each one
-starts and ends when there is more than one. A pull request that no local
-change carries — landed elsewhere, or opened from another machine — is listed
-last.
+Pull requests are grouped by stack, top of each stack first, so a stack reads
+the way `jj log` prints it. GitHub's stacked pull requests come first, where
+the repository has them: a pull request in one of GitHub's stacks is listed in
+that stack's order, whatever the local changes say. The rest follow in the
+order of the local changes that carry them. Each stack is a table of its own,
+separated from the next by a blank line, and a `Stack` column marks where each
+one starts and ends when there is more than one. A pull request in no stack —
+landed elsewhere, or opened from another machine — is listed last, each on its
+own.
 
 **Asking for reviews:** `--format slack` prints the listing as a Markdown
 bullet list to paste into a chat message — one bullet per pull request, its
