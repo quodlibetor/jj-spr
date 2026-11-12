@@ -404,6 +404,18 @@ impl ReviewStatus {
             ReviewStatus::Other(_) => "❔",
         }
     }
+
+    /// The one word the legend gives the emoji, so a reader who has not seen
+    /// the listing before can tell what each one means.
+    fn word(&self) -> &'static str {
+        match self {
+            ReviewStatus::Accepted => "approved",
+            ReviewStatus::ChangesRequested => "blocked",
+            ReviewStatus::Commented => "commented",
+            ReviewStatus::Pending => "unreviewed",
+            ReviewStatus::Other(_) => "unknown",
+        }
+    }
 }
 
 /// Who the conversation on a PR is waiting on.
@@ -749,32 +761,35 @@ enum Link {
 /// Build the listing as a Markdown bullet list to paste into a chat message
 /// asking for reviews.
 ///
-/// Each stack is a block of its own, separated by a blank line, in the order
-/// the table would have printed them: newest change first, the way `jj log`
-/// reads. There are no stack markers, because indentation is all a chat
-/// client will keep, and no merge or comment status, because what a reviewer
-/// needs from the message is which pull requests are still waiting on them.
+/// The list opens with a legend for the emoji it uses, then each stack is a
+/// block of its own, separated by a blank line, in the order the table would
+/// have printed them: newest change first, the way `jj log` reads. There are
+/// no stack markers, because indentation is all a chat client will keep, and
+/// no merge or comment status, because what a reviewer needs from the message
+/// is which pull requests are still waiting on them.
 fn build_list(groups: &[Group], link: Link) -> String {
-    groups
-        .iter()
-        .map(|group| {
+    std::iter::once(legend(groups))
+        .chain(groups.iter().map(|group| {
             group
                 .pull_requests
                 .iter()
                 .map(|pull_request| bullet(pull_request, link))
                 .collect::<Vec<_>>()
                 .join("\n")
-        })
+        }))
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
 /// Build the listing as HTML, one list per stack, each title a link to its
 /// pull request. This is the flavour a chat client pastes from.
+///
+/// Consecutive lists paste as one list, so the blocks are kept apart with a
+/// line break between them, as the plain text keeps them apart with a blank
+/// line.
 fn build_html_list(groups: &[Group]) -> String {
-    groups
-        .iter()
-        .map(|group| {
+    std::iter::once(format!("<p>{}</p>", escape_html(&legend(groups))))
+        .chain(groups.iter().map(|group| {
             let items: String = group
                 .pull_requests
                 .iter()
@@ -788,8 +803,34 @@ fn build_html_list(groups: &[Group]) -> String {
                 })
                 .collect();
             format!("<ul>{items}</ul>")
-        })
-        .collect()
+        }))
+        .collect::<Vec<_>>()
+        .join("<br>")
+}
+
+/// One line saying what each emoji in the listing means, naming only the ones
+/// the listing uses.
+fn legend(groups: &[Group]) -> String {
+    let statuses = [
+        ReviewStatus::Accepted,
+        ReviewStatus::ChangesRequested,
+        ReviewStatus::Commented,
+        ReviewStatus::Pending,
+        ReviewStatus::Other(String::new()),
+    ];
+    let used = |status: &ReviewStatus| {
+        groups
+            .iter()
+            .flat_map(|group| &group.pull_requests)
+            .any(|pull_request| pull_request.review_status.emoji() == status.emoji())
+    };
+
+    statuses
+        .iter()
+        .filter(|status| used(status))
+        .map(|status| format!("{} {}", status.emoji(), status.word()))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Escape the characters that would otherwise be read as markup. A pull
@@ -1412,7 +1453,8 @@ mod tests {
         let groups = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2, 1]]);
         assert_eq!(
             build_list(&groups, Link::OwnLine),
-            "- \u{23f3} pull request 2\n  https://github.com/o/r/pull/2\n\
+            "\u{23f3} unreviewed\n\n\
+             - \u{23f3} pull request 2\n  https://github.com/o/r/pull/2\n\
              - \u{23f3} pull request 1\n  https://github.com/o/r/pull/1"
         );
     }
@@ -1425,8 +1467,8 @@ mod tests {
         let list = build_list(&groups, Link::OwnLine);
         assert_eq!(
             list.split("\n\n").count(),
-            2,
-            "the two stacks should be two blocks, got:\n{list}"
+            3,
+            "the legend and the two stacks should be three blocks, got:\n{list}"
         );
     }
 
@@ -1498,19 +1540,45 @@ mod tests {
         let groups = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2, 1]]);
         assert_eq!(
             build_html_list(&groups),
-            "<ul>\
+            "<p>\u{23f3} unreviewed</p><br><ul>\
              <li>\u{23f3} <a href=\"https://github.com/o/r/pull/2\">pull request 2</a></li>\
              <li>\u{23f3} <a href=\"https://github.com/o/r/pull/1\">pull request 1</a></li>\
              </ul>"
         );
     }
 
-    /// Each stack is a list of its own, which is what keeps the blocks apart
-    /// once the blank lines of the plain text are gone.
+    /// Each stack is a list of its own, with a line break between them:
+    /// consecutive lists paste into a chat message as one.
     #[test]
     fn each_stack_is_its_own_html_list() {
         let groups = group_by_stack(vec![pull_request(2), pull_request(1)], &[vec![2], vec![1]]);
-        assert_eq!(build_html_list(&groups).matches("<ul>").count(), 2);
+        let html = build_html_list(&groups);
+        assert_eq!(html.matches("<ul>").count(), 2);
+        assert!(html.contains("</ul><br><ul>"), "got:\n{html}");
+    }
+
+    /// The legend names every emoji the listing uses and none it does not,
+    /// in the same order whichever pull request comes first.
+    #[test]
+    fn the_legend_names_only_the_emoji_in_use() {
+        let groups = vec![Group {
+            pull_requests: vec![
+                PullRequest {
+                    review_status: ReviewStatus::Pending,
+                    ..pull_request(2)
+                },
+                PullRequest {
+                    review_status: ReviewStatus::Accepted,
+                    ..pull_request(1)
+                },
+                PullRequest {
+                    review_status: ReviewStatus::Pending,
+                    ..pull_request(3)
+                },
+            ],
+            is_stack: true,
+        }];
+        assert_eq!(legend(&groups), "\u{2705} approved  \u{23f3} unreviewed");
     }
 
     /// A title is somebody's prose and a URL carries query strings, so either
@@ -1529,7 +1597,8 @@ mod tests {
 
         assert_eq!(
             build_html_list(&groups),
-            "<ul><li>\u{23f3} <a href=\"https://github.com/o/r/pull/1?a=1&amp;b=2\">\
+            "<p>\u{23f3} unreviewed</p><br>\
+             <ul><li>\u{23f3} <a href=\"https://github.com/o/r/pull/1?a=1&amp;b=2\">\
              fix: &lt;script&gt; &amp; &quot;quotes&quot;</a></li></ul>"
         );
     }
